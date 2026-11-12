@@ -5,15 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileConfigSource } from "../src/config.ts";
 import { SqliteStore } from "../src/store.ts";
+import { AttachmentError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import type {
+  AttachmentReader,
   ModelEngine,
   TelegramTransport,
   OutgoingPart,
   TelegramUpdate,
 } from "../src/contracts.ts";
 
-function fixture(t: any) {
+function fixture(t: any, attachments?: AttachmentReader) {
   const dir = mkdtempSync(join(tmpdir(), "verfix-bot-"));
   const env = join(dir, ".env");
   const configText = (allowed = "2", extra = "") =>
@@ -62,7 +64,7 @@ function fixture(t: any) {
     health: async () => ({ available: true }),
     close: async () => {},
   };
-  let bot = createBot({ config, store, engine, telegram });
+  let bot = createBot({ config, store, engine, telegram, attachments });
   t.after(async () => {
     await bot.shutdown();
     config.close();
@@ -100,7 +102,7 @@ function fixture(t: any) {
       await bot.shutdown();
       store.close();
       store = new SqliteStore(join(dir, "db.sqlite"));
-      bot = createBot({ config, store, engine, telegram });
+      bot = createBot({ config, store, engine, telegram, attachments });
       await bot.recover();
     },
   };
@@ -462,4 +464,390 @@ test("revocation cancels pending output permanently while granting access preser
   await f.bot.drain();
   assert.equal(f.requests.at(-1).threadId, "retained");
   assert.equal(f.sent.at(-1)!.text, "continued");
+});
+
+function fileUpdate(update: TelegramUpdate, name = "notes.txt", caption?: string, album?: string): TelegramUpdate {
+  delete update.message!.text;
+  update.message!.document = { file_id: name, file_name: name, mime_type: "text/plain", file_size: 4 };
+  if (caption !== undefined) update.message!.caption = caption;
+  if (album) update.message!.media_group_id = album;
+  return update;
+}
+
+test("files wait for a task and pending materials survive restart without a model call", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: new TextDecoder().decode(file.bytes), images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new TextEncoder().encode("note"); };
+  const first = fileUpdate(f.update(2, ""));
+  await f.bot.handleUpdate(first);
+  await f.bot.handleUpdate(first);
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(downloads, []);
+  assert.match(f.sent.at(-1)!.text, /задани/i);
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Explain my notes"));
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["notes.txt"]);
+  assert.deepEqual(f.requests[0].attachments, [{ name: "notes.txt", text: "note", images: [] }]);
+  assert.equal(f.requests[0].text, "Explain my notes");
+});
+
+test("an album waits for its last member and all captions describe the entire ordered group", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "material", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt", "Compare these", "album-a"));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt", undefined, "album-a"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "third.txt", "and find differences", "album-a"));
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(downloads, []);
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["first.txt", "second.txt", "third.txt"]);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].text, "Compare these\n\nand find differences");
+  assert.deepEqual(f.requests[0].attachments.map((a: any) => a.name), ["first.txt", "second.txt", "third.txt"]);
+});
+
+test("attachment limits reject a batch before downloads and leave accepted files available for the task", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  for (let i = 0; i < 10; i++) await f.bot.handleUpdate(fileUpdate(f.update(2, ""), `${i}.txt`));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "overflow.txt"));
+  await f.bot.drain();
+  assert.ok(f.sent.some((m) => /10|раздел/i.test(m.text)));
+  await f.bot.handleUpdate(f.update(2, "Use all accepted files"));
+  await f.bot.drain();
+  assert.equal(downloads.length, 10);
+  assert.ok(!downloads.includes("overflow.txt"));
+  assert.equal(f.requests[0].attachments.length, 10);
+});
+
+test("actual oversized downloads never start partial analysis and pending materials can be retried", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(20_000_001);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "large.txt", "Explain"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /раздел|20|размер/i);
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(f.update(2, "Try again"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].attachments[0].name, "large.txt");
+});
+
+test("prepared text over the batch limit is rejected without silently truncating the document", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "x".repeat(500_001), images: [] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "long.txt", "Summarize"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
+});
+
+test("prepared images respect batch size and count limits before model analysis", async (t) => {
+  let images = [{ name: "scan.png", mime: "image/png" as const, base64: Buffer.alloc(6_000_001).toString("base64") }];
+  const f = fixture(t, { prepare: async () => [{ name: "scan.pdf", text: "", images }] });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "scan.pdf", "Read"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  images = Array.from({ length: 21 }, (_, i) => ({ name: `page-${i}.png`, mime: "image/png" as const, base64: "AA==" }));
+  await f.bot.handleUpdate(f.update(2, "Retry"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
+});
+
+test("cumulative serialized material context is bounded and /new makes room for a fresh task", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "", images: [{ name: "scan.png", mime: "image/png", base64: Buffer.alloc(3_000_000).toString("base64") }] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  for (let i = 0; i < 3; i++) {
+    await f.bot.handleUpdate(fileUpdate(f.update(2, ""), `${i}.pdf`, "Read"));
+    await f.bot.drain();
+  }
+  assert.equal(f.requests.length, 2);
+  assert.match(f.sent.at(-1)!.text, /\/new/);
+  await f.bot.handleUpdate(f.update(2, "/new"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "new.pdf", "Read"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 3);
+  assert.deepEqual(f.requests[2].history, []);
+});
+
+test("revocation during download cancels the batch before the next file and pending refs remain isolated", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  let signal: AbortSignal | undefined;
+  let finishDownload!: (bytes: Uint8Array) => void;
+  f.telegram.downloadFile = async (id, _max, abortSignal) => {
+    downloads.push(id);
+    signal = abortSignal;
+    if (downloads.length === 1) return new Promise<Uint8Array>((resolve) => { finishDownload = resolve; });
+    return new Uint8Array(4);
+  };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt"));
+  await f.bot.handleUpdate(f.update(2, "Explain both"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  writeFileSync(f.env, f.configText(""));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const cancelled = signal?.aborted;
+  finishDownload(new Uint8Array(4));
+  assert.equal(cancelled, true);
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["first.txt"]);
+  assert.equal(f.requests.length, 0);
+  writeFileSync(f.env, f.configText());
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  await f.bot.handleUpdate(f.update(1, "Owner continues independently"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].attachments, undefined);
+  await f.bot.handleUpdate(f.update(2, "Repeat the task"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[1].attachments.map((a: any) => a.name), ["first.txt", "second.txt"]);
+});
+
+test("restart before album dispatch keeps files but requires the text task again", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  let downloads = 0;
+  f.telegram.downloadFile = async () => { downloads++; return new Uint8Array(4); };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt", "Old task", "group"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt", undefined, "group"));
+  await f.reopen();
+  assert.equal(downloads, 0);
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /повторите текст задания/i);
+  await f.bot.handleUpdate(f.update(2, "Repeated task"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].text, "Repeated task");
+  assert.deepEqual(f.requests[0].attachments.map((a: any) => a.name), ["first.txt", "second.txt"]);
+});
+
+test("committed images and text survive restart and a failed follow-up rebuilds the same material context", async (t) => {
+  const prepared = [{ name: "scan.pdf", text: "The total is 42", images: [{ name: "page.png", mime: "image/png" as const, base64: "aW1hZ2U=" }] }];
+  const f = fixture(t, { prepare: async () => prepared });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "scan.pdf", "Read"));
+  await f.bot.drain();
+  await f.reopen();
+  const original = f.engine.run;
+  f.engine.run = async () => { throw new Error("provider failed"); };
+  await f.bot.handleUpdate(f.update(2, "Failed clarification"));
+  await f.bot.drain();
+  await f.reopen();
+  f.engine.run = original;
+  await f.bot.handleUpdate(f.update(2, "What is the total?"));
+  await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId, undefined);
+  assert.deepEqual(f.requests.at(-1).history, [
+    { role: "user", text: "Read", attachments: prepared },
+    { role: "assistant", text: "answer Read" },
+  ]);
+});
+
+test("/model leaves pending files for the task and /new removes both pending and historical materials", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  await f.bot.handleUpdate(fileUpdate(f.update(1, ""), "kept.txt"));
+  await f.bot.handleUpdate(f.update(1, "/model"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(f.update(1, "Read"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].attachments[0].name, "kept.txt");
+  await f.bot.handleUpdate(fileUpdate(f.update(1, ""), "discarded.txt"));
+  await f.bot.handleUpdate(f.update(1, "/new"));
+  await f.bot.drain();
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(1, "Fresh"));
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["kept.txt"]);
+  assert.equal(f.requests.at(-1).attachments, undefined);
+  assert.deepEqual(f.requests.at(-1).history, []);
+});
+
+test("/help explains how several photos and files receive a task", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "/help"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /фото|файл/i);
+  assert.match(f.sent.at(-1)!.text, /подпис/i);
+  assert.match(f.sent.at(-1)!.text, /задани/i);
+});
+
+test("offline photos and documents receive a repeat notice without downloads or analysis", async (t) => {
+  const f = fixture(t);
+  let downloads = 0;
+  f.telegram.downloadFile = async () => { downloads++; return new Uint8Array(4); };
+  const outsider = fileUpdate(f.update(99, ""));
+  const photo = f.update(2, "");
+  delete photo.message!.text;
+  photo.message!.photo = [{ file_id: "photo", width: 800, height: 600 }];
+  await f.bot.discardOfflineUpdates([outsider, photo, fileUpdate(f.update(1, ""))]);
+  assert.equal(downloads, 0);
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(f.sent.map((m) => m.chatId).sort(), [1, 2]);
+  assert.ok(f.sent.every((m) => /повторите/i.test(m.text)));
+});
+
+test("a rejected album member cancels automatic analysis of the accepted subset", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "good.txt", "Read everything", "album-limit"));
+  const oversized = fileUpdate(f.update(2, ""), "large.txt", undefined, "album-limit");
+  oversized.message!.document!.file_size = 20_000_001;
+  await f.bot.handleUpdate(oversized);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "later.txt", "A second caption", "album-limit"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(downloads, []);
+  await f.bot.handleUpdate(f.update(2, "Read the two accepted files"));
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["good.txt", "later.txt"]);
+  assert.equal(f.requests[0].text, "Read the two accepted files");
+});
+
+test("invalid configuration pauses an album before download and valid reload resumes its accepted task", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "album.txt", "Read", "paused"));
+  writeFileSync(f.env, "OWNER_TELEGRAM_ID=1\n");
+  await new Promise((resolve) => setTimeout(resolve, 1550));
+  assert.deepEqual(downloads, []);
+  writeFileSync(f.env, f.configText());
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["album.txt"]);
+  assert.equal(f.requests[0].text, "Read");
+});
+
+test("unauthorized, group, and mismatched senders are rejected before inspecting attachment refs", async (t) => {
+  const f = fixture(t);
+  for (const [user, type, sender] of [[99, "private", 99], [2, "group", 2], [2, "private", 99]] as const) {
+    const update = f.update(user, "");
+    update.message!.chat.type = type;
+    update.message!.from!.id = sender;
+    Object.defineProperty(update.message, "document", { get() { throw new Error("attachment inspected before authorization"); } });
+    await f.bot.handleUpdate(update);
+  }
+  await f.bot.drain();
+  assert.deepEqual(f.sent, []);
+  assert.deepEqual(f.requests, []);
+});
+
+test("the largest photo is analyzed as an image and a caption starting with slash is a task", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "", images: [{ name: file.name, mime: "image/jpeg", base64: "aW1hZ2U=" }] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  const photo = f.update(2, "");
+  delete photo.message!.text;
+  photo.message!.photo = [{ file_id: "small", width: 100, height: 100 }, { file_id: "large", width: 1200, height: 1200 }];
+  photo.message!.caption = "/new is printed in the screenshot; explain it";
+  await f.bot.handleUpdate(photo);
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["large"]);
+  assert.equal(f.requests[0].text, "/new is printed in the screenshot; explain it");
+  assert.equal(f.requests[0].attachments[0].images[0].base64, "aW1hZ2U=");
+});
+
+test("a busy user's new files are rejected without download or inclusion in a later task", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
+  let finish!: (value: any) => void;
+  f.engine.run = async (request) => { f.requests.push(request); return new Promise((resolve) => { finish = resolve; }); };
+  await f.bot.handleUpdate(f.update(2, "Running task"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "rejected.txt", "Another task"));
+  finish({ text: "done", threadId: "busy-thread", images: [] });
+  await f.bot.drain();
+  f.engine.run = async (request) => { f.requests.push(request); return { text: "ok", threadId: "busy-thread", images: [] }; };
+  await f.bot.handleUpdate(f.update(2, "Next task"));
+  await f.bot.drain();
+  assert.deepEqual(downloads, []);
+  assert.equal(f.requests.at(-1).attachments, undefined);
+  assert.ok(f.sent.some((m) => /Дождитесь/i.test(m.text)));
+});
+
+test("the request deadline also bounds an unresponsive attachment download", async (t) => {
+  const f = fixture(t, { prepare: async () => [] });
+  writeFileSync(f.env, f.configText("2", "REQUEST_TIMEOUT_MS=20"));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  let signal: AbortSignal | undefined;
+  f.telegram.downloadFile = async (_id, _max, abortSignal) => { signal = abortSignal; return new Promise(() => {}); };
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "slow.txt", "Read"));
+  await f.bot.drain();
+  assert.equal(signal?.aborted, true);
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /Время обработки/i);
+});
+
+test("a reader that omits a failed file cannot start analysis of a partial batch", async (t) => {
+  const f = fixture(t, { prepare: async (files) => [{ name: files[0]!.name, text: "only first file", images: [] }] });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt"));
+  await f.bot.handleUpdate(f.update(2, "Compare both"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /все|материал|повтор/i);
+});
+
+test("safe reader and model attachment errors retain the whole batch for an explicit retry", async (t) => {
+  let readerFails = true;
+  const f = fixture(t, { prepare: async (files) => {
+    if (readerFails) throw new AttachmentError("Документ повреждён. Исправьте материалы и повторите задание.");
+    return files.map((file) => ({ name: file.name, text: "ok", images: [] }));
+  } });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt", "Read"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /Документ повреждён/);
+  readerFails = false;
+  const original = f.engine.run;
+  f.engine.run = async () => { throw new AttachmentError("Выбранная модель не принимает изображения. Выберите другую модель."); };
+  await f.bot.handleUpdate(f.update(2, "Retry"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /не принимает изображения/);
+  f.engine.run = original;
+  await f.bot.handleUpdate(f.update(2, "Retry once more"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[0].history, []);
+  assert.equal(f.requests[0].attachments[0].name, "notes.txt");
+});
+
+test("a captioned album rejected by the global capacity limit never becomes an implicit request queue", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+  writeFileSync(f.env, f.configText("2", "MAX_CONCURRENT_REQUESTS=1"));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  const original = f.engine.run;
+  let finish!: (value: any) => void;
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    return new Promise((resolve) => { finish = resolve; });
+  };
+  await f.bot.handleUpdate(f.update(1, "Occupy the only slot"));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "waiting.txt", "Caption task", "full"));
+  await new Promise((resolve) => setTimeout(resolve, 1550));
+  finish({ text: "done", threadId: "owner-thread", images: [] });
+  await f.bot.drain();
+  f.engine.run = original;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 1);
+  assert.ok(f.sent.some((m) => m.chatId === 2 && /заняты|Повторите/i.test(m.text)));
+  await f.bot.handleUpdate(f.update(2, "Explicit repeated task"));
+  await f.bot.drain();
+  assert.equal(f.requests[1].text, "Explicit repeated task");
+  assert.equal(f.requests[1].attachments[0].name, "waiting.txt");
 });
