@@ -69,6 +69,12 @@ export interface ModelSelection {
   effort: string;
 }
 
+/** Completed conversation only; used to rebuild a thread after interrupted work. */
+export interface ConversationMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
 export interface ModelInfo {
   id: string;
   displayName?: string;
@@ -85,6 +91,7 @@ export interface ModelRequest extends ModelSelection {
   userId: UserId;
   threadId?: string;
   text: string;
+  history?: ConversationMessage[];
   signal: AbortSignal;
   /** Await persistence of the thread before continuing the request. */
   onThread: (threadId: string) => void | Promise<void>;
