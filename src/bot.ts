@@ -122,7 +122,7 @@ export class BotController implements Bot {
         : undefined;
     if (!message.text && !ref) {
       this.deps.store.accept(update.update_id);
-      this.control(() => this.safeText(userId, "Поддерживаются только текстовые сообщения."));
+      this.control(() => this.safeText(userId, "Отправьте текст, фото или файл: JPEG, PNG, WebP, PDF, DOCX, XLSX, PPTX либо текстовый UTF-8 документ."));
       return;
     }
     const state = this.deps.store.get(userId);

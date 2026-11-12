@@ -21,8 +21,10 @@ MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 6_000_000
 SPLIT = 'Материалы превышают лимит. Разделите их на несколько заданий.'
 INVALID = 'Не удалось прочитать файл. Проверьте формат или разделите материалы.'
+PDF_EXPORT = 'Документ содержит диаграммы, SmartArt или неподдерживаемые рисунки. Экспортируйте его в PDF и отправьте снова.'
 class Rejected(Exception): pass
 class Limit(Rejected): pass
+class UnsupportedOffice(Rejected): pass
 
 images = []
 image_bytes = 0
@@ -64,6 +66,49 @@ def local(tag):
 
 def attr(element, name):
     return next((value for key, value in element.attrib.items() if key.endswith('}'+name)), element.get(name))
+
+MATH = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+def math_latex(node, depth=0):
+    # Only recognized structures are translated. An unknown structure preserves
+    # the entire formula as OMML below, never its concatenated text descendants.
+    if depth > 64 or not node.tag.startswith('{'+MATH+'}'): raise Rejected()
+    kind = local(node.tag)
+    def render(child): return math_latex(child, depth+1)
+    if kind == 't':
+        if len(node): raise Rejected()
+        return ''.join({'\\': r'\backslash ', '{': r'\{', '}': r'\}', '_': r'\_', '^': r'\^{}', '%': r'\%', '#': r'\#', '&': r'\&', '$': r'\$', '~': r'\~{}'}.get(c, c) for c in (node.text or ''))
+    if kind in ('oMath', 'r', 'num', 'den', 'e', 'sup', 'sub', 'deg'):
+        return ''.join(render(child) for child in node)
+    if kind == 'f':
+        if [local(child.tag) for child in node] != ['num', 'den']: raise Rejected()
+        return r'\frac{'+render(node[0])+'}{'+render(node[1])+'}'
+    if kind in ('sSup', 'sSub', 'sSubSup'):
+        expected = {'sSup': ['e', 'sup'], 'sSub': ['e', 'sub'], 'sSubSup': ['e', 'sub', 'sup']}[kind]
+        if [local(child.tag) for child in node] != expected: raise Rejected()
+        base = '{'+render(node[0])+'}'
+        if kind in ('sSub', 'sSubSup'): base += '_{'+render(node[1])+'}'
+        if kind in ('sSup', 'sSubSup'): base += '^{'+render(node[-1])+'}'
+        return base
+    if kind == 'rad':
+        children = list(node)
+        hide_degree = False
+        if children and local(children[0].tag) == 'radPr':
+            properties = children.pop(0)
+            if len(properties) != 1 or local(properties[0].tag) != 'degHide': raise Rejected()
+            value = attr(properties[0], 'val')
+            if value not in ('0', '1', 'true', 'false', 'on', 'off'): raise Rejected()
+            hide_degree = value in ('1', 'true', 'on')
+        if [local(child.tag) for child in children] != ['deg', 'e']: raise Rejected()
+        degree = render(children[0])
+        if hide_degree and degree: raise Rejected()
+        return r'\sqrt'+('['+degree+']' if degree else '')+'{'+render(children[1])+'}'
+    raise Rejected()
+
+def formula(node):
+    try: return r'\('+math_latex(node)+r'\)'
+    except Rejected:
+        return '\n[Office Math — complete structured OMML XML]\n'+ET.tostring(node, encoding='unicode')+'\n[/Office Math]\n'
 
 class NoDTD(ET.TreeBuilder):
     def doctype(self, name, pubid, system):
@@ -134,9 +179,11 @@ class Office:
 
     def inline(self, element, source):
         parts = []
-        for node in element.iter():
+        def visit(node):
             kind = local(node.tag)
-            if kind == 't': parts.append(node.text or '')
+            if kind == 'oMath' or (node.tag.startswith(('{'+MATH+'}', '{http://purl.oclc.org/ooxml/officeDocument/math}')) and kind != 'oMathPara'):
+                parts.append(formula(node))
+            elif kind == 't': parts.append(node.text or '')
             elif kind == 'tab': parts.append('\t')
             elif kind in ('br', 'cr'): parts.append('\n')
             elif kind == 'blip':
@@ -147,6 +194,9 @@ class Office:
                 parts.append(add_image(self.bytes(target)))
             elif kind in ('altChunk', 'OLEObject', 'object'):
                 raise Rejected()
+            else:
+                for child in node: visit(child)
+        visit(element)
         return ''.join(parts)
 
     def word_blocks(self, parent, source):
@@ -245,10 +295,57 @@ class Office:
         return '\n\n'.join(slides)
 
     def read(self):
+        self.check_content()
         if 'word/document.xml' in self.members: return self.word()
         if 'xl/workbook.xml' in self.members: return self.sheet()
         if 'ppt/presentation.xml' in self.members: return self.slides()
         raise Rejected()
+
+    def check_content(self):
+        # Traverse the package relationship graph, including slide layouts and
+        # masters. Reject before extracting anything if any reachable material
+        # cannot be faithfully represented; cached chart values are not images.
+        roots = [path for path in ('word/document.xml', 'xl/workbook.xml', 'ppt/presentation.xml') if path in self.members]
+        # word() also reads these annotation parts, even in minimalist packages
+        # that omit a relationship; apply the same completeness checks to them.
+        roots += [path for path in self.trees if path.startswith('word/') and posixpath.basename(path).startswith(('header', 'footer', 'footnotes', 'endnotes', 'comments')) and path.endswith('.xml')]
+        pending = roots[:]
+        seen = set()
+        while pending:
+            source = pending.pop()
+            if source in seen: continue
+            seen.add(source)
+            if source in self.trees:
+                root = self.tree(source)
+                inherited = local(root.tag) in ('sldLayout', 'sldMaster', 'notesMaster', 'handoutMaster')
+                for node in root.iter():
+                    kind = local(node.tag)
+                    namespace = node.tag.split('}')[0].lstrip('{')
+                    if inherited and ((kind == 't' and node.text) or kind in ('blip', 'imagedata', 'graphicData', 'prstGeom', 'custGeom', 'cxnSp')):
+                        raise UnsupportedOffice()
+                    if kind in ('wsp', 'cxnSp', 'grpSp', 'custGeom'): raise UnsupportedOffice()
+                    if kind in ('sp', 'graphicFrame') and namespace.endswith('/spreadsheetDrawing'): raise UnsupportedOffice()
+                    if kind == 'drawing' and namespace.endswith('/wordprocessingml/2006/main') and not any(local(child.tag) == 'blip' for child in node.iter()):
+                        raise UnsupportedOffice()
+                    if kind == 'sp' and namespace.endswith('/presentationml/2006/main'):
+                        shapes = list(node.iter())
+                        if any(local(child.tag) == 'prstGeom' for child in shapes) and not any(attr(child, 'txBox') in ('1', 'true') for child in shapes):
+                            raise UnsupportedOffice()
+                    if namespace == 'urn:schemas-microsoft-com:vml' and kind == 'shape':
+                        if not any(local(child.tag) == 'imagedata' for child in node.iter()) or any(local(child.tag) == 'textbox' for child in node.iter()):
+                            raise UnsupportedOffice()
+                    if namespace == 'urn:schemas-microsoft-com:vml' and kind in ('rect', 'roundrect', 'oval', 'line', 'polyline', 'curve', 'arc', 'group'):
+                        raise UnsupportedOffice()
+                    if ('/chart' in namespace or '/diagram' in namespace or kind in ('chart', 'chartEx', 'relIds')):
+                        raise UnsupportedOffice()
+                    if kind == 'graphicData' and node.get('uri') not in (
+                        'http://schemas.openxmlformats.org/drawingml/2006/picture',
+                        'http://schemas.openxmlformats.org/drawingml/2006/table',
+                    ): raise UnsupportedOffice()
+            for related, kind in self.relationships(source).values():
+                relation = kind.rsplit('/', 1)[-1].lower()
+                if relation.startswith(('chart', 'diagram')): raise UnsupportedOffice()
+                if related is not None: pending.append(related)
 
 def read(data, name, mime):
     if data.startswith((b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff')) or (data[:4] == b'RIFF' and data[8:12] == b'WEBP'):
@@ -297,5 +394,7 @@ try:
     print(json.dumps({'text': text, 'images': images}, ensure_ascii=False))
 except Limit:
     print(json.dumps({'text': '', 'images': [], 'error': SPLIT}, ensure_ascii=False))
+except UnsupportedOffice:
+    print(json.dumps({'text': '', 'images': [], 'error': PDF_EXPORT}, ensure_ascii=False))
 except BaseException:
     print(json.dumps({'text': '', 'images': [], 'error': INVALID}, ensure_ascii=False))
