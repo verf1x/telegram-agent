@@ -15,10 +15,11 @@ export class Rpc {
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data',(chunk:string)=>{
       buffer+=chunk;
-      if(Buffer.byteLength(buffer)>12*1024*1024){this.stop();return;}
       let index:number;
       while((index=buffer.indexOf('\n'))>=0){
         const line=buffer.slice(0,index);buffer=buffer.slice(index+1);
+        // A completed multimodal userMessage may echo the full outgoing input.
+        if(Buffer.byteLength(line)>32*1024*1024){this.stop();return;}
         if(!line.trim())continue;
         try{
           const frame=JSON.parse(line) as Frame;
@@ -29,6 +30,7 @@ export class Rpc {
           if(frame.error)wait.reject(new Error('Codex request failed'));else wait.resolve(frame.result);
         }catch{this.stop();}
       }
+      if(Buffer.byteLength(buffer)>32*1024*1024)this.stop();
     });
     // Drain and discard: diagnostics can include credentials, prompts or local paths.
     this.child.stderr.on('data',()=>{});
@@ -37,13 +39,20 @@ export class Rpc {
     this.child.stdin.on('error',()=>this.stop());
   }
   async initialize(){await this.request('initialize',{clientInfo:{name:'verfix_telegram_agent',version:'0.1.0'},capabilities:{experimentalApi:true,requestAttestation:false}});this.send({method:'initialized'});}
-  send(frame:Frame){if(this.stopped)throw new Error('Codex unavailable');this.child.stdin.write(JSON.stringify(frame)+'\n');}
+  send(frame:Frame){
+    if(this.stopped)throw new Error('Codex unavailable');
+    const serialized=JSON.stringify(frame)+'\n';
+    if(Buffer.byteLength(serialized)>24*1024*1024)throw new Error('Codex payload too large');
+    this.child.stdin.write(serialized);
+  }
   request(method:string,params:any,timeout=30000):Promise<any>{
     if(this.stopped)return Promise.reject(new Error('Codex unavailable'));
     const id=this.next++;
     return new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('Codex deadline exceeded'));this.stop();},timeout);
-      this.pending.set(id,{resolve,reject,timer});this.send({id,method,params});
+      this.pending.set(id,{resolve,reject,timer});
+      try{this.send({id,method,params});}
+      catch{clearTimeout(timer);this.pending.delete(id);reject(new Error('Codex request failed'));}
     });
   }
   get alive(){return !this.stopped;}

@@ -4,6 +4,71 @@ import { test } from 'node:test';
 import { TelegramApi } from './transport.ts';
 import { formatAnswer } from './format.ts';
 
+async function downloadServer(handler: Parameters<typeof createServer>[0]) {
+  const http = createServer(handler);
+  await new Promise<void>(resolve => http.listen(0,'127.0.0.1',resolve));
+  return {api:new TelegramApi('123:secret',{baseUrl:`http://127.0.0.1:${(http.address() as {port:number}).port}`}),close:()=>new Promise<void>(resolve=>{http.closeAllConnections();http.close(()=>resolve());})};
+}
+
+test('downloads bytes by Telegram file ID without treating the file name as a host path',async()=>{
+  const seen:string[]=[];
+  const remote=await downloadServer((request,response)=>{
+    seen.push(request.url!);
+    if(request.url!.endsWith('/getFile'))response.end(JSON.stringify({ok:true,result:{file_path:'documents/file_12.txt',file_size:5}}));
+    else response.end('hello');
+  });
+  try{
+    assert.equal(Buffer.from(await remote.api.downloadFile('telegram-id',10)).toString(),'hello');
+    assert.deepEqual(seen,['/bot123:secret/getFile','/file/bot123:secret/documents/file_12.txt']);
+  }finally{await remote.close();}
+});
+
+test('download limits apply to metadata, headers and streamed bytes with safe diagnostics',async()=>{
+  for(const mode of ['metadata','headers','stream']) {
+    let downloads=0;
+    const remote=await downloadServer((request,response)=>{
+      if(request.url!.endsWith('/getFile')) {response.end(JSON.stringify({ok:true,result:{file_path:'documents/file.txt',...(mode==='metadata'?{file_size:11}:{})}}));return;}
+      downloads++;
+      if(mode==='headers')response.setHeader('content-length','11');
+      else response.setHeader('transfer-encoding','chunked');
+      response.write('12345');response.end('678901');
+    });
+    try {
+      await assert.rejects(remote.api.downloadFile('id',10),(error:Error)=>/слишком большой/.test(error.message)&&!String(error).includes('secret'));
+      assert.equal(downloads,mode==='metadata'?0:1);
+    }finally{await remote.close();}
+  }
+});
+
+test('unsafe Telegram paths and redirects cannot forward bot credentials',async()=>{
+  for(const path of ['https://evil.test/x','//evil.test/x','/photos/x','../file','photos/../x','photos/%2e%2e/x','photos/%252e%252e/x','photos/a?x=1','photos/a#x','photos/a\\x','photos/a\nx']){
+    let downloads=0;
+    const remote=await downloadServer((request,response)=>{
+      if(request.url!.endsWith('/getFile'))response.end(JSON.stringify({ok:true,result:{file_path:path}}));
+      else {downloads++;response.end('bad');}
+    });
+    try {await assert.rejects(remote.api.downloadFile('id',10));assert.equal(downloads,0);}finally{await remote.close();}
+  }
+  let leaked=0;
+  const remote=await downloadServer((request,response)=>{
+    if(request.url!.endsWith('/getFile'))response.end(JSON.stringify({ok:true,result:{file_path:'photos/x.jpg'}}));
+    else if(request.url!.includes('/file/')){response.writeHead(302,{location:'/leak/123:secret'});response.end();}
+    else {leaked++;response.end('leaked');}
+  });
+  try {await assert.rejects(remote.api.downloadFile('id',10),(error:Error)=>!String(error).includes('secret'));assert.equal(leaked,0);}finally{await remote.close();}
+});
+
+test('a stalled download can be cancelled without exposing an abort reason or remote errors',async()=>{
+  const abort=new AbortController();
+  const remote=await downloadServer((request,response)=>{
+    if(request.url!.endsWith('/getFile'))response.end(JSON.stringify({ok:true,result:{file_path:'photos/x.jpg'}}));
+    else {response.write('x');setTimeout(()=>abort.abort(new Error('123:secret')),20);}
+  });
+  try {await assert.rejects(remote.api.downloadFile('id',10,abort.signal),(error:Error)=>error.name==='AbortError'&&!String(error).includes('secret'));}finally{await remote.close();}
+  const failure=await server(()=>({ok:false,error_code:400,description:'https://api.telegram.org/bot123:secret/getFile'}));
+  try {await assert.rejects(failure.api.downloadFile('id',10),(error:Error)=>!String(error).includes('secret'));}finally{await failure.close();}
+});
+
 async function server(handler: (method: string, body: string, contentType: string, raw: Buffer) => unknown | Promise<unknown>) {
   const http = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
