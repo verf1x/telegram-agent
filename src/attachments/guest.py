@@ -318,7 +318,16 @@ class Office:
             if source in self.trees:
                 root = self.tree(source)
                 inherited = local(root.tag) in ('sldLayout', 'sldMaster', 'notesMaster', 'handoutMaster')
+                empty_placeholders = set()
+                if inherited:
+                    for shape in root.iter():
+                        if local(shape.tag) != 'sp': continue
+                        contents = list(shape.iter())
+                        if any(local(child.tag) == 'ph' for child in contents) and not any(
+                            (local(child.tag) == 't' and child.text) or local(child.tag) in ('blip', 'imagedata', 'graphicData', 'custGeom') for child in contents
+                        ): empty_placeholders.update(contents)
                 for node in root.iter():
+                    if node in empty_placeholders: continue
                     kind = local(node.tag)
                     namespace = node.tag.split('}')[0].lstrip('{')
                     if inherited and ((kind == 't' and node.text) or kind in ('blip', 'imagedata', 'graphicData', 'prstGeom', 'custGeom', 'cxnSp')):

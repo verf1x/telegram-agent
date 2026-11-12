@@ -153,3 +153,8 @@ del drawing_sheet['xl/drawings/_rels/drawing1.xml.rels']
 archive('drawing.xlsx',drawing_sheet)
 archive('connector.pptx',{**slide_base,'ppt/slides/_rels/slide1.xml.rels':rels([]),'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:cxnSp><p:spPr><a:prstGeom prst="bentConnector3"/></p:spPr></p:cxnSp></p:spTree></p:cSld></p:sld>'})
 archive('smartart.docx',{'word/document.xml':f'<w:document xmlns:w="{W}" xmlns:a="{A}" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:r="{D}"><w:body><w:p><w:drawing><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="data"/></a:graphicData></a:graphic></w:drawing></w:p></w:body></w:document>','word/_rels/document.xml.rels':rels([('data','diagrams/data1.xml','diagramData')]),'word/diagrams/data1.xml':f'<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="{A}"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Only SmartArt material: 42</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>'})
+archive('empty-placeholders.pptx',{
+ **slide_base,'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Actual slide text.</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
+ 'ppt/slides/_rels/slide1.xml.rels':rels([('layout','../slideLayouts/slideLayout1.xml','slideLayout')]),
+ 'ppt/slideLayouts/slideLayout1.xml':f'<p:sldLayout xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:spPr><a:prstGeom prst="rect"/></p:spPr><p:txBody><a:p/></p:txBody></p:sp></p:spTree></p:cSld></p:sldLayout>',
+})

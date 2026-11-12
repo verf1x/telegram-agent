@@ -81,6 +81,10 @@ test('Office vector drawings, spreadsheet shapes, connectors and SmartArt reques
  for(const name of ['vector.docx','drawing.xlsx','connector.pptx','smartart.docx'])
   await assert.rejects(reader.prepare([await fixture(name,'application/octet-stream')],new AbortController().signal),/PDF/);
 });
+test('empty PowerPoint layout placeholders do not hide or reject actual slide text',{skip:!pythonPath},async()=>{
+ const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('empty-placeholders.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation')],new AbortController().signal);
+ assert.equal(file!.text,'Slide 1\nActual slide text.');
+});
 
 test('a corrupt or unsupported attachment rejects the whole task with a safe actionable error',{skip:!pythonPath},async()=>{
  const reader=new SandboxedAttachmentReader({pythonPath});
