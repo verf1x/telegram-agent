@@ -196,7 +196,6 @@ export class CodexEngine implements ModelEngine {
         }finally{computing=false;}
       };
       const recordImage=(item:any,completedItem:boolean)=>{
-        if(nativeError)return;
         try{
           if(typeof item.id!=='string'||!item.id||item.id.length>1024)throw new ImageGenerationError('Не удалось получить корректное изображение от Codex. Попробуйте повторить запрос.');
           if(!nativeImages.has(item.id)){
@@ -211,7 +210,7 @@ export class CodexEngine implements ModelEngine {
           const bytes=nativePng(item.result,GENERATED_IMAGE_LIMITS.totalBytes-nativeBytes);
           if(nativeBytes+bytes.length>GENERATED_IMAGE_LIMITS.totalBytes)throw new ImageGenerationError('Изображения Codex слишком большие для одного ответа. Попросите меньше изображений.');
           nativeBytes+=bytes.length;nativeImages.set(item.id,{bytes,name:'',mime:'image/png'});
-        }catch(error){nativeError=error instanceof ImageGenerationError?error:new ImageGenerationError('Не удалось получить корректное изображение от Codex. Попробуйте повторить запрос.');fail(nativeError);}
+        }catch(error){nativeError??=error instanceof ImageGenerationError?error:new ImageGenerationError('Не удалось получить корректное изображение от Codex. Попробуйте повторить запрос.');}
       };
       const recordItem=(item:any)=>{
         if(item?.type==='imageGeneration')recordImage(item,true);
@@ -227,11 +226,16 @@ export class CodexEngine implements ModelEngine {
         if(f.method==='turn/completed'&&f.params.turn.id===turnId){
           for(const item of f.params.turn.items??[])recordItem(item);
           if(f.params.turn.status!=='completed'){
-            fail(nativeImages.size?new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.'):new Error('Codex request failed'));return;
+            const error=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
+            if(f.params.turn.status!=='failed'||![...nativeImages.values()].some(image=>!!image)){
+              fail(nativeError??(nativeImages.size?error:new Error('Codex request failed')));return;
+            }
+            nativeError??=error;
           }
           if([...nativeImages.values()].some(image=>!image)){
-            fail(new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.'));return;
+            nativeError??=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
           }
+          if(nativeError&&![...nativeImages.values()].some(image=>!!image)){fail(nativeError);return;}
           finish(f.params.turn);
         }
       };
@@ -242,11 +246,14 @@ export class CodexEngine implements ModelEngine {
       const started=await rpc.request('turn/start',{...scope,threadId:nativeId,input,effort:request.effort,environments:[]});
       turnId=started.turn.id;
       for(const event of events)consume(event);
-      await completed;
+      const turn=await completed;
       abort.signal.removeEventListener('abort',stop);
       if(abort.signal.aborted)throw new Error('Request cancelled');
-      const answer=[...items.values()].join('\n\n').trim()||(nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
-      await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
+      let answer=[...items.values()].join('\n\n').trim()||(nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
+      if(nativeError)answer+='\n\nГотова только часть изображений. '+nativeError.message;
+      // A failed turn may have usable images, but must not be resumed as a
+      // completed conversation. The existing rebuild path handles the next request.
+      if(turn.status==='completed')await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images};
     }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
