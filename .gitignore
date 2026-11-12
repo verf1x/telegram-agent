@@ -8,3 +8,8 @@ runtime/
 *.sqlite-shm
 *.sqlite-wal
 coverage/
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+*.log
