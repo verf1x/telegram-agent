@@ -143,6 +143,11 @@ def run():
         for library in sorted(libraries):
             if library.startswith(str(stdlib)+'/') or library.startswith(str(packages)+'/'): continue
             command += ['--ro-bind',library,library]
+        # A distro stdlib may contain globally installed packages. Hide them;
+        # only the prepared venv is supplied to generated calculations.
+        for name in ['site-packages','dist-packages']:
+            path=stdlib/name
+            if path.is_dir(): command += ['--size','4096','--tmpfs',str(path),'--remount-ro',str(path)]
         empty_fds=[]
         for name in ['result.png','image-2.png','image-3.png','image-4.png']+[f'scratch-{n}.txt' for n in range(8)]:
             fd=os.dup(empty.fileno());empty_fds.append(fd)
