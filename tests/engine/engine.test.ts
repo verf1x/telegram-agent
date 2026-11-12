@@ -127,3 +127,15 @@ test('cancellation while opening a saved dialog preserves its completed context'
   assert.equal(next.text,'COMMITTED');assert.equal(next.threadId,first.threadId);
  }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
+
+test('the caller controls request lifetime beyond ten minutes and can still cancel',async(t)=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const abort=new AbortController();
+ t.mock.timers.enable({apis:['setTimeout']});
+ try {
+  const result=await engine.run({userId:1,text:'six times seven',model:'gpt-6.1-sol',effort:'medium',signal:abort.signal,onThread:()=>{t.mock.timers.tick(600001);}});
+  assert.equal(result.text,'42');assert.equal(abort.signal.aborted,false);
+  await assert.rejects(engine.run({userId:1,text:'wait',model:'gpt-6.1-sol',effort:'medium',signal:abort.signal,onThread:()=>abort.abort()}),/cancelled/);
+ }finally {await engine.close();t.mock.timers.reset();await rm(runtimeDir,{recursive:true,force:true});}
+});

@@ -83,7 +83,6 @@ export class CodexEngine implements ModelEngine {
     let rpc:Rpc|undefined;
     const computations=new Set<Promise<void>>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
-    const deadline=setTimeout(()=>abort.abort(),600000);
     try{
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
@@ -156,7 +155,7 @@ export class CodexEngine implements ModelEngine {
       await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       return {text:answer,threadId:id,images};
     }catch{throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
-    finally{clearTimeout(deadline);abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
+    finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{
     const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();
