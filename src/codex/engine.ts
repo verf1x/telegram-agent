@@ -32,6 +32,7 @@ export class CodexEngine implements ModelEngine {
     // remain disabled individually and filesystem grants remain minimal.
     await writeFile(join(home,'config.toml'),`approval_policy = "never"\ndefault_permissions = "bot"\nweb_search = "live"\n[features]\nshell_tool = false\nview_image = false\napps = false\nplugins = false\nhooks = false\ncomputer_use = false\nin_app_browser = false\nimage_generation = false\nmulti_agent = false\nmemories = false\ncode_mode = false\ncode_mode_host = true\nbrowser_use = false\nbrowser_use_external = false\nbrowser_use_full_cdp_access = false\nrequest_permissions_tool = false\nskill_search = false\nskill_mcp_dependency_install = false\nskip_host_skill_discovery = true\nshell_snapshot = false\ngoals = false\nsleep_tool = false\n[permissions.bot.filesystem]\n":minimal" = "read"\n${JSON.stringify(cwd)} = "read"\n[permissions.bot.network]\nenabled = false\n`,{mode:0o600});
     const env:NodeJS.ProcessEnv={PATH:process.env.PATH??'/usr/bin:/bin',HOME:dir,CODEX_HOME:home,LANG:'C.UTF-8'};
+    if(this.closed||signal?.aborted)throw new Error('Codex unavailable');
     const rpc=new Rpc(this.command,cwd,env);this.workers.add(rpc);
     rpc.onFrame=frame=>{if(frame.id!==undefined)rpc.send({id:frame.id,error:{code:-32601,message:'Request denied'}});};
     const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
@@ -76,6 +77,7 @@ export class CodexEngine implements ModelEngine {
       }
     }
     const abort=new AbortController();let markDone:()=>void=()=>{};
+    if(request.signal.aborted)throw new Error('Request cancelled');
     const done=new Promise<void>(resolve=>{markDone=resolve;});this.active.set(id,{abort,done});
     const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
     let rpc:Rpc|undefined;

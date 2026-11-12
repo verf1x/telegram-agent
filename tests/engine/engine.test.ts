@@ -112,3 +112,18 @@ test('cancelling a calculation stops it and the next request uses a fresh thread
   assert.notEqual(next.threadId,saved);assert.equal(next.text,'42');
  }finally {if(timer)clearTimeout(timer);await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
+
+test('cancellation while opening a saved dialog preserves its completed context',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',onThread:()=>{}};
+ try {
+  const first=await engine.run({...base,text:'remember:COMMITTED',signal:new AbortController().signal});
+  const abort=new AbortController();let persisted=false;
+  const pending=engine.run({...base,threadId:first.threadId,text:'recall',signal:abort.signal,onThread:()=>{persisted=true;}});
+  abort.abort();
+  await assert.rejects(pending,/cancelled/);assert.equal(persisted,false);
+  const next=await engine.run({...base,threadId:first.threadId,text:'recall',signal:new AbortController().signal});
+  assert.equal(next.text,'COMMITTED');assert.equal(next.threadId,first.threadId);
+ }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
