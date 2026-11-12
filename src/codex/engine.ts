@@ -40,8 +40,9 @@ export class CodexEngine implements ModelEngine {
     catch{rpc.stop();this.workers.delete(rpc);throw new Error('Codex unavailable');}
     finally{signal?.removeEventListener('abort',cancel);}
   }
-  async listModels():Promise<ModelInfo[]>{
-    const {rpc}=await this.worker(join(this.root,'catalog'));
+  async listModels(signal?:AbortSignal):Promise<ModelInfo[]>{
+    const {rpc}=await this.worker(join(this.root,'catalog'),signal);
+    const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
     try{
       const all:ModelInfo[]=[];let cursor:string|null=null;
       do{
@@ -51,10 +52,10 @@ export class CodexEngine implements ModelEngine {
         if(all.length>1000)throw new Error('Codex catalog too large');
       }while(cursor);
       return all;
-    }finally{rpc.stop();this.workers.delete(rpc);}
+    }finally{signal?.removeEventListener('abort',cancel);rpc.stop();this.workers.delete(rpc);}
   }
-  async health():Promise<EngineHealth>{
-    try{const {rpc}=await this.worker(join(this.root,'health'));try{const r=await rpc.request('account/read',{refreshToken:false});return {available:!!r.account,detail:r.account?'Codex ready':'ChatGPT authentication required'};}finally{rpc.stop();this.workers.delete(rpc);}}
+  async health(signal?:AbortSignal):Promise<EngineHealth>{
+    try{const {rpc}=await this.worker(join(this.root,'health'),signal);const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();try{const r=await rpc.request('account/read',{refreshToken:false});return {available:!!r.account,detail:r.account?'Codex ready':'ChatGPT authentication required'};}finally{signal?.removeEventListener('abort',cancel);rpc.stop();this.workers.delete(rpc);}}
     catch{return {available:false,detail:'Codex unavailable'};}
   }
   private threadDir(id:string){

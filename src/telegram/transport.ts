@@ -89,5 +89,5 @@ export class TelegramApi implements TelegramTransport {
     return sent.message_id;
   }
   async typing(chatId: ChatId, signal?: AbortSignal): Promise<void> { await this.#call('sendChatAction',{chat_id:chatId,action:'typing'},signal); }
-  async answerCallback(id: string, text?: string): Promise<void> { await this.#call('answerCallbackQuery',{callback_query_id:id,...(text ? {text} : {})}); }
+  async answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void> { await this.#call('answerCallbackQuery',{callback_query_id:id,...(text ? {text} : {})},signal); }
 }
