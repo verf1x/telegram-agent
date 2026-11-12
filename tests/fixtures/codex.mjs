@@ -19,7 +19,13 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    let answer='empty';try{answer=readFileSync(memory,'utf8');}catch{}
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:answer}]}}});return;
   }
-  if(text.startsWith('compute:')){toolTurn=x.params.threadId;send({id:999,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'call-1',tool:'isolated_compute',arguments:{code:text.slice(8)}}});return;}
+  if(text.startsWith('compute:')){
+   // codex-cli 0.167.2 routes dynamic tools through its isolated code-mode
+   // host even with the optional code_mode feature disabled.
+   if(!readFileSync(process.env.CODEX_HOME+'/config.toml','utf8').includes('code_mode_host = true')){
+    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'code-mode host is disabled'}]}}});return;
+   }
+   toolTurn=x.params.threadId;send({id:999,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'call-1',tool:'isolated_compute',arguments:{code:text.slice(8)}}});return;}
   send({method:'item/completed',params:{threadId:x.params.threadId,turnId:'turn-1',item:{id:'r',type:'reasoning',text:'private'}}});
   send({method:'item/completed',params:{threadId:x.params.threadId,turnId:'turn-1',item:{id:'c',type:'agentMessage',phase:'commentary',text:'working'}}});
   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'42'}]}}});
