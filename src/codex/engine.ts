@@ -3,9 +3,10 @@ import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
-import { AttachmentError,ATTACHMENT_LIMITS } from '../contracts.ts';
+import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS } from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
+import { nativePng } from './images.ts';
 
 export interface CodexEngineOptions {runtimeDir:string;pythonPath?:string;codexCommand?:string;}
 type UserInput = {type:'text';text:string;text_elements:[]} | {type:'image';url:string};
@@ -85,8 +86,8 @@ export class CodexEngine implements ModelEngine {
     }catch{/* account/read reports missing authentication */}}
     // Current models route function calls through the isolated code-mode host;
     // disabling that host disables even our external dynamic tool. Native tools
-    // remain disabled individually and filesystem grants remain minimal.
-    await writeFile(join(home,'config.toml'),`approval_policy = "never"\ndefault_permissions = "bot"\nweb_search = "live"\n[features]\nshell_tool = false\nview_image = false\napps = false\nplugins = false\nhooks = false\ncomputer_use = false\nin_app_browser = false\nimage_generation = false\nmulti_agent = false\nmemories = false\ncode_mode = false\ncode_mode_host = true\nbrowser_use = false\nbrowser_use_external = false\nbrowser_use_full_cdp_access = false\nrequest_permissions_tool = false\nskill_search = false\nskill_mcp_dependency_install = false\nskip_host_skill_discovery = true\nshell_snapshot = false\ngoals = false\nsleep_tool = false\n[permissions.bot.filesystem]\n":minimal" = "read"\n${JSON.stringify(cwd)} = "read"\n[permissions.bot.network]\nenabled = false\n`,{mode:0o600});
+    // are disabled individually except native image generation; filesystem grants remain minimal.
+    await writeFile(join(home,'config.toml'),`approval_policy = "never"\ndefault_permissions = "bot"\nweb_search = "live"\n[features]\nshell_tool = false\nview_image = false\napps = false\nplugins = false\nhooks = false\ncomputer_use = false\nin_app_browser = false\nimage_generation = true\nomit_app_server_notification_media = false\nmulti_agent = false\nmemories = false\ncode_mode = false\ncode_mode_host = true\nbrowser_use = false\nbrowser_use_external = false\nbrowser_use_full_cdp_access = false\nrequest_permissions_tool = false\nskill_search = false\nskill_mcp_dependency_install = false\nskip_host_skill_discovery = true\nshell_snapshot = false\ngoals = false\nsleep_tool = false\n[permissions.bot.filesystem]\n":minimal" = "read"\n${JSON.stringify(cwd)} = "read"\n[permissions.bot.network]\nenabled = false\n`,{mode:0o600});
     const env:NodeJS.ProcessEnv={PATH:process.env.PATH??'/usr/bin:/bin',HOME:dir,CODEX_HOME:home,LANG:'C.UTF-8'};
     if(this.closed||signal?.aborted)throw new Error('Codex unavailable');
     const rpc=new Rpc(this.command,cwd,env);this.workers.add(rpc);
@@ -156,16 +157,19 @@ export class CodexEngine implements ModelEngine {
         if(!matched)throw new AttachmentError('Выбранная модель недоступна или не поддерживает изображения. Выберите модель с поддержкой изображений.');
       }
       const cwd=join(dir,'empty');
+      const developerInstructions='Respond to the user in ordinary Markdown. Cite web sources as descriptive Markdown links to public URLs; internal citation tokens do not render in Telegram. Use the native tools.image_gen__imagegen tool for artwork, illustrations, posters and image editing. Use isolated_compute Python for numerical calculations and scientific plots, never as a substitute for native artwork. Image generation uses the current ChatGPT authorization and its model/account limits; if the native tool is unavailable, explain that limitation. Never ask for an API key or silently switch billing routes. For image editing use num_last_images_to_include for images in this conversation only; never use local reference paths. Computations use isolated_compute only. Generated PNG attachments are already delivered with your answer; do not link local paths.';
       const scope={model:request.model,permissions:'bot',approvalPolicy:'never',cwd,runtimeWorkspaceRoots:[cwd]};
       const thread=state?.nativeId
-        ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true})
-        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions:'Respond to the user in ordinary Markdown. Cite web sources as descriptive Markdown links to public URLs; internal citation tokens do not render in Telegram. Computations use isolated_compute only. Generated PNG attachments are already delivered with your answer; do not link local paths.',dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
+        ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions})
+        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
       const nativeId=thread.thread.id as string;
       await this.save(dir,{userId:request.userId,nativeId,status:'running'});
       await request.onThread(id);
       if(abort.signal.aborted)throw new Error('Request cancelled');
       const events:any[]=[];let turnId:string|undefined;const items=new Map<string,string>();
-      const images:GeneratedImage[]=[];let imageBytes=0;const calls=new Set<string>();let computing=false;
+      const images:GeneratedImage[]=[];let imageBytes=0;
+      const nativeImages=new Map<string,GeneratedImage|undefined>();let nativeBytes=0,nativeError:ImageGenerationError|undefined;
+      const calls=new Set<string>();let computing=false;
       let finish:(x:any)=>void=()=>{},fail:(e:Error)=>void=()=>{};
       const completed=new Promise<any>((resolve,reject)=>{finish=resolve;fail=reject;});
       // The completion promise may reject while awaiting the turn/start RPC.
@@ -191,19 +195,43 @@ export class CodexEngine implements ModelEngine {
           if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:'Calculation unavailable or resource limit exceeded'}],success:false}});
         }finally{computing=false;}
       };
+      const recordImage=(item:any,completedItem:boolean)=>{
+        if(nativeError)return;
+        try{
+          if(typeof item.id!=='string'||!item.id||item.id.length>1024)throw new ImageGenerationError('Не удалось получить корректное изображение от Codex. Попробуйте повторить запрос.');
+          if(!nativeImages.has(item.id)){
+            if(nativeImages.size>=GENERATED_IMAGE_LIMITS.nativeImages)throw new ImageGenerationError('Codex вернул слишком много изображений. Попросите не более четырёх за один запрос.');
+            nativeImages.set(item.id,undefined);
+          }
+          if(!completedItem)return;
+          if(item.status!=='completed'||item.failure){
+            throw new ImageGenerationError(item.failure?.type==='usageLimitExceeded'?'Достигнут лимит генерации изображений Codex. Попробуйте позднее.':'Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
+          }
+          if(nativeImages.get(item.id))return;
+          const bytes=nativePng(item.result,GENERATED_IMAGE_LIMITS.totalBytes-nativeBytes);
+          if(nativeBytes+bytes.length>GENERATED_IMAGE_LIMITS.totalBytes)throw new ImageGenerationError('Изображения Codex слишком большие для одного ответа. Попросите меньше изображений.');
+          nativeBytes+=bytes.length;nativeImages.set(item.id,{bytes,name:'',mime:'image/png'});
+        }catch(error){nativeError=error instanceof ImageGenerationError?error:new ImageGenerationError('Не удалось получить корректное изображение от Codex. Попробуйте повторить запрос.');fail(nativeError);}
+      };
+      const recordItem=(item:any)=>{
+        if(item?.type==='imageGeneration')recordImage(item,true);
+        if(item?.type==='agentMessage'&&(item.phase===null||item.phase==='final_answer'))items.set(item.id,item.text);
+      };
       const consume=(f:any)=>{
         if(f.id!==undefined){const task=handleTool(f);computations.add(task);void task.finally(()=>computations.delete(task));return;}
         if(f.params?.threadId!==nativeId)return;
         if(!turnId){events.push(f);return;}
         if(f.params.turnId!==undefined&&f.params.turnId!==turnId)return;
-        if(f.method==='item/completed'){
-          const item=f.params.item;
-          if(item.type==='agentMessage'&&(item.phase===null||item.phase==='final_answer'))items.set(item.id,item.text);
-        }
+        if(f.method==='item/started'&&f.params.turnId===turnId&&f.params.item?.type==='imageGeneration')recordImage(f.params.item,false);
+        if(f.method==='item/completed'&&f.params.turnId===turnId)recordItem(f.params.item);
         if(f.method==='turn/completed'&&f.params.turn.id===turnId){
-          if(f.params.turn.status!=='completed'){fail(new Error('Codex request failed'));return;}
-          for(const item of f.params.turn.items??[])
-            if(item.type==='agentMessage'&&(item.phase===null||item.phase==='final_answer'))items.set(item.id,item.text);
+          for(const item of f.params.turn.items??[])recordItem(item);
+          if(f.params.turn.status!=='completed'){
+            fail(nativeImages.size?new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.'):new Error('Codex request failed'));return;
+          }
+          if([...nativeImages.values()].some(image=>!image)){
+            fail(new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.'));return;
+          }
           finish(f.params.turn);
         }
       };
@@ -217,10 +245,11 @@ export class CodexEngine implements ModelEngine {
       await completed;
       abort.signal.removeEventListener('abort',stop);
       if(abort.signal.aborted)throw new Error('Request cancelled');
-      const answer=[...items.values()].join('\n\n');if(!answer)throw new Error('Codex returned an empty answer');
+      const answer=[...items.values()].join('\n\n').trim()||(nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
       await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
+      images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images};
-    }catch(error){if(!abort.signal.aborted&&error instanceof AttachmentError)throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
+    }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
     finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{

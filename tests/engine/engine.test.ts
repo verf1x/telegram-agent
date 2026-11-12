@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,rm } from 'node:fs/promises';
+import { mkdtemp,rm,readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { CodexEngine } from '../../src/codex/engine.ts';
@@ -214,4 +214,146 @@ test('the caller controls request lifetime beyond ten minutes and can still canc
   assert.equal(result.text,'42');assert.equal(abort.signal.aborted,false);
   await assert.rejects(engine.run({userId:1,text:'wait',model:'gpt-6.1-sol',effort:'medium',signal:abort.signal,onThread:()=>abort.abort()}),/cancelled/);
  }finally {await engine.close();t.mock.timers.reset();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+
+test('a native generated image returns verified inline PNG bytes without reading its savedPath',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  const result=await engine.run({userId:1,text:'native-image:valid',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.equal(result.text,'Created artwork');
+  assert.equal(result.images.length,1);
+  assert.equal(result.images[0]!.mime,'image/png');
+  assert.equal(result.images[0]!.name,'generated-image-1.png');
+  assert.deepEqual(Buffer.from(result.images[0]!.bytes),await readFile('tests/fixtures/attachments/tiny.png'));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+
+test('native images retain generation order and duplicate or foreign notifications do not add images',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  const result=await engine.run({userId:1,text:'native-image:ordered',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.deepEqual(result.images.map(image=>image.name),['generated-image-1.png','generated-image-2.png']);
+  assert.deepEqual(Buffer.from(result.images[0]!.bytes),await readFile('tests/fixtures/attachments/tiny.png'));
+  assert.deepEqual(Buffer.from(result.images[1]!.bytes),await readFile('tests/fixtures/attachments/transparent.png'));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('native artwork without assistant prose still returns an image and a friendly explanation',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  const result=await engine.run({userId:1,text:'native-image:image-only',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.equal(result.images.length,1);assert.match(result.text,/Изображени/);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+
+test('new and restarted dialogs enable native artwork while retaining the isolated worker policy',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
+ let engine=new CodexEngine(options);
+ const base={userId:1,text:'native-image:policy',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const first=await engine.run(base);
+  await engine.close();engine=new CodexEngine(options);
+  const resumed=await engine.run({...base,threadId:first.threadId});
+  for(const [index,response] of [first,resumed].entries()){
+   const report=JSON.parse(response.text);
+   assert.equal(report.threadMethod,index?'thread/resume':'thread/start');
+   assert.match(report.config,/image_generation = true/);
+   assert.match(report.config,/omit_app_server_notification_media = false/);
+   for(const feature of ['shell_tool','view_image','apps','plugins','hooks','computer_use','in_app_browser','code_mode','multi_agent','memories','request_permissions_tool'])assert.ok(report.config.includes(feature+' = false'));
+   assert.match(report.config,/code_mode_host = true/);assert.match(report.config,/enabled = false/);
+   assert.deepEqual(report.turnParams.environments,[]);
+   if(index===0)assert.deepEqual(report.threadParams.environments,[]);
+   assert.equal(report.threadParams.permissions,'bot');assert.equal(report.turnParams.permissions,'bot');
+   assert.match(report.threadParams.developerInstructions,/image_gen__imagegen/);
+   assert.match(report.threadParams.developerInstructions,/num_last_images_to_include/);
+   assert.match(report.threadParams.developerInstructions,/API key/);
+  }
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+
+test('failed, unfinished or non-inline native generation never claims successful delivery',async(t)=>{
+ for(const scenario of ['failed','failed-with-result','failed-turn','mixed','in-progress','started-only','missing-inline','missing-result','too-many'])await t.test(scenario,async()=>{
+  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+  try {
+   await assert.rejects(engine.run({userId:1,text:'native-image:'+scenario,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),(error:Error)=>error.name==='ImageGenerationError'&&!error.message.includes('SECRET')&&!error.message.includes('/etc'));
+  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+ });
+});
+
+
+test('native image results reject malformed base64, broken PNG chunks and excessive dimensions',async(t)=>{
+ for(const scenario of ['url','dataurl','whitespace','invalid','truncated','trailer','signature','crc','dimensions','pixels','zero','object','noncanonical'])await t.test(scenario,async()=>{
+  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+  try {
+   await assert.rejects(engine.run({userId:1,text:'native-image:malformed-'+scenario,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),(error:Error)=>error.name==='ImageGenerationError'&&!error.message.includes('SECRET'));
+  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+ });
+});
+
+test('native output supports four images and its full byte budget alongside echoed image inputs',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  assert.equal((await engine.run({...base,text:'native-image:four'})).images.length,4);
+  const bytes=Buffer.alloc(5500000);Buffer.from(png,'base64').copy(bytes);
+  const result=await engine.run({...base,text:'native-image:max-budget',attachments:[{name:'scan.png',text:'',images:[{name:'scan.png',mime:'image/png',base64:bytes.toString('base64')}]}]});
+  assert.deepEqual(result.images.map(image=>image.bytes.length),[8000000,8000000,8000000]);
+  assert.ok(result.text);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('native output rejects an excessive single image or total byte budget',async(t)=>{
+ for(const scenario of ['image-limit','total-limit'])await t.test(scenario,async()=>{
+  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+  try {
+   await assert.rejects(engine.run({userId:1,text:'native-image:'+scenario,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),(error:Error)=>error.name==='ImageGenerationError');
+  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+ });
+});
+
+
+test('notification-only native completion delivers its image and wrong turn summaries are ignored',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  for(const scenario of ['notification-only','wrong-turn-summary']){
+   const response=await engine.run({...base,text:'native-image:'+scenario});
+   assert.equal(response.images.length,1);assert.equal(response.text,'Created artwork');
+  }
+  const ordinary=await engine.run({...base,text:'native-image:unavailable'});
+  assert.deepEqual(ordinary.images,[]);assert.match(ordinary.text,/unavailable/);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('cancelling native generation returns promptly and does not reuse its incomplete thread',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const abort=new AbortController();let timer:NodeJS.Timeout|undefined,saved='';
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:abort.signal,onThread:(id:string)=>{saved=id;timer=setTimeout(()=>abort.abort(),200);}};
+ try {
+  await assert.rejects(engine.run({...base,text:'native-image:wait'}),/cancelled/);
+  const next=await engine.run({...base,threadId:saved,text:'native-image:valid',signal:new AbortController().signal,onThread:()=>{}});
+  assert.notEqual(next.threadId,saved);assert.equal(next.images.length,1);
+ }finally{if(timer)clearTimeout(timer);await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('an app-server frame above the bounded native media budget fails safely',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  await assert.rejects(engine.run({userId:1,text:'native-image:oversized-frame',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),/^Error: Codex request failed$/);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
