@@ -11,15 +11,20 @@ export class Rpc {
   onClose:()=>void=()=>{};
   constructor(command:string,cwd:string,env:NodeJS.ProcessEnv) {
     this.child=spawn(command,['app-server','--listen','stdio://','--strict-config'],{cwd,env,stdio:'pipe'});
-    let buffer='';
+    // A summary can contain native artwork plus echoed user inputs and tool results.
+    // Accumulate fragments once; repeatedly scanning a growing base64 frame is quadratic.
+    const frameLimit=64*1024*1024;
+    let fragments:string[]=[],frameBytes=0;
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data',(chunk:string)=>{
-      buffer+=chunk;
-      let index:number;
-      while((index=buffer.indexOf('\n'))>=0){
-        const line=buffer.slice(0,index);buffer=buffer.slice(index+1);
-        // A completed multimodal userMessage may echo the full outgoing input.
-        if(Buffer.byteLength(line)>32*1024*1024){this.stop();return;}
+      let offset=0;
+      while(offset<chunk.length){
+        const newline=chunk.indexOf('\n',offset),end=newline<0?chunk.length:newline;
+        const fragment=chunk.slice(offset,end);frameBytes+=Buffer.byteLength(fragment);
+        if(frameBytes>frameLimit){this.stop();return;}
+        fragments.push(fragment);
+        if(newline<0)return;
+        const line=fragments.join('');fragments=[];frameBytes=0;offset=newline+1;
         if(!line.trim())continue;
         try{
           const frame=JSON.parse(line) as Frame;
@@ -28,9 +33,8 @@ export class Rpc {
           const wait=this.pending.get(frame.id);if(!wait)continue;
           this.pending.delete(frame.id);clearTimeout(wait.timer);
           if(frame.error)wait.reject(new Error('Codex request failed'));else wait.resolve(frame.result);
-        }catch{this.stop();}
+        }catch{this.stop();return;}
       }
-      if(Buffer.byteLength(buffer)>32*1024*1024)this.stop();
     });
     // Drain and discard: diagnostics can include credentials, prompts or local paths.
     this.child.stderr.on('data',()=>{});
