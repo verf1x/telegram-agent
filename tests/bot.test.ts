@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileConfigSource } from "../src/config.ts";
 import { SqliteStore } from "../src/store.ts";
-import { AttachmentError } from "../src/contracts.ts";
+import { AttachmentError, ImageGenerationError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import type {
   AttachmentReader,
@@ -14,6 +14,8 @@ import type {
   OutgoingPart,
   TelegramUpdate,
 } from "../src/contracts.ts";
+
+const generatedPng = readFileSync(new URL("./fixtures/attachments/tiny.png", import.meta.url));
 
 function fixture(t: any, attachments?: AttachmentReader) {
   const dir = mkdtempSync(join(tmpdir(), "verfix-bot-"));
@@ -127,6 +129,83 @@ test("approved users receive independent answers and their dialogue survives SQL
   assert.equal(f.requests.at(-1).threadId, "thread-2");
   assert.equal(f.requests[0].model, "gpt-6.1-sol");
   assert.equal(f.requests[0].effort, "medium");
+});
+
+test("an approved user receives a safe image generation limit error and can explicitly retry", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "previous request"));
+  await f.bot.drain();
+  const run = f.engine.run;
+  const message = "Лимит генерации изображений исчерпан. Повторите запрос позже.";
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    await request.onThread("failed-image-thread");
+    throw new ImageGenerationError(message);
+  };
+  await f.bot.handleUpdate(f.update(2, "Нарисуй кота-космонавта"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, message);
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "Попробуем ещё раз"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, "answer Попробуем ещё раз");
+  assert.equal(f.requests.at(-1).threadId, undefined);
+  assert.deepEqual(f.requests.at(-1).history, [
+    { role: "user", text: "previous request" },
+    { role: "assistant", text: "answer previous request" },
+  ]);
+});
+
+test("an ordinary approved user receives generated images in order in their existing dialogue", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "Начнём диалог"));
+  await f.bot.drain();
+  f.sent.length = 0;
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    return {
+      text: "Два варианта кота-космонавта.",
+      threadId: "thread-2",
+      images: ["first.png", "second.png"].map((name) => ({ name, mime: "image/png", bytes: generatedPng })),
+    };
+  };
+  await f.bot.handleUpdate(f.update(99, "Нарисуй секретную картинку"));
+  assert.equal(f.requests.length, 1);
+  await f.bot.handleUpdate(f.update(2, "Нарисуй кота-космонавта в двух вариантах"));
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(({ chatId, part }) => ({ chatId, part })), [
+    { chatId: 2, part: { kind: "rich", text: "Два варианта кота-космонавта." } },
+    { chatId: 2, part: { kind: "image", name: "first.png", mime: "image/png", base64: generatedPng.toString("base64") } },
+    { chatId: 2, part: { kind: "image", name: "second.png", mime: "image/png", base64: generatedPng.toString("base64") } },
+  ]);
+  assert.equal(f.requests.at(-1).threadId, "thread-2");
+  assert.equal(f.requests.at(-1).model, "gpt-6.1-sol");
+  assert.equal(f.requests.at(-1).effort, "medium");
+});
+
+test("a safe generation failure resumes error delivery after SQLite reopen without repeating generation", async (t) => {
+  const f = fixture(t);
+  const message = "Не удалось создать изображение. Повторите запрос позже.";
+  const run = f.engine.run;
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    throw new ImageGenerationError(message);
+  };
+  const send = f.telegram.sendPart;
+  f.telegram.sendPart = async () => { throw new Error("network unavailable"); };
+  await f.bot.handleUpdate(f.update(2, "Нарисуй постер"));
+  await f.bot.drain();
+  assert.equal(f.sent.length, 0);
+  f.telegram.sendPart = send;
+  await f.reopen();
+  await new Promise((resolve) => setTimeout(resolve, 1300));
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(({ chatId, text }) => [chatId, text]), [[2, message]]);
+  assert.equal(f.requests.length, 1);
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "Другое задание"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, "answer Другое задание");
 });
 
 test("one user remains busy until response delivery and other users continue", async (t) => {
@@ -341,6 +420,37 @@ test("long saved answers resume after restart without resending acknowledged par
   assert.equal(f.sent.map((x) => x.text).join(""), text);
 });
 
+test("saved generated images resume in order after SQLite reopen without resending acknowledged images or calling the model", async (t) => {
+  const f = fixture(t);
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    return {
+      text: "Три иллюстрации.",
+      threadId: "illustration-thread",
+      images: ["first.png", "second.png", "third.png"].map((name) => ({ name, mime: "image/png", bytes: generatedPng })),
+    };
+  };
+  const send = f.telegram.sendPart;
+  f.telegram.sendPart = async (...args) => {
+    if (args[1].kind === "image" && args[1].name === "second.png") throw new Error("network unavailable");
+    return send(...args);
+  };
+  await f.bot.handleUpdate(f.update(2, "Нарисуй три иллюстрации"));
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(({ text }) => text), ["Три иллюстрации.", "first.png"]);
+  f.telegram.sendPart = send;
+  await f.reopen();
+  await new Promise((resolve) => setTimeout(resolve, 1300));
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(({ chatId, text }) => [chatId, text]), [
+    [2, "Три иллюстрации."], [2, "first.png"], [2, "second.png"], [2, "third.png"],
+  ]);
+  assert.ok(f.sent.filter(({ part }) => part?.kind === "image").every(({ part }) =>
+    part?.kind === "image" && part.base64 === generatedPng.toString("base64") && part.mime === "image/png",
+  ));
+  assert.equal(f.requests.length, 1);
+});
+
 test("owner picker binds model identity when catalog order changes and survives reset/restart", async (t) => {
   const f = fixture(t);
   const a = { id: "model-a", supportedEfforts: ["medium", "high"] },
@@ -440,7 +550,7 @@ test("invalid runtime configuration pauses accepted output and owner diagnostics
   assert.equal(f.requests.length, 1);
 });
 
-test("revocation cancels pending output permanently while granting access preserves committed dialogue", async (t) => {
+test("revocation during image generation permanently cancels all output while granting access preserves committed dialogue", async (t) => {
   const f = fixture(t);
   let finish!: (value: any) => void;
   f.engine.run = async (r) => {
@@ -453,7 +563,7 @@ test("revocation cancels pending output permanently while granting access preser
   await new Promise((r) => setTimeout(r, 60));
   writeFileSync(f.env, f.configText("2"));
   await new Promise((r) => setTimeout(r, 60));
-  finish({ text: "cancelled answer", threadId: "retained", images: [] });
+  finish({ text: "cancelled answer", threadId: "retained", images: [{ name: "private.png", mime: "image/png", bytes: generatedPng }] });
   await f.bot.drain();
   assert.equal(f.sent.length, 0);
   f.engine.run = async (r) => {
