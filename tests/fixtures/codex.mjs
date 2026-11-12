@@ -38,15 +38,26 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    }
    if(scenario==='image-only')items=[image()];
    if(scenario==='wait'){event('item/started',{...image(),status:'in_progress',result:''});return;}
+   if(scenario==='completed-then-wait'){event('item/completed',image());return;}
    if(scenario==='notification-only'){event('item/completed',image());items=[items[1]];}
    if(scenario==='wrong-turn-summary')send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'other-turn',status:'failed',items:[image('foreign')]}}});
    if(scenario==='oversized-frame'){process.stdout.write('x'.repeat(64*1024*1024+1));return;}
    if(scenario==='unavailable')items=[{id:'a',type:'agentMessage',phase:'final_answer',text:'Native image generation is unavailable for this model. Ordinary text is available.'}];
    if(scenario==='failed'||scenario==='mixed'||scenario==='failed-turn'){
     const failed={...image('failed'),status:'failed',result:'',failure:{type:'usageLimitExceeded',limitId:'SECRET-PROVIDER-DETAIL',resetsAt:null}};
-    items=scenario==='mixed'?[image(),failed]:[failed];
+    items=scenario==='mixed'?[image(),failed,items[1]]:[failed];
    }
    if(scenario==='failed-with-result')items=[{...image(),status:'failed'}];
+   if(['mixed-missing-inline','mixed-malformed','mixed-unfinished'].includes(scenario)){
+    const first=image('first'),second=image('second','transparent.png'),broken={...image('broken'),result:'SECRET'};
+    if(scenario==='mixed-missing-inline'){delete broken.result;broken.fileId='remote-SECRET';}
+    if(scenario==='mixed-unfinished')broken.status='in_progress';
+    event('item/started',{...first,status:'in_progress',result:''});
+    event('item/started',{...second,status:'in_progress',result:''});
+    event('item/completed',second);event('item/completed',broken);event('item/completed',first);event('item/completed',second);
+    event('item/completed',image('foreign'),{threadId:'other-thread'});
+    items=[first,broken,second,items[1]];
+   }
    if(scenario==='in-progress')items=[{...image(),status:'in_progress'}];
    if(scenario==='started-only'){event('item/started',{...image(),status:'in_progress',result:''});items=[items[1]];}
    if(scenario==='missing-inline'){const missing=image();delete missing.result;items=[{...missing,fileId:'remote-SECRET',savedPath:new URL('./attachments/tiny.png',import.meta.url).pathname}];}
@@ -61,7 +72,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     if(scenario==='max-budget')items.unshift({id:'user-input',type:'userMessage',content:x.params.input});
    }
    if(scenario==='policy')items=[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify({config:readFileSync(process.env.CODEX_HOME+'/config.toml','utf8'),threadParams,threadMethod,turnParams:x.params})}];
-   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:scenario==='failed-turn'?'failed':'completed',items}}});return;
+   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:['failed-turn','completed-failed-turn'].includes(scenario)?'failed':'completed',items}}});return;
   }
   if(text==='wait')return;
   if(text.startsWith('remember:')||text==='recall'){
