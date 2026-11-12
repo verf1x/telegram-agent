@@ -49,3 +49,66 @@ test('a dialog returns a validated PNG from its own isolated calculation',{skip:
   assert.equal(Buffer.from(result.images[0]!.bytes).subarray(0,8).toString('hex'),'89504e470d0a1a0a');
  }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
+
+test('calculation cannot create files through Python or raw syscalls, or exceed slot size',{skip:!pythonPath},async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs'),pythonPath});
+ try {
+  const code=`import os,json,ctypes
+report={}
+for label,fn in [('create',lambda:os.open('/work/new',os.O_WRONLY|os.O_CREAT)),('tmpfile',lambda:os.open('/work',os.O_RDWR|os.O_TMPFILE)),('mkdir',lambda:os.mkdir('/tmp/new')),('symlink',lambda:os.symlink('/etc/passwd','/work/result.png')),('link',lambda:os.link('/work/scratch-0.txt','/work/new')),('root',lambda:open('/new','w')),('device',lambda:open('/dev/new','w'))]:
+ try: fn();report[label]='allowed'
+ except OSError: report[label]='denied'
+with open('/work/scratch-0.txt','w') as f: f.write('existing file works')
+report['existing']=open('/work/scratch-0.txt').read()
+report['work_bytes']=os.statvfs('/work').f_blocks*os.statvfs('/work').f_frsize
+report['tmp_bytes']=os.statvfs('/tmp').f_blocks*os.statvfs('/tmp').f_frsize
+try: os.truncate('/work/scratch-0.txt',10*1024*1024);report['size']='allowed'
+except OSError: report['size']='denied'
+libc=ctypes.CDLL(None,use_errno=True)
+report['raw_create']=libc.syscall(257,-100,b'/work/raw',os.O_CREAT|os.O_WRONLY,0o600)
+report['raw_errno']=ctypes.get_errno()
+print(json.dumps(report))`;
+  const result=await engine.run({userId:123,text:'compute:'+code,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  const report=JSON.parse(JSON.parse(result.text).stdout);
+  assert.deepEqual(report,{create:'denied',tmpfile:'denied',mkdir:'denied',symlink:'denied',link:'denied',root:'denied',device:'denied',existing:'existing file works',work_bytes:67108864,tmp_bytes:33554432,size:'denied',raw_create:-1,raw_errno:1});
+ }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('malformed generated images never become attachments',{skip:!pythonPath},async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs'),pythonPath});
+ try {
+  const result=await engine.run({userId:123,text:'compute:open("/work/result.png","wb").write(b"not an image")',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.deepEqual(result.images,[]);assert.match(result.text,/unavailable|limit/);
+ }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('dialogs resume independently after restart and deleted context cannot resume',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
+ let engine=new CodexEngine(options);
+ const query=(userId:number,text:string,threadId?:string)=>engine.run({userId,text,...(threadId?{threadId}:{}),model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+ try {
+  const first=await query(1,'remember:ALPHA');const second=await query(2,'remember:BETA');
+  await engine.close();engine=new CodexEngine(options);
+  assert.equal((await query(1,'recall',first.threadId)).text,'ALPHA');assert.equal((await query(2,'recall',second.threadId)).text,'BETA');
+  await assert.rejects(query(2,'recall',first.threadId),/unavailable/);
+  await engine.deleteThread(first.threadId);
+  await assert.rejects(query(1,'recall',first.threadId),/unavailable/);
+  assert.equal((await query(2,'recall',second.threadId)).text,'BETA');
+ }finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('cancelling a calculation stops it and the next request uses a fresh thread',{skip:!pythonPath},async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs'),pythonPath});
+ const abort=new AbortController();let saved='';let timer:NodeJS.Timeout|undefined;
+ try {
+  const started=Date.now();
+  await assert.rejects(engine.run({userId:123,text:'compute:while True: pass',model:'gpt-6.1-sol',effort:'medium',signal:abort.signal,onThread:id=>{saved=id;timer=setTimeout(()=>abort.abort(),1200);}}),/cancelled/);
+  assert.ok(Date.now()-started<5000,'cancellation returns promptly');
+  const next=await engine.run({userId:123,threadId:saved,text:'six times seven',history:[{role:'user',text:'hello'},{role:'assistant',text:'completed answer'}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.notEqual(next.threadId,saved);assert.equal(next.text,'42');
+ }finally {if(timer)clearTimeout(timer);await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});

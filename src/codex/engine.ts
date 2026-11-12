@@ -12,10 +12,11 @@ export class CodexEngine implements ModelEngine {
   private command:string;
   private pythonPath:string;
   private workers=new Set<Rpc>();
-  private active=new Map<string,AbortController>();
+  private active=new Map<string,{abort:AbortController;done:Promise<void>}>();
   private closed=false;
   constructor(options:CodexEngineOptions){this.root=resolve(options.runtimeDir,'codex');this.command=options.codexCommand??'codex';this.pythonPath=options.pythonPath??resolve('.venv/bin/python');}
-  private async worker(dir:string){
+  private async worker(dir:string,signal?:AbortSignal){
+    if(this.closed||signal?.aborted)throw new Error('Codex unavailable');
     const home=join(dir,'home'),cwd=join(dir,'empty');
     await mkdir(home,{recursive:true,mode:0o700});await mkdir(cwd,{recursive:true,mode:0o700});
     await chmod(dir,0o700);
@@ -30,7 +31,10 @@ export class CodexEngine implements ModelEngine {
     const env:NodeJS.ProcessEnv={PATH:process.env.PATH??'/usr/bin:/bin',HOME:dir,CODEX_HOME:home,LANG:'C.UTF-8'};
     const rpc=new Rpc(this.command,cwd,env);this.workers.add(rpc);
     rpc.onFrame=frame=>{if(frame.id!==undefined)rpc.send({id:frame.id,error:{code:-32601,message:'Request denied'}});};
-    try{await rpc.initialize();return {rpc,cwd};}catch{rpc.stop();this.workers.delete(rpc);throw new Error('Codex unavailable');}
+    const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
+    try{await rpc.initialize();if(signal?.aborted)throw new Error();return {rpc,cwd};}
+    catch{rpc.stop();this.workers.delete(rpc);throw new Error('Codex unavailable');}
+    finally{signal?.removeEventListener('abort',cancel);}
   }
   async listModels():Promise<ModelInfo[]>{
     const {rpc}=await this.worker(join(this.root,'catalog'));
@@ -58,7 +62,6 @@ export class CodexEngine implements ModelEngine {
   }
   async run(request:ModelRequest):Promise<ModelResponse>{
     if(this.closed||request.signal.aborted)throw new Error('Request cancelled');
-    if(this.active.size>=4)throw new Error('Codex busy');
     let id=request.threadId??randomUUID(),dir=this.threadDir(id);
     if(this.active.has(id))throw new Error('Dialog busy');
     let state:any;
@@ -69,20 +72,22 @@ export class CodexEngine implements ModelEngine {
         await this.deleteThread(id);id=randomUUID();dir=this.threadDir(id);state=undefined;
       }
     }
-    const abort=new AbortController();this.active.set(id,abort);
-    const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});
+    const abort=new AbortController();let markDone:()=>void=()=>{};
+    const done=new Promise<void>(resolve=>{markDone=resolve;});this.active.set(id,{abort,done});
+    const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
     let rpc:Rpc|undefined;
+    const computations=new Set<Promise<void>>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
     const deadline=setTimeout(()=>abort.abort(),600000);
     try{
       await mkdir(dir,{recursive:true,mode:0o700});
-      ({rpc}=await this.worker(dir));const connection=rpc;
+      ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
       if(abort.signal.aborted)throw new Error('Request cancelled');
       const cwd=join(dir,'empty');
       const scope={model:request.model,permissions:'bot',approvalPolicy:'never',cwd,runtimeWorkspaceRoots:[cwd]};
       const thread=state?.nativeId
         ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true})
-        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
+        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions:'Respond to the user in ordinary Markdown. Cite web sources as descriptive Markdown links to public URLs; internal citation tokens do not render in Telegram. Computations use isolated_compute only. Generated PNG attachments are already delivered with your answer; do not link local paths.',dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
       const nativeId=thread.thread.id as string;
       await this.save(dir,{userId:request.userId,nativeId,status:'running'});
       await request.onThread(id);
@@ -115,7 +120,7 @@ export class CodexEngine implements ModelEngine {
         }finally{computing=false;}
       };
       const consume=(f:any)=>{
-        if(f.id!==undefined){void handleTool(f);return;}
+        if(f.id!==undefined){const task=handleTool(f);computations.add(task);void task.finally(()=>computations.delete(task));return;}
         if(f.params?.threadId!==nativeId)return;
         if(!turnId){events.push(f);return;}
         if(f.params.turnId!==undefined&&f.params.turnId!==turnId)return;
@@ -146,11 +151,12 @@ export class CodexEngine implements ModelEngine {
       await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       return {text:answer,threadId:id,images};
     }catch{throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
-    finally{clearTimeout(deadline);abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);this.active.delete(id);}
+    finally{clearTimeout(deadline);abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{
-    const dir=this.threadDir(threadId);this.active.get(threadId)?.abort();
+    const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();
+    await active?.done;
     await rm(dir,{recursive:true,force:true});
   }
-  async close(){this.closed=true;for(const abort of this.active.values())abort.abort();for(const rpc of this.workers)rpc.stop();this.workers.clear();}
+  async close(){this.closed=true;for(const job of this.active.values())job.abort.abort();for(const rpc of this.workers)rpc.stop();this.workers.clear();await Promise.all([...this.active.values()].map(job=>job.done));}
 }
