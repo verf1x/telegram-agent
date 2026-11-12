@@ -32,6 +32,27 @@ test('DOCX paragraphs, table cells and embedded pictures retain their order',{sk
  assert.equal(file!.images.length,1);
 });
 
+test('a Word fraction reaches the task with its numerator and denominator intact',{skip:!pythonPath},async()=>{
+ const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('fraction.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document')],new AbortController().signal);
+ assert.equal(file!.text,'Compute: \\(\\frac{1}{2}\\) = ?');
+ assert.doesNotMatch(file!.text,/Compute: 12/);
+});
+test('nested Word powers, subscripts and square or indexed roots preserve their mathematical meaning',{skip:!pythonPath},async()=>{
+ const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('nested-math.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document')],new AbortController().signal);
+ assert.equal(file!.text,'Compute: \\(\\frac{{x}^{2}}{\\sqrt{{y}_{1}}}+\\sqrt[3]{8}\\) = ?');
+});
+test('complex and strict Word math retains complete labeled OMML instead of lossy plain text',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ for(const name of ['complex-math.docx','strict-math.docx']){
+  const [file]=await reader.prepare([await fixture(name,'application/vnd.openxmlformats-officedocument.wordprocessingml.document')],new AbortController().signal);
+  assert.match(file!.text,/\[Office Math — complete structured OMML XML\]/);
+  for(const structure of ['nary','naryPr','sub','sup','e','sSup'])assert.match(file!.text,new RegExp(`<[^<>]+:${structure}[ >]`));
+  assert.match(file!.text,/val="∑"/);assert.match(file!.text,/>i=1</);assert.match(file!.text,/>n</);assert.match(file!.text,/>2</);
+  assert.match(file!.text,/\[\/Office Math\]\n = \?$/);
+  assert.doesNotMatch(file!.text,/i=1ni2/);
+ }
+});
+
 test('XLSX keeps sheet, row and cell order, shared strings and inert cached formulas',{skip:!pythonPath},async()=>{
  const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('sheet.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')],new AbortController().signal);
  assert.match(file!.text,/Sales\nA1: Apples\tB1: 42\nB2: =B1\*2 \[cached: 84\]\n\nForecast\nA1: Next year\tB1: 100/);
@@ -40,6 +61,29 @@ test('PPTX uses presentation slide order and includes embedded pictures',{skip:!
  const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('slides.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation')],new AbortController().signal);
  assert.match(file!.text,/Slide 1\nOpening slide\.\n\[Image 1\]\n\nSlide 2\nFinal slide\./);
  assert.equal(file!.images.length,1);
+});
+
+test('chart-only Word, Excel and PowerPoint files reject the whole task and request a PDF export',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ for(const name of ['chart.docx','chart.xlsx','chart.pptx']){
+  await assert.rejects(reader.prepare([{name:'safe.txt',mime:'text/plain',bytes:Buffer.from('Surrounding task')},await fixture(name,'application/octet-stream')],new AbortController().signal),(error:unknown)=>{
+   assert.equal((error as Error).name,'AttachmentError');assert.match((error as Error).message,/PDF/);assert.match((error as Error).message,/диаграмм|график|рисунк/);return true;
+  });
+ }
+});
+test('PowerPoint layout and master material cannot disappear behind an empty slide',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ for(const name of ['slideLayout-content.pptx','slideMaster-content.pptx','slideLayout-chart.pptx','slideMaster-chart.pptx'])
+  await assert.rejects(reader.prepare([await fixture(name,'application/vnd.openxmlformats-officedocument.presentationml.presentation')],new AbortController().signal),/PDF/);
+});
+test('Office vector drawings, spreadsheet shapes, connectors and SmartArt request PDF instead of partial content',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ for(const name of ['vector.docx','drawing.xlsx','connector.pptx','smartart.docx'])
+  await assert.rejects(reader.prepare([await fixture(name,'application/octet-stream')],new AbortController().signal),/PDF/);
+});
+test('empty PowerPoint layout placeholders do not hide or reject actual slide text',{skip:!pythonPath},async()=>{
+ const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('empty-placeholders.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation')],new AbortController().signal);
+ assert.equal(file!.text,'Slide 1\nActual slide text.');
 });
 
 test('a corrupt or unsupported attachment rejects the whole task with a safe actionable error',{skip:!pythonPath},async()=>{

@@ -9,6 +9,7 @@ import type {AttachmentReader,DownloadedAttachment,InputImage,PreparedAttachment
 const unavailable='Не удалось прочитать файл. Проверьте формат или разделите материалы.';
 const split='Материалы превышают лимит. Разделите их на несколько заданий.';
 const cancelled='Чтение вложений отменено.';
+const pdfExport='Документ содержит диаграммы, SmartArt или неподдерживаемые рисунки. Экспортируйте его в PDF и отправьте снова.';
 
 /** Uploaded bytes cross an inherited FD; user filenames are display metadata. */
 export class SandboxedAttachmentReader implements AttachmentReader {
@@ -72,7 +73,7 @@ export class SandboxedAttachmentReader implements AttachmentReader {
   private validate(value:unknown,name:string):PreparedAttachment {
     const data=value as {text?:unknown;images?:unknown;error?:unknown};
     if(!data||typeof data!=='object')throw new AttachmentError(unavailable);
-    if(typeof data.error==='string')throw new AttachmentError(data.error===split?split:unavailable);
+    if(typeof data.error==='string')throw new AttachmentError(data.error===split?split:data.error===pdfExport?pdfExport:unavailable);
     if(typeof data.text!=='string'||Buffer.byteLength(data.text)>ATTACHMENT_LIMITS.textBytes||!Array.isArray(data.images)||data.images.length>ATTACHMENT_LIMITS.images)throw new AttachmentError(unavailable);
     let total=0;
     const images:InputImage[]=data.images.map((value:unknown,index:number)=>{

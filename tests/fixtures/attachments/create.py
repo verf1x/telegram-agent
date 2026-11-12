@@ -99,3 +99,62 @@ pdf('eleven-pages.pdf',11)
 rotated=Image.new('RGB',(20,10),'blue');exif=Image.Exif();exif[274]=6
 rotated.save(ROOT/'rotated.png',exif=exif)
 Image.new('RGB',(120,80),'white').save(ROOT/'white.png')
+
+# Hand-authored OMML: the independent expected formula is 1/2, not 12.
+M='http://schemas.openxmlformats.org/officeDocument/2006/math'
+def math_doc(name, formula):
+ archive(name,{'word/document.xml':f'<w:document xmlns:w="{W}" xmlns:m="{M}"><w:body><w:p><w:r><w:t>Compute: </w:t></w:r><m:oMath>{formula}</m:oMath><w:r><w:t> = ?</w:t></w:r></w:p></w:body></w:document>'})
+math_doc('fraction.docx','<m:f><m:num><m:r><m:t>1</m:t></m:r></m:num><m:den><m:r><m:t>2</m:t></m:r></m:den></m:f>')
+math_doc('nested-math.docx','<m:f><m:num><m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:num><m:den><m:rad><m:radPr><m:degHide m:val="1"/></m:radPr><m:deg/><m:e><m:sSub><m:e><m:r><m:t>y</m:t></m:r></m:e><m:sub><m:r><m:t>1</m:t></m:r></m:sub></m:sSub></m:e></m:rad></m:den></m:f><m:r><m:t>+</m:t></m:r><m:rad><m:deg><m:r><m:t>3</m:t></m:r></m:deg><m:e><m:r><m:t>8</m:t></m:r></m:e></m:rad>')
+complex_math='<m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr><m:sub><m:r><m:t>i=1</m:t></m:r></m:sub><m:sup><m:r><m:t>n</m:t></m:r></m:sup><m:e><m:sSup><m:e><m:r><m:t>i</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:e></m:nary>'
+math_doc('complex-math.docx',complex_math)
+M='http://purl.oclc.org/ooxml/officeDocument/math'
+math_doc('strict-math.docx',complex_math)
+
+# Each chart's cached value 42 is the only material, so returning empty text
+# would incorrectly claim successful preparation of the task.
+C='http://schemas.openxmlformats.org/drawingml/2006/chart'
+chart=f'<c:chartSpace xmlns:c="{C}"><c:chart><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>42</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>'
+graphic=f'<a:graphic xmlns:a="{A}" xmlns:c="{C}" xmlns:r="{D}"><a:graphicData uri="{C}"><c:chart r:id="chart"/></a:graphicData></a:graphic>'
+archive('chart.docx',{'word/document.xml':f'<w:document xmlns:w="{W}"><w:body><w:p><w:drawing>{graphic}</w:drawing></w:p></w:body></w:document>','word/_rels/document.xml.rels':rels([('chart','charts/chart1.xml','chart')]),'word/charts/chart1.xml':chart})
+archive('chart.xlsx',{
+ 'xl/workbook.xml':f'<workbook xmlns="{S}" xmlns:r="{D}"><sheets><sheet name="Chart only" sheetId="1" r:id="sheet"/></sheets></workbook>',
+ 'xl/_rels/workbook.xml.rels':rels([('sheet','worksheets/sheet1.xml','worksheet')]),
+ 'xl/worksheets/sheet1.xml':f'<worksheet xmlns="{S}" xmlns:r="{D}"><sheetData/><drawing r:id="drawing"/></worksheet>',
+ 'xl/worksheets/_rels/sheet1.xml.rels':rels([('drawing','../drawings/drawing1.xml','drawing')]),
+ 'xl/drawings/drawing1.xml':f'<drawing>{graphic}</drawing>',
+ 'xl/drawings/_rels/drawing1.xml.rels':rels([('chart','../charts/chart1.xml','chart')]),'xl/charts/chart1.xml':chart,
+})
+slide_base={
+ 'ppt/presentation.xml':f'<p:presentation xmlns:p="{P}" xmlns:r="{D}"><p:sldIdLst><p:sldId id="256" r:id="slide"/></p:sldIdLst></p:presentation>',
+ 'ppt/_rels/presentation.xml.rels':rels([('slide','slides/slide1.xml','slide')]),
+ 'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}"><p:cSld><p:spTree>{graphic}</p:spTree></p:cSld></p:sld>',
+ 'ppt/slides/_rels/slide1.xml.rels':rels([('chart','../charts/chart1.xml','chart')]),'ppt/charts/chart1.xml':chart,
+}
+archive('chart.pptx',slide_base)
+for inherited in ('slideLayout','slideMaster'):
+ tag={'slideLayout':'sldLayout','slideMaster':'sldMaster'}[inherited]
+ part=f'ppt/{inherited}s/{inherited}1.xml'
+ entries={**slide_base,'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}"><p:cSld><p:spTree/></p:cSld></p:sld>',
+  'ppt/slides/_rels/slide1.xml.rels':rels([('layout','../slideLayouts/slideLayout1.xml','slideLayout')]),
+  'ppt/slideLayouts/slideLayout1.xml':f'<p:sldLayout xmlns:p="{P}"><p:cSld><p:spTree/></p:cSld></p:sldLayout>',
+  part:f'<p:{tag} xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Only inherited material: solve 6 x 7.</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:{tag}>'}
+ if inherited=='slideMaster':entries['ppt/slideLayouts/_rels/slideLayout1.xml.rels']=rels([('master','../slideMasters/slideMaster1.xml','slideMaster')])
+ archive(inherited+'-content.pptx',entries)
+ # A chart can also live entirely on a slide layout or master.
+ entries[part]=f'<p:{tag} xmlns:p="{P}"><p:cSld><p:spTree>{graphic}</p:spTree></p:cSld></p:{tag}>'
+ entries[f'ppt/{inherited}s/_rels/{inherited}1.xml.rels']=rels([('chart','../charts/chart1.xml','chart')])
+ archive(inherited+'-chart.pptx',entries)
+
+archive('vector.docx',{'word/document.xml':f'<w:document xmlns:w="{W}" xmlns:v="urn:schemas-microsoft-com:vml"><w:body><w:p><w:r><w:t>Find the shaded area.</w:t></w:r><w:pict><v:shape type="#rectangle" style="width:100pt;height:50pt" fillcolor="red"/></w:pict></w:p></w:body></w:document>'})
+with zipfile.ZipFile(ROOT/'chart.xlsx') as z: drawing_sheet={name:z.read(name) for name in z.namelist()}
+drawing_sheet['xl/drawings/drawing1.xml']=f'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="{A}"><xdr:sp><xdr:txBody><a:p><a:r><a:t>Only drawing text: 42</a:t></a:r></a:p></xdr:txBody></xdr:sp></xdr:wsDr>'
+del drawing_sheet['xl/drawings/_rels/drawing1.xml.rels']
+archive('drawing.xlsx',drawing_sheet)
+archive('connector.pptx',{**slide_base,'ppt/slides/_rels/slide1.xml.rels':rels([]),'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:cxnSp><p:spPr><a:prstGeom prst="bentConnector3"/></p:spPr></p:cxnSp></p:spTree></p:cSld></p:sld>'})
+archive('smartart.docx',{'word/document.xml':f'<w:document xmlns:w="{W}" xmlns:a="{A}" xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:r="{D}"><w:body><w:p><w:drawing><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="data"/></a:graphicData></a:graphic></w:drawing></w:p></w:body></w:document>','word/_rels/document.xml.rels':rels([('data','diagrams/data1.xml','diagramData')]),'word/diagrams/data1.xml':f'<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="{A}"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>Only SmartArt material: 42</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>'})
+archive('empty-placeholders.pptx',{
+ **slide_base,'ppt/slides/slide1.xml':f'<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Actual slide text.</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
+ 'ppt/slides/_rels/slide1.xml.rels':rels([('layout','../slideLayouts/slideLayout1.xml','slideLayout')]),
+ 'ppt/slideLayouts/slideLayout1.xml':f'<p:sldLayout xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:spPr><a:prstGeom prst="rect"/></p:spPr><p:txBody><a:p/></p:txBody></p:sp></p:spTree></p:cSld></p:sldLayout>',
+})
