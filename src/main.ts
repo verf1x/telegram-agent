@@ -33,7 +33,15 @@ async function main(): Promise<void> {
   // are conservatively skipped. Keep this cutoff across temporary network failures.
   const startupCutoff = Math.ceil(Date.now() / 1000);
   process.umask(0o077);
-  const config = new FileConfigSource(resolve('.env'));
+  let config: FileConfigSource;
+  try { config = new FileConfigSource(resolve('.env')); }
+  catch (error) {
+    const detail = error instanceof Error && (
+      /^(Cannot read \.env configuration file|Invalid \.env (syntax|quoting))$/.test(error.message) ||
+      /^Invalid configuration: [A-Z_]+ (must be a positive integer|is out of range|is required|must contain positive numeric IDs)$/.test(error.message)
+    ) ? error.message : 'Проверьте обязательные поля и синтаксис .env.';
+    throw new Error(`Ошибка конфигурации: ${detail}`);
+  }
   const initial = config.snapshot();
   if (!initial.valid) { config.close(); throw new Error(`Ошибка конфигурации: ${initial.error}`); }
   const stop = new AbortController();
