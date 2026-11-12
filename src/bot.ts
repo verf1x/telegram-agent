@@ -1,5 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type {
+  AttachmentReader,
+  AttachmentRef,
+  PreparedAttachment,
   Bot,
   BotConfig,
   ConfigSource,
@@ -10,6 +13,7 @@ import type {
   TelegramTransport,
   TelegramUpdate,
 } from "./contracts.ts";
+import { ATTACHMENT_LIMITS, AttachmentError } from "./contracts.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
@@ -18,6 +22,7 @@ interface Dependencies {
   store: SqliteStore;
   engine: ModelEngine;
   telegram: TelegramTransport;
+  attachments?: AttachmentReader;
 }
 const REPEAT = "Обработка запроса прервалась. Пожалуйста, повторите запрос.";
 const BUSY =
@@ -30,7 +35,9 @@ export class BotController implements Bot {
   private readonly jobs = new Map<number, Promise<void>>();
   private readonly controlJobs = new Set<Promise<void>>();
   private readonly controlAbort = new AbortController();
+  private readonly preparing = new Set<number>();
   private readonly controllers = new Map<number, AbortController>();
+  private readonly albums = new Map<number, { timer: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void }>();
   private readonly offlineNotified = new Set<number>();
   private readonly unsubscribe: () => void;
   private readonly retryTimer: ReturnType<typeof setInterval>;
@@ -95,7 +102,25 @@ export class BotController implements Bot {
       this.control(() => this.modelCallback(userId, callback.id, callback.data, config));
       return;
     }
-    if (!message.text) {
+    const photo = message.photo?.at(-1), document = message.document;
+    const ref: AttachmentRef | undefined = document
+      ? {
+          fileId: document.file_id,
+          name: document.file_name ?? "document",
+          mime: document.mime_type ?? "application/octet-stream",
+          ...(document.file_size === undefined ? {} : { size: document.file_size }),
+          source: "document",
+        }
+      : photo
+        ? {
+            fileId: photo.file_id,
+            name: `photo-${message.message_id}.jpg`,
+            mime: "image/jpeg",
+            ...(photo.file_size === undefined ? {} : { size: photo.file_size }),
+            source: "photo",
+          }
+        : undefined;
+    if (!message.text && !ref) {
       this.deps.store.accept(update.update_id);
       this.control(() => this.safeText(userId, "Поддерживаются только текстовые сообщения."));
       return;
@@ -103,11 +128,12 @@ export class BotController implements Bot {
     const state = this.deps.store.get(userId);
     if (from.username) state.username = from.username;
     const command = /^\/(\w+)(?:@\w+)?(?:\s|$)/
-      .exec(message.text)?.[1]
+      .exec(message.text ?? "")?.[1]
       ?.toLowerCase();
     if (command) {
       if (command === "new" && !this.busy(state)) {
         if (userId === config.ownerId) this.invalidatePicker();
+        this.cancelAlbum(userId);
         state.reset = { threadIds: state.threadId ? [state.threadId] : [] };
         this.deps.store.accept(update.update_id, state);
         this.launch(userId, () => this.reset(userId));
@@ -131,25 +157,114 @@ export class BotController implements Bot {
       this.control(() => this.safeText(userId, BUSY));
       return;
     }
-    if (
-      this.deps.store.all().filter((s) => this.busy(s)).length >=
-      config.maxConcurrentRequests
-    ) {
+    if (ref) {
+      const refs = [...(state.pending?.refs ?? []), ref];
+      if (
+        refs.length > ATTACHMENT_LIMITS.files ||
+        refs.some((r) => r.size !== undefined && (
+          !Number.isFinite(r.size) || r.size < 0 || r.size > ATTACHMENT_LIMITS.fileBytes
+        )) ||
+        refs.reduce((n, r) => n + (r.size ?? 0), 0) > ATTACHMENT_LIMITS.batchBytes
+      ) {
+        this.cancelAlbum(userId);
+        state.pending ??= { refs: [], captions: [] };
+        state.pending.captions = [];
+        delete state.pending.readyAt;
+        state.pending.awaitingTask = true;
+        this.deps.store.accept(update.update_id, state);
+        this.control(() => this.safeText(userId, "Не более 10 вложений, 20 МБ на файл и 50 МБ на задание. Вложение отклонено; остальные материалы сохранены. Разделите материалы и повторите текст задания или очистите их через /new."));
+        return;
+      }
+      state.pending ??= { refs: [], captions: [] };
+      state.pending.refs.push(ref);
+    }
+    const text = message.text ?? (
+      state.pending?.awaitingTask ? undefined : message.caption
+    );
+    if (state.pending) {
+      if (message.text?.trim()) delete state.pending.awaitingTask;
+      if (text?.trim()) state.pending.captions.push(text);
+      if (ref && !state.pending.awaitingTask && (message.media_group_id || state.pending.readyAt))
+        state.pending.readyAt = Date.now() + ATTACHMENT_LIMITS.albumQuietMs;
+      if (state.pending.readyAt) {
+        this.deps.store.accept(update.update_id, state);
+        this.scheduleAlbum(userId, state.pending.readyAt);
+        return;
+      }
+    }
+    if (!text?.trim()) {
       this.deps.store.accept(update.update_id, state);
-      this.control(() => this.safeText(
-        userId,
-        "Все места обработки заняты. Повторите запрос позже.",
-      ));
+      this.control(() => this.safeText(userId, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
+      return;
+    }
+    this.dispatch(state, text, config, update.update_id);
+  }
+  private dispatch(
+    state: DialogueState,
+    text: string,
+    config: BotConfig,
+    updateId?: number,
+  ): void {
+    const userId = state.userId;
+    if (this.busy(state)) return;
+    if (this.deps.store.all().filter((s) => this.busy(s)).length >= config.maxConcurrentRequests) {
+      if (state.pending) {
+        state.pending.captions = [];
+        delete state.pending.readyAt;
+      }
+      if (updateId === undefined) this.deps.store.put(state);
+      else this.deps.store.accept(updateId, state);
+      this.control(() => this.safeText(userId, "Все места обработки заняты. Повторите запрос позже."));
       return;
     }
     state.request = {
       id: randomUUID(),
-      text: message.text,
+      text,
       started: Date.now(),
+      ...(state.pending?.refs.length ? { attachments: state.pending.refs } : {}),
     };
+    if (state.pending) {
+      state.pending.captions = [];
+      delete state.pending.readyAt;
+    }
     if (userId === config.ownerId) this.invalidatePicker();
-    this.deps.store.accept(update.update_id, state);
+    if (updateId === undefined) this.deps.store.put(state);
+    else this.deps.store.accept(updateId, state);
     this.launch(userId, () => this.process(userId, config));
+  }
+  private cancelAlbum(userId: number): void {
+    const album = this.albums.get(userId);
+    if (!album) return;
+    clearTimeout(album.timer);
+    this.albums.delete(userId);
+    album.resolve();
+  }
+  private scheduleAlbum(userId: number, readyAt: number): void {
+    this.cancelAlbum(userId);
+    let resolve!: () => void;
+    const done = new Promise<void>((r) => { resolve = r; });
+    const timer = setTimeout(() => {
+      this.albums.delete(userId);
+      try {
+        const snapshot = this.deps.config.snapshot();
+        const state = this.deps.store.get(userId);
+        if (!snapshot.valid || !this.allowed(userId, snapshot.config) || !state.pending) return;
+        if (this.busy(state)) {
+          state.pending.captions = [];
+          delete state.pending.readyAt;
+          this.deps.store.put(state);
+          this.control(() => this.safeText(userId, BUSY));
+          return;
+        }
+        const text = state.pending.captions.join("\n\n");
+        state.pending.captions = [];
+        delete state.pending.readyAt;
+        this.deps.store.put(state);
+        if (text.trim()) this.dispatch(state, text, snapshot.config);
+        else this.control(() => this.safeText(userId, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
+      } finally { resolve(); }
+    }, Math.max(0, readyAt - Date.now()));
+    this.albums.set(userId, { timer, done, resolve });
   }
   private control(work: () => Promise<void>): void {
     // Controls start after durable acceptance, but never occupy a user's request slot.
@@ -191,12 +306,49 @@ export class BotController implements Bot {
       model: config.defaultModel,
       effort: config.defaultEffort,
     };
+    let engineStarted = false;
     try {
+      this.ensureActive(userId, request.id, controller.signal);
       void this.deps.telegram.typing(userId, controller.signal).catch(() => {});
+      let attachments: PreparedAttachment[] | undefined;
+      if (request.attachments?.length) {
+        this.preparing.add(userId);
+        if (!this.deps.attachments || !this.deps.telegram.downloadFile)
+          throw new AttachmentError("Обработка вложений сейчас недоступна. Повторите задание позже.");
+        const files = [];
+        let total = 0;
+        for (const [index, ref] of request.attachments.entries()) {
+          this.ensureActive(userId, request.id, controller.signal);
+          const bytes = await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+          this.ensureActive(userId, request.id, controller.signal);
+          total += bytes.byteLength;
+          const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
+          if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes || total + remaining > ATTACHMENT_LIMITS.batchBytes)
+            throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы или используйте /new.");
+          files.push({ name: ref.name, mime: ref.mime, bytes });
+        }
+        this.ensureActive(userId, request.id, controller.signal);
+        attachments = await this.abortable(this.deps.attachments.prepare(files, controller.signal), controller.signal);
+        this.ensureActive(userId, request.id, controller.signal);
+        if (attachments.length !== files.length)
+          throw new AttachmentError("Не удалось подготовить все материалы. Файлы сохранены; повторите текст задания или используйте /new.");
+        const context = [...state.history.flatMap((m) => m.attachments ?? []), ...attachments];
+        if (Buffer.byteLength(JSON.stringify(context)) > ATTACHMENT_LIMITS.dialogueBytes || context.reduce((n, a) => n + a.images.length, 0) > ATTACHMENT_LIMITS.images)
+          throw new AttachmentError("Материалы заняли весь контекст диалога. Начните новый диалог через /new и разделите материалы.");
+        const images = attachments.flatMap((a) => a.images);
+        if (images.length > ATTACHMENT_LIMITS.images || images.reduce((n, i) => n + Buffer.byteLength(i.base64, "base64"), 0) > ATTACHMENT_LIMITS.imageBytes)
+          throw new AttachmentError("Слишком много изображений во вложениях. Разделите материалы или очистите диалог через /new.");
+        if (attachments.reduce((n, a) => n + Buffer.byteLength(a.text), 0) > ATTACHMENT_LIMITS.textBytes)
+          throw new AttachmentError("Слишком много текста во вложениях. Разделите материалы или очистите диалог через /new.");
+      }
+      this.preparing.delete(userId);
+      this.ensureActive(userId, request.id, controller.signal);
+      engineStarted = true;
       const response = await Promise.race([
         this.deps.engine.run({
           userId,
           text: request.text,
+          ...(attachments ? { attachments } : {}),
           ...selection,
           ...(state.threadId
             ? { threadId: state.threadId }
@@ -222,28 +374,30 @@ export class BotController implements Bot {
       if (current.request?.id !== request.id) return;
       current.threadId = response.threadId;
       current.history.push(
-        { role: "user", text: request.text },
+        { role: "user", text: request.text, ...(attachments ? { attachments } : {}) },
         { role: "assistant", text: response.text },
       );
+      if (attachments) delete current.pending;
       current.lastResponse = response.text;
       const revoked = current.request.revoked;
       delete current.request;
       if (!revoked)
         current.delivery = { parts: formatAnswer(response), next: 0 };
       this.deps.store.put(current);
-    } catch {
+    } catch (error) {
       if (this.closed) return;
       const current = this.deps.store.get(userId);
-      const poisoned = current.request?.threadId ?? current.threadId;
+      if (current.request?.id !== request.id) return;
+      const poisoned = engineStarted ? current.request?.threadId ?? current.threadId : undefined;
       const revoked = current.request?.revoked;
       delete current.request;
-      delete current.threadId;
+      if (engineStarted) delete current.threadId;
       if (!revoked)
         current.delivery = {
           parts: [
             {
               kind: "text",
-              text: controller.signal.aborted
+              text: error instanceof AttachmentError ? error.message : controller.signal.aborted
                 ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
                 : "Не удалось обработать запрос. Пожалуйста, повторите позже.",
             },
@@ -254,11 +408,27 @@ export class BotController implements Bot {
       if (poisoned)
         void this.deps.engine.deleteThread(poisoned).catch(() => {});
     } finally {
+      this.preparing.delete(userId);
       clearTimeout(timer);
       clearInterval(typing);
       this.controllers.delete(userId);
     }
     if (!this.closed) await this.deliver(userId);
+  }
+  private ensureActive(userId: number, requestId: string, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    const snapshot = this.deps.config.snapshot();
+    const request = this.deps.store.get(userId).request;
+    if (!snapshot.valid || !this.allowed(userId, snapshot.config) || request?.id !== requestId || request.revoked)
+      throw new AttachmentError("Обработка приостановлена. Повторите текст задания позже; материалы сохранены.");
+  }
+  private abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+      work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+      if (signal.aborted) abort();
+    });
   }
   private async deliver(userId: number): Promise<void> {
     while (!this.closed) {
@@ -361,7 +531,7 @@ export class BotController implements Bot {
       case "help":
         await this.safeText(
           id,
-          "Отправьте текст для Codex. /new — сброс диалога; /text — последний ответ текстом; /status — состояние." +
+          "Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
             (id === config.ownerId
               ? " /users — список доступа; /model — выбор модели."
               : ""),
@@ -430,6 +600,7 @@ export class BotController implements Bot {
     delete state.threadId;
     delete state.lastResponse;
     state.history = [];
+    delete state.pending;
     state.delivery = {
       parts: [
         { kind: "text", text: "Диалог сброшен. Отправьте новый запрос." },
@@ -550,16 +721,26 @@ export class BotController implements Bot {
   private reloaded(snapshot: ConfigSnapshot): void {
     if (!snapshot.valid) {
       for (const [id, controller] of this.controllers)
-        if (!this.deps.store.get(id).request) controller.abort();
+        if (this.preparing.has(id)) controller.abort(new AttachmentError("Обработка приостановлена. После исправления настроек повторите текст задания; материалы сохранены."));
+        else if (!this.deps.store.get(id).request) controller.abort();
       return;
     }
     for (const state of this.deps.store.all())
       if (!this.allowed(state.userId, snapshot.config)) {
+        this.cancelAlbum(state.userId);
+        if (state.pending) {
+          state.pending.captions = [];
+          delete state.pending.readyAt;
+          state.pending.awaitingTask = true;
+        }
         if (state.request) state.request.revoked = true;
         delete state.delivery;
         this.deps.store.put(state);
-        if (!state.request) this.controllers.get(state.userId)?.abort();
+        if (!state.request || this.preparing.has(state.userId)) this.controllers.get(state.userId)?.abort();
       }
+    for (const state of this.deps.store.all())
+      if (this.allowed(state.userId, snapshot.config) && state.pending?.readyAt && !this.albums.has(state.userId))
+        this.scheduleAlbum(state.userId, state.pending.readyAt);
     this.resume();
   }
   private resume(): void {
@@ -583,7 +764,7 @@ export class BotController implements Bot {
         message?.chat.type === "private" &&
         from?.id === message.chat.id &&
         this.allowed(from.id, snapshot.config) &&
-        message.text &&
+        (message.text || message.photo?.length || message.document) &&
         !this.offlineNotified.has(from.id)
       ) {
         this.offlineNotified.add(from.id);
@@ -601,7 +782,14 @@ export class BotController implements Bot {
     await this.drain();
   }
   async recover(): Promise<void> {
-    for (const state of this.deps.store.all())
+    for (const state of this.deps.store.all()) {
+      if (state.pending) {
+        state.pending.captions = [];
+        delete state.pending.readyAt;
+        if (!state.request && !state.delivery)
+          state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
+        this.deps.store.put(state);
+      }
       if (state.request) {
         const threadId = state.request.threadId ?? state.threadId,
           revoked = state.request.revoked;
@@ -613,15 +801,17 @@ export class BotController implements Bot {
         if (threadId)
           void this.deps.engine.deleteThread(threadId).catch(() => {});
       }
+    }
     this.reloaded(this.deps.config.snapshot());
     await this.drain();
   }
   async drain(): Promise<void> {
-    while (this.jobs.size || this.controlJobs.size)
-      await Promise.all([...this.jobs.values(), ...this.controlJobs]);
+    while (this.jobs.size || this.controlJobs.size || this.albums.size)
+      await Promise.all([...this.jobs.values(), ...this.controlJobs, ...[...this.albums.values()].map((a) => a.done)]);
   }
   async shutdown(): Promise<void> {
     this.closed = true;
+    for (const id of this.albums.keys()) this.cancelAlbum(id);
     clearInterval(this.retryTimer);
     this.unsubscribe();
     this.controlAbort.abort(new Error("Bot shutting down"));
