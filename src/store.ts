@@ -1,12 +1,23 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ModelSelection, OutgoingPart } from "./contracts.ts";
+import type {
+  AttachmentRef,
+  ConversationMessage,
+  ModelSelection,
+  OutgoingPart,
+} from "./contracts.ts";
 export interface DialogueState {
   userId: number;
   username?: string;
   threadId?: string;
-  history: Array<{ role: "user" | "assistant"; text: string }>;
+  history: ConversationMessage[];
+  pending?: {
+    refs: AttachmentRef[];
+    captions: string[];
+    readyAt?: number;
+    awaitingTask?: boolean;
+  };
   selection?: ModelSelection;
   lastResponse?: string;
   request?: {
@@ -14,6 +25,7 @@ export interface DialogueState {
     text: string;
     threadId?: string;
     started: number;
+    attachments?: AttachmentRef[];
     revoked?: boolean;
   };
   reset?: { threadIds: string[] };
