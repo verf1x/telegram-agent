@@ -13,7 +13,7 @@ import type {
   TelegramTransport,
   TelegramUpdate,
 } from "./contracts.ts";
-import { ATTACHMENT_LIMITS, AttachmentError } from "./contracts.ts";
+import { ATTACHMENT_LIMITS, AttachmentError, ImageGenerationError } from "./contracts.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
@@ -397,7 +397,7 @@ export class BotController implements Bot {
           parts: [
             {
               kind: "text",
-              text: error instanceof AttachmentError ? error.message : controller.signal.aborted
+              text: error instanceof AttachmentError || error instanceof ImageGenerationError ? error.message : controller.signal.aborted
                 ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
                 : "Не удалось обработать запрос. Пожалуйста, повторите позже.",
             },
@@ -531,7 +531,7 @@ export class BotController implements Bot {
       case "help":
         await this.safeText(
           id,
-          "Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
+          "Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
             (id === config.ownerId
               ? " /users — список доступа; /model — выбор модели."
               : ""),
