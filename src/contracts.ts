@@ -68,6 +68,19 @@ export class AttachmentError extends Error {
   constructor(message: string) { super(message); this.name = "AttachmentError"; }
 }
 
+export const GENERATED_IMAGE_LIMITS = {
+  nativeImages: 4,
+  imageBytes: 12_000_000,
+  totalBytes: 24_000_000,
+  dimension: 8192,
+  pixels: 64_000_000,
+} as const;
+
+/** Only fixed, application-owned messages may be exposed to Telegram. */
+export class ImageGenerationError extends Error {
+  constructor(message: string) { super(message); this.name = "ImageGenerationError"; }
+}
+
 export interface TelegramCallbackQuery {
   id: string;
   from: TelegramUser;
@@ -109,7 +122,7 @@ export interface TelegramTransport {
   downloadFile?(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
-/** Only images read by the trusted adapter from its isolated workspace. */
+/** Validated output bytes from isolated computations or native image generation. */
 export interface GeneratedImage {
   bytes: Uint8Array;
   name: string;
