@@ -32,6 +32,7 @@ export class CodexEngine implements ModelEngine {
     // remain disabled individually and filesystem grants remain minimal.
     await writeFile(join(home,'config.toml'),`approval_policy = "never"\ndefault_permissions = "bot"\nweb_search = "live"\n[features]\nshell_tool = false\nview_image = false\napps = false\nplugins = false\nhooks = false\ncomputer_use = false\nin_app_browser = false\nimage_generation = false\nmulti_agent = false\nmemories = false\ncode_mode = false\ncode_mode_host = true\nbrowser_use = false\nbrowser_use_external = false\nbrowser_use_full_cdp_access = false\nrequest_permissions_tool = false\nskill_search = false\nskill_mcp_dependency_install = false\nskip_host_skill_discovery = true\nshell_snapshot = false\ngoals = false\nsleep_tool = false\n[permissions.bot.filesystem]\n":minimal" = "read"\n${JSON.stringify(cwd)} = "read"\n[permissions.bot.network]\nenabled = false\n`,{mode:0o600});
     const env:NodeJS.ProcessEnv={PATH:process.env.PATH??'/usr/bin:/bin',HOME:dir,CODEX_HOME:home,LANG:'C.UTF-8'};
+    if(this.closed||signal?.aborted)throw new Error('Codex unavailable');
     const rpc=new Rpc(this.command,cwd,env);this.workers.add(rpc);
     rpc.onFrame=frame=>{if(frame.id!==undefined)rpc.send({id:frame.id,error:{code:-32601,message:'Request denied'}});};
     const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
@@ -39,8 +40,9 @@ export class CodexEngine implements ModelEngine {
     catch{rpc.stop();this.workers.delete(rpc);throw new Error('Codex unavailable');}
     finally{signal?.removeEventListener('abort',cancel);}
   }
-  async listModels():Promise<ModelInfo[]>{
-    const {rpc}=await this.worker(join(this.root,'catalog'));
+  async listModels(signal?:AbortSignal):Promise<ModelInfo[]>{
+    const {rpc}=await this.worker(join(this.root,'catalog'),signal);
+    const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
     try{
       const all:ModelInfo[]=[];let cursor:string|null=null;
       do{
@@ -50,10 +52,10 @@ export class CodexEngine implements ModelEngine {
         if(all.length>1000)throw new Error('Codex catalog too large');
       }while(cursor);
       return all;
-    }finally{rpc.stop();this.workers.delete(rpc);}
+    }finally{signal?.removeEventListener('abort',cancel);rpc.stop();this.workers.delete(rpc);}
   }
-  async health():Promise<EngineHealth>{
-    try{const {rpc}=await this.worker(join(this.root,'health'));try{const r=await rpc.request('account/read',{refreshToken:false});return {available:!!r.account,detail:r.account?'Codex ready':'ChatGPT authentication required'};}finally{rpc.stop();this.workers.delete(rpc);}}
+  async health(signal?:AbortSignal):Promise<EngineHealth>{
+    try{const {rpc}=await this.worker(join(this.root,'health'),signal);const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();try{const r=await rpc.request('account/read',{refreshToken:false});return {available:!!r.account,detail:r.account?'Codex ready':'ChatGPT authentication required'};}finally{signal?.removeEventListener('abort',cancel);rpc.stop();this.workers.delete(rpc);}}
     catch{return {available:false,detail:'Codex unavailable'};}
   }
   private threadDir(id:string){
@@ -76,12 +78,12 @@ export class CodexEngine implements ModelEngine {
       }
     }
     const abort=new AbortController();let markDone:()=>void=()=>{};
+    if(request.signal.aborted)throw new Error('Request cancelled');
     const done=new Promise<void>(resolve=>{markDone=resolve;});this.active.set(id,{abort,done});
     const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
     let rpc:Rpc|undefined;
     const computations=new Set<Promise<void>>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
-    const deadline=setTimeout(()=>abort.abort(),600000);
     try{
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
@@ -154,7 +156,7 @@ export class CodexEngine implements ModelEngine {
       await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       return {text:answer,threadId:id,images};
     }catch{throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
-    finally{clearTimeout(deadline);abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
+    finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{
     const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();

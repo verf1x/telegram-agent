@@ -28,11 +28,14 @@ export function createBot(deps: Dependencies): BotController {
 export class BotController implements Bot {
   private readonly deps: Dependencies;
   private readonly jobs = new Map<number, Promise<void>>();
+  private readonly controlJobs = new Set<Promise<void>>();
+  private readonly controlAbort = new AbortController();
   private readonly controllers = new Map<number, AbortController>();
   private readonly offlineNotified = new Set<number>();
   private readonly unsubscribe: () => void;
   private readonly retryTimer: ReturnType<typeof setInterval>;
   private closed = false;
+  private pickerRevision = 0;
   private readonly picker = new Map<
     string,
     { model: string; effort?: string }
@@ -79,21 +82,22 @@ export class BotController implements Bot {
         userId === config.ownerId &&
         /^\/status(?:@\w+)?(?:\s|$)/.test(message.text ?? "")
       )
-        await this.safeText(
+        this.control(() => this.safeText(
           userId,
           `Работа приостановлена: ${snapshot.error}`,
           true,
-        );
+        ));
       return;
     }
     if (callback) {
       this.deps.store.accept(update.update_id);
-      await this.modelCallback(userId, callback.id, callback.data, config);
+      if (userId === config.ownerId) this.pickerRevision++;
+      this.control(() => this.modelCallback(userId, callback.id, callback.data, config));
       return;
     }
     if (!message.text) {
       this.deps.store.accept(update.update_id);
-      await this.safeText(userId, "Поддерживаются только текстовые сообщения.");
+      this.control(() => this.safeText(userId, "Поддерживаются только текстовые сообщения."));
       return;
     }
     const state = this.deps.store.get(userId);
@@ -103,24 +107,28 @@ export class BotController implements Bot {
       ?.toLowerCase();
     if (command) {
       if (command === "new" && !this.busy(state)) {
+        if (userId === config.ownerId) this.invalidatePicker();
         state.reset = { threadIds: state.threadId ? [state.threadId] : [] };
         this.deps.store.accept(update.update_id, state);
         this.launch(userId, () => this.reset(userId));
         return;
       }
       if (command === "text" && !this.busy(state) && state.lastResponse) {
+        if (userId === config.ownerId) this.invalidatePicker();
         state.delivery = { parts: formatText(state.lastResponse), next: 0 };
         this.deps.store.accept(update.update_id, state);
         this.launch(userId, () => this.deliver(userId));
         return;
       }
       this.deps.store.accept(update.update_id, state);
-      await this.command(command, state, config);
+      if (command === "model" && userId === config.ownerId && !this.busy(state))
+        this.invalidatePicker();
+      this.control(() => this.command(command, state, config));
       return;
     }
     if (this.busy(state)) {
       this.deps.store.accept(update.update_id, state);
-      await this.safeText(userId, BUSY);
+      this.control(() => this.safeText(userId, BUSY));
       return;
     }
     if (
@@ -128,10 +136,10 @@ export class BotController implements Bot {
       config.maxConcurrentRequests
     ) {
       this.deps.store.accept(update.update_id, state);
-      await this.safeText(
+      this.control(() => this.safeText(
         userId,
         "Все места обработки заняты. Повторите запрос позже.",
-      );
+      ));
       return;
     }
     state.request = {
@@ -139,8 +147,14 @@ export class BotController implements Bot {
       text: message.text,
       started: Date.now(),
     };
+    if (userId === config.ownerId) this.invalidatePicker();
     this.deps.store.accept(update.update_id, state);
     this.launch(userId, () => this.process(userId, config));
+  }
+  private control(work: () => Promise<void>): void {
+    // Controls start after durable acceptance, but never occupy a user's request slot.
+    const task = work().catch(() => {}).finally(() => this.controlJobs.delete(task));
+    this.controlJobs.add(task);
   }
   private launch(userId: number, work: () => Promise<void>): void {
     if (this.closed || this.jobs.has(userId)) return;
@@ -326,13 +340,14 @@ export class BotController implements Bot {
     const snapshot = this.deps.config.snapshot(),
       config = snapshot.valid ? snapshot.config : snapshot.lastValid;
     if (
+      this.closed ||
       !config ||
       !this.allowed(userId, config) ||
       (!snapshot.valid && !(diagnostic && userId === config.ownerId))
     )
       return;
     try {
-      await this.deps.telegram.sendText(userId, text);
+      await this.deps.telegram.sendText(userId, text, { signal: this.controlAbort.signal });
     } catch {}
   }
   private async command(
@@ -359,7 +374,7 @@ export class BotController implements Bot {
         if (id === config.ownerId) {
           let health;
           try {
-            health = await this.deps.engine.health();
+            health = await this.deps.engine.health(this.controlAbort.signal);
           } catch {
             health = { available: false };
           }
@@ -425,12 +440,13 @@ export class BotController implements Bot {
     await this.deliver(userId);
   }
   private async models(): Promise<ModelInfo[]> {
-    return this.deps.engine.listModels();
+    return this.deps.engine.listModels(this.controlAbort.signal);
   }
   private ownerIdle(userId: number): boolean {
     const snapshot = this.deps.config.snapshot();
     return (
       snapshot.valid &&
+      !this.closed &&
       snapshot.config.ownerId === userId &&
       !this.busy(this.deps.store.get(userId))
     );
@@ -440,19 +456,25 @@ export class BotController implements Bot {
     this.picker.set(token, { model, ...(effort ? { effort } : {}) });
     return `pick:${token}`;
   }
+  private invalidatePicker(): void {
+    this.pickerRevision++;
+    this.picker.clear();
+  }
   private async showModels(userId: number): Promise<void> {
+    const revision = this.pickerRevision;
     try {
       const models = await this.models(),
         selection = this.deps.store.get(userId).selection ?? {
           model: "gpt-6.1-sol",
           effort: "medium",
         };
-      if (!this.ownerIdle(userId)) return;
+      if (revision !== this.pickerRevision || !this.ownerIdle(userId)) return;
       this.picker.clear();
       await this.deps.telegram.sendText(
         userId,
         `Текущая модель: ${selection.model}, рассуждение: ${selection.effort}. Выберите модель:`,
         {
+          signal: this.controlAbort.signal,
           reply_markup: {
             inline_keyboard: models
               .slice(0, 100)
@@ -476,9 +498,10 @@ export class BotController implements Bot {
     config: BotConfig,
   ): Promise<void> {
     if (userId !== config.ownerId) return;
+    const revision = this.pickerRevision;
     if (!this.ownerIdle(userId)) {
       try {
-        await this.deps.telegram.answerCallback(callbackId, BUSY);
+        await this.deps.telegram.answerCallback(callbackId, BUSY, this.controlAbort.signal);
       } catch {}
       return;
     }
@@ -488,7 +511,7 @@ export class BotController implements Bot {
       if (!choice) throw new Error("Invalid selection");
       const models = await this.models(),
         model = models.find((m) => m.id === choice.model);
-      if (!model || !this.ownerIdle(userId))
+      if (!model || revision !== this.pickerRevision || !this.ownerIdle(userId))
         throw new Error("Invalid selection");
       if (!choice.effort) {
         this.picker.clear();
@@ -496,6 +519,7 @@ export class BotController implements Bot {
           userId,
           `Модель ${model.id}. Выберите уровень рассуждения:`,
           {
+            signal: this.controlAbort.signal,
             reply_markup: {
               inline_keyboard: model.supportedEfforts.map((effort) => [
                 { text: effort, callback_data: this.pick(model.id, effort) },
@@ -512,12 +536,13 @@ export class BotController implements Bot {
         this.picker.clear();
         await this.safeText(userId, `Выбраны ${model.id}, ${choice.effort}.`);
       }
-      await this.deps.telegram.answerCallback(callbackId);
+      await this.deps.telegram.answerCallback(callbackId, undefined, this.controlAbort.signal);
     } catch {
       try {
         await this.deps.telegram.answerCallback(
           callbackId,
           "Выбор недоступен. Повторите /model.",
+          this.controlAbort.signal,
         );
       } catch {}
     }
@@ -592,12 +617,14 @@ export class BotController implements Bot {
     await this.drain();
   }
   async drain(): Promise<void> {
-    while (this.jobs.size) await Promise.all([...this.jobs.values()]);
+    while (this.jobs.size || this.controlJobs.size)
+      await Promise.all([...this.jobs.values(), ...this.controlJobs]);
   }
   async shutdown(): Promise<void> {
     this.closed = true;
     clearInterval(this.retryTimer);
     this.unsubscribe();
+    this.controlAbort.abort(new Error("Bot shutting down"));
     for (const controller of this.controllers.values())
       controller.abort(new Error("Bot shutting down"));
     await this.drain();

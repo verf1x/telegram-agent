@@ -54,7 +54,7 @@ export interface TelegramTransport {
   sendText(chatId: ChatId, text: string, options?: SendOptions): Promise<number>;
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
   typing(chatId: ChatId, signal?: AbortSignal): Promise<void>;
-  answerCallback(id: string, text?: string): Promise<void>;
+  answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void>;
 }
 
 /** Only images read by the trusted adapter from its isolated workspace. */
@@ -105,9 +105,9 @@ export interface ModelResponse {
 
 export interface ModelEngine {
   run(request: ModelRequest): Promise<ModelResponse>;
-  listModels(): Promise<ModelInfo[]>;
+  listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   deleteThread(threadId: string): Promise<void>;
-  health(): Promise<EngineHealth>;
+  health(signal?: AbortSignal): Promise<EngineHealth>;
   close(): Promise<void>;
 }
 

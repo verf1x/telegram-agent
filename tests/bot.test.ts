@@ -150,6 +150,136 @@ test("one user remains busy until response delivery and other users continue", a
   await f.bot.drain();
 });
 
+test("a pending owner model catalog does not block another user's accepted update", async (t) => {
+  const f = fixture(t);
+  let release!: () => void;
+  const catalog = new Promise<void>((resolve) => (release = resolve));
+  let catalogs = 0;
+  f.engine.listModels = async () => {
+    catalogs++;
+    await catalog;
+    return [{ id: "gpt-6.1-sol", supportedEfforts: ["medium"] }];
+  };
+  const command = f.update(1, "/model");
+  const following = f.update(2, "independent");
+  const polling = (async () => {
+    await f.bot.handleUpdate(command);
+    await f.bot.handleUpdate(command); // A redelivered update cannot repeat control work.
+    await f.bot.handleUpdate(following);
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const deliveredWhileCatalogPending = f.sent.some(
+    (message) => message.chatId === 2 && message.text === "answer independent",
+  );
+  release();
+  await polling;
+  await f.bot.drain();
+  assert.equal(deliveredWhileCatalogPending, true);
+  assert.equal(catalogs, 1);
+});
+
+test("reset invalidates a model callback whose catalog finishes after the reset", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(1, "/model"));
+  await f.bot.drain();
+  const data = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  let release!: () => void;
+  const catalog = new Promise<void>((resolve) => (release = resolve));
+  f.engine.listModels = async () => {
+    await catalog;
+    return [{ id: "gpt-6.1-sol", supportedEfforts: ["medium", "high"] }];
+  };
+  await f.bot.handleUpdate({
+    ...f.update(1, ""),
+    callback_query: {
+      id: "pending-choice", from: { id: 1 }, data,
+      message: { message_id: 1, date: 0, chat: { id: 1, type: "private" } },
+    },
+  });
+  await f.bot.handleUpdate(f.update(1, "/new"));
+  await f.bot.handleUpdate(f.update(2, "independent"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const resetDelivered = f.sent.some((message) => /Диалог сброшен/.test(message.text));
+  release();
+  await f.bot.drain();
+  assert.equal(resetDelivered, true);
+  assert.ok(f.sent.some((message) => message.text === "answer independent"));
+  assert.equal(f.sent.filter((message) => /Выберите уровень/.test(message.text)).length, 0);
+});
+
+test("a pending Telegram command response leaves polling free and drain waits for it", async (t) => {
+  const f = fixture(t);
+  let release!: () => void;
+  const response = new Promise<void>((resolve) => (release = resolve));
+  const send = f.telegram.sendText;
+  f.telegram.sendText = async (...args) => {
+    if (args[0] === 1) await response;
+    return send(...args);
+  };
+  const polling = (async () => {
+    await f.bot.handleUpdate(f.update(1, "/help"));
+    await f.bot.handleUpdate(f.update(2, "independent"));
+  })();
+  let drained = false;
+  const draining = f.bot.drain().then(() => { drained = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const delivered = f.sent.some((message) => message.text === "answer independent");
+  const waitedForResponse = !drained;
+  release();
+  await polling;
+  await draining;
+  await f.bot.drain();
+  assert.equal(delivered, true);
+  assert.equal(waitedForResponse, true);
+});
+
+test("owner health diagnostics do not replace an active request or block other users", async (t) => {
+  const f = fixture(t);
+  let finish!: () => void, report!: () => void;
+  const pendingRequest = new Promise<void>((resolve) => (finish = resolve));
+  const pendingHealth = new Promise<void>((resolve) => (report = resolve));
+  const run = f.engine.run;
+  f.engine.run = async (request) => {
+    if (request.userId === 1) await pendingRequest;
+    return run(request);
+  };
+  f.engine.health = async () => { await pendingHealth; return { available: true }; };
+  await f.bot.handleUpdate(f.update(1, "owner request"));
+  const polling = (async () => {
+    await f.bot.handleUpdate(f.update(1, "/status"));
+    await f.bot.handleUpdate(f.update(1, "must remain busy"));
+    await f.bot.handleUpdate(f.update(2, "independent"));
+  })();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const delivered = f.sent.some((message) => message.text === "answer independent");
+  report();
+  await polling;
+  await f.bot.handleUpdate(f.update(1, "still busy after status"));
+  finish();
+  await f.bot.drain();
+  assert.equal(delivered, true);
+  assert.deepEqual(f.requests.filter((request) => request.userId === 1).map((request) => request.text), ["owner request"]);
+  assert.ok(f.sent.some((message) => /Запрос обрабатывается/.test(message.text)));
+});
+
+test("shutdown aborts a pending Telegram command response and waits for it to settle", async (t) => {
+  const f = fixture(t);
+  let signal: AbortSignal | undefined;
+  let settled = false;
+  f.telegram.sendText = async (_id, _text, options) => {
+    signal = options?.signal;
+    await new Promise<void>((_resolve, reject) => signal?.addEventListener("abort", () => {
+      settled = true;
+      reject(new Error("stopped"));
+    }, { once: true }));
+    return 1;
+  };
+  await f.bot.handleUpdate(f.update(1, "/help"));
+  await f.bot.shutdown();
+  assert.equal(signal?.aborted, true);
+  assert.equal(settled, true);
+});
+
 test("restart never repeats an interrupted turn and rebuilds only committed dialogue", async (t) => {
   const f = fixture(t);
   await f.bot.handleUpdate(f.update(2, "committed"));
@@ -215,6 +345,7 @@ test("owner picker binds model identity when catalog order changes and survives 
     b = { id: "model-b", supportedEfforts: ["low"] };
   f.engine.listModels = async () => [a, b];
   await f.bot.handleUpdate(f.update(1, "/model"));
+  await f.bot.drain();
   const modelData =
     f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
   f.engine.listModels = async () => [b, a];
@@ -228,10 +359,12 @@ test("owner picker binds model identity when catalog order changes and survives 
     },
   });
   await f.bot.handleUpdate(callback(modelData));
+  await f.bot.drain();
   assert.match(f.sent.at(-1)!.text, /model-a/);
   const effortData =
     f.sent.at(-1)!.options.reply_markup.inline_keyboard[1][0].callback_data;
   await f.bot.handleUpdate(callback(effortData));
+  await f.bot.drain();
   await f.bot.handleUpdate(f.update(1, "/new"));
   await f.bot.drain();
   await f.reopen();
@@ -294,6 +427,7 @@ test("invalid runtime configuration pauses accepted output and owner diagnostics
   await f.bot.drain();
   assert.equal(f.sent.length, 0);
   await f.bot.handleUpdate(f.update(1, "/status"));
+  await f.bot.drain();
   assert.match(f.sent.at(-1)!.text, /приостановлена/);
   assert.ok(!f.sent.at(-1)!.text.includes("do-not-expose"));
   await f.bot.handleUpdate(f.update(2, "not accepted"));
