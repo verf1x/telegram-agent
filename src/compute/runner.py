@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -127,9 +128,25 @@ def run():
     libc=ctypes.CDLL(None)
     if libc.prctl(1,signal.SIGTERM,0,0,0)!=0 or os.getppid()!=parent_pid:
         raise RuntimeError('Parent unavailable')
+    # Unwind subprocess.run's context manager during runtime discovery too;
+    # default SIGTERM would otherwise leave an in-flight ldd helper orphaned.
+    def cancelled_before_launch(*_):
+        raise RuntimeError('Calculation cancelled')
+    signal.signal(signal.SIGTERM, cancelled_before_launch)
+    document_mode = len(sys.argv) == 3 and sys.argv[2] == '--attachment'
     request = json.loads(sys.stdin.buffer.read(70000))
-    code = request.get('code')
-    if not isinstance(code,str) or len(code.encode())>65536: raise RuntimeError('Invalid calculation')
+    if document_mode:
+        # FD 3 is opened by our trusted Node adapter, never selected by an
+        # uploaded filename. Only this one file enters the document namespace.
+        info = os.fstat(3)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 20_000_000:
+            raise RuntimeError('Invalid attachment input')
+        code = json.dumps({'name': request.get('name'), 'mime': request.get('mime')})
+        guest = (Path(__file__).parent.parent/'attachments'/'guest.py').read_text()
+    else:
+        code = request.get('code')
+        if not isinstance(code,str) or len(code.encode())>65536: raise RuntimeError('Invalid calculation')
+        guest = GUEST
     interpreter,stdlib,packages,libraries=runtime_files()
     with seccomp_file() as bpf, open('/dev/null','rb') as empty:
         command=['/usr/sbin/prlimit','--as=1073741824','--cpu=20','--fsize=4194304','--nofile=64','--core=0','--',
@@ -148,14 +165,16 @@ def run():
         for name in ['site-packages','dist-packages']:
             path=stdlib/name
             if path.is_dir(): command += ['--size','4096','--tmpfs',str(path),'--remount-ro',str(path)]
+        if document_mode:
+            command += ['--ro-bind-fd','3','/attachments/input']
         empty_fds=[]
-        for name in ['result.png','image-2.png','image-3.png','image-4.png']+[f'scratch-{n}.txt' for n in range(8)]:
+        for name in ([] if document_mode else ['result.png','image-2.png','image-3.png','image-4.png']+[f'scratch-{n}.txt' for n in range(8)]):
             fd=os.dup(empty.fileno());empty_fds.append(fd)
             command += ['--file',str(fd),'/work/'+name]
         command += ['--dir','/tmp/mpl']
-        command += ['--remount-ro','/proc','--remount-ro','/dev','--remount-ro','/','--chdir','/work','--seccomp',str(bpf.fileno()),'--','/runtime/python','-I','-c',GUEST]
+        command += ['--remount-ro','/proc','--remount-ro','/dev','--remount-ro','/','--chdir','/work','--seccomp',str(bpf.fileno()),'--','/runtime/python','-I','-c',guest]
         child = subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-            pass_fds=(bpf.fileno(),*empty_fds),env={'PATH':'/usr/bin'},close_fds=True)
+            pass_fds=(bpf.fileno(),*empty_fds,*([3] if document_mode else [])),env={'PATH':'/usr/bin'},close_fds=True)
         for fd in empty_fds: os.close(fd)
         def terminate(*_):
             child.kill()
@@ -173,12 +192,20 @@ def run():
                     chunk=os.read(key.fileobj.fileno(),65536)
                     if not chunk: selector.unregister(key.fileobj);continue
                     outputs[key.data].extend(chunk)
-                    if len(outputs[key.data])>(MAX_WIRE if key.data=='out' else 65536): raise RuntimeError('Calculation output limit exceeded')
+                    limit = (10*1024*1024 if document_mode else MAX_WIRE) if key.data=='out' else 65536
+                    if len(outputs[key.data])>limit: raise RuntimeError('Calculation output limit exceeded')
             if child.wait(timeout=1):
                 raise RuntimeError('Calculation failed: '+outputs['err'].decode(errors='replace')[:2000])
             # Validate the untrusted protocol before returning it, including PNG
             # decoding in the trusted parent after the worker has stopped.
             result=json.loads(outputs['out'])
+            if document_mode:
+                # No host decoding or parsing of uploaded documents/images.
+                # The adapter bounds and validates this wire format too.
+                if not isinstance(result,dict) or not isinstance(result.get('text'),str) or not isinstance(result.get('images'),list):
+                    raise RuntimeError('Invalid attachment result')
+                print(json.dumps(result))
+                return
             from PIL import Image
             import io
             if not isinstance(result,dict) or len(result.get('images',[]))>4: raise RuntimeError('Invalid result')
