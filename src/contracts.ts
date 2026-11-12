@@ -15,6 +15,57 @@ export interface TelegramMessage {
   chat: { id: ChatId; type: string };
   from?: TelegramUser;
   text?: string;
+  caption?: string;
+  media_group_id?: string;
+  photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+}
+
+export const ATTACHMENT_LIMITS = {
+  files: 10,
+  fileBytes: 20_000_000,
+  batchBytes: 50_000_000,
+  imageBytes: 6_000_000,
+  textBytes: 500_000,
+  images: 20,
+  dialogueBytes: 12_000_000,
+  albumQuietMs: 1500,
+} as const;
+
+/** Telegram references are durable; they are not local filesystem paths. */
+export interface AttachmentRef {
+  fileId: string;
+  name: string;
+  mime: string;
+  size?: number;
+  source: "photo" | "document";
+}
+
+export interface DownloadedAttachment {
+  name: string;
+  mime: string;
+  bytes: Uint8Array;
+}
+
+/** Normalized images, decoded only inside the isolated reader. */
+export interface InputImage {
+  name: string;
+  mime: "image/jpeg" | "image/png";
+  base64: string;
+}
+
+export interface PreparedAttachment {
+  name: string;
+  text: string;
+  images: InputImage[];
+}
+
+export interface AttachmentReader {
+  prepare(files: DownloadedAttachment[], signal: AbortSignal): Promise<PreparedAttachment[]>;
+}
+
+export class AttachmentError extends Error {
+  constructor(message: string) { super(message); this.name = "AttachmentError"; }
 }
 
 export interface TelegramCallbackQuery {
@@ -55,6 +106,7 @@ export interface TelegramTransport {
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
   typing(chatId: ChatId, signal?: AbortSignal): Promise<void>;
   answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void>;
+  downloadFile?(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
 /** Only images read by the trusted adapter from its isolated workspace. */
@@ -73,6 +125,7 @@ export interface ModelSelection {
 export interface ConversationMessage {
   role: "user" | "assistant";
   text: string;
+  attachments?: PreparedAttachment[];
 }
 
 export interface ModelInfo {
@@ -92,6 +145,7 @@ export interface ModelRequest extends ModelSelection {
   threadId?: string;
   text: string;
   history?: ConversationMessage[];
+  attachments?: PreparedAttachment[];
   signal: AbortSignal;
   /** Await persistence of the thread before continuing the request. */
   onThread: (threadId: string) => void | Promise<void>;
