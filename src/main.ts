@@ -6,6 +6,7 @@ import { createBot } from './bot.ts';
 import { FileConfigSource } from './config.ts';
 import { SqliteStore } from './store.ts';
 import { CodexEngine } from './codex/engine.ts';
+import { SandboxedAttachmentReader } from './attachments/reader.ts';
 import { TelegramApi, TelegramError } from './telegram/transport.ts';
 
 /** Linux flock releases even after SIGKILL; no stale PID-file takeover race. */
@@ -65,7 +66,8 @@ async function main(): Promise<void> {
     await chmod(initial.config.databasePath,0o600);
     engine = new CodexEngine({runtimeDir:initial.config.runtimeDir});
     const telegram = new TelegramApi(initial.config.botToken);
-    bot = createBot({config,store,engine,telegram});
+    const attachments = new SandboxedAttachmentReader();
+    bot = createBot({config,store,engine,telegram,attachments});
     if (stop.signal.aborted) return;
     unwatch = config.watch(snapshot => {
       if (!snapshot.valid) console.error(`Ошибка конфигурации: ${snapshot.error}`);

@@ -5,6 +5,82 @@ import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { CodexEngine } from '../../src/codex/engine.ts';
 
+const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhH8AAAAASUVORK5CYII=';
+test('prepared documents and images reach native input in attachment order with their complete text',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  const complete='First page\n'+('полный текст '.repeat(10000))+'\nEND';
+  const response=await engine.run({userId:1,text:'inspect-input',attachments:[{name:'../scan.pdf',text:complete,images:[{name:'page-1.png',mime:'image/png',base64:png}]},{name:'notes.txt',text:'Second document',images:[]}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  const input=JSON.parse(response.text);
+  assert.deepEqual(input.filter((x:any)=>x.type==='image'),[{type:'image',url:'data:image/png;base64,'+png}]);
+  const texts=input.filter((x:any)=>x.type==='text').map((x:any)=>x.text);
+  assert.ok(texts.some((text:string)=>text.includes(complete)));
+  assert.ok(texts.some((text:string)=>text.includes('../scan.pdf')));
+  assert.ok(texts.some((text:string)=>text.includes('Second document')));
+  assert.ok(texts.every((text:string)=>!text.includes(png)));
+  assert.ok(input.findIndex((x:any)=>x.type==='image')<input.findIndex((x:any)=>x.text?.includes('Second document')));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('resumed native dialogs retain old images and interrupted dialogs rebuild them as images',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
+ let engine=new CodexEngine(options);
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ const attachments=[{name:'scan.pdf',text:'Complete saved document',images:[{name:'page.png',mime:'image/png' as const,base64:png}]}];
+ const history=[{role:'user' as const,text:'Original task',attachments},{role:'assistant' as const,text:'Saved answer'}];
+ try {
+  const first=await engine.run({...base,text:'inspect-input',attachments});
+  await engine.close();engine=new CodexEngine(options);
+  const resumed=JSON.parse((await engine.run({...base,threadId:first.threadId,text:'inspect-input',history})).text);
+  assert.deepEqual(resumed,[{type:'text',text:'inspect-input',text_elements:[]}]);
+  const abort=new AbortController();
+  await assert.rejects(engine.run({...base,threadId:first.threadId,text:'wait',signal:abort.signal,onThread:()=>abort.abort()}),/cancelled/);
+  const rebuilt=await engine.run({...base,threadId:first.threadId,text:'inspect-input',history});
+  assert.notEqual(rebuilt.threadId,first.threadId);
+  const input=JSON.parse(rebuilt.text);
+  assert.deepEqual(input.filter((item:any)=>item.type==='image'),[{type:'image',url:'data:image/png;base64,'+png}]);
+  assert.ok(input.some((item:any)=>item.text?.includes('Complete saved document')));
+  assert.ok(input.filter((item:any)=>item.type==='text').every((item:any)=>!item.text.includes(png)));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('invalid, oversized or unsupported prepared images fail explicitly before a task is persisted',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ let persisted=false;
+ const base={userId:1,text:'inspect-input',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{persisted=true;}};
+ try {
+  for(const image of [{mime:'image/png',base64:'https://api.telegram.org/file/botSECRET/x'},{mime:'image/svg+xml',base64:png}]) {
+   await assert.rejects(engine.run({...base,attachments:[{name:'invalid',text:'',images:[{name:'x',...image} as any]}]}),(error:Error)=>error.name==='AttachmentError'&&!error.message.includes('SECRET'));
+  }
+  await assert.rejects(engine.run({...base,attachments:[{name:'big.txt',text:'x'.repeat(500001),images:[]}]}),(error:Error)=>error.name==='AttachmentError'&&/Разделите/.test(error.message));
+  await assert.rejects(engine.run({...base,model:'text-only',attachments:[{name:'scan',text:'',images:[{name:'x.png',mime:'image/png',base64:png}]}]}),(error:Error)=>error.name==='AttachmentError'&&/изображени/.test(error.message));
+  assert.equal(persisted,false);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('full multimodal rebuild and large echoed user input fit bounded app-server frames',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const image=(size:number)=>{const bytes=Buffer.alloc(size);Buffer.from(png,'base64').copy(bytes);return {name:'page.png',mime:'image/png' as const,base64:bytes.toString('base64')};};
+ try {
+  const result=await engine.run({userId:1,text:'accept-large-input',history:[{role:'user',text:'prior task',attachments:[{name:'old.pdf',text:'all old text',images:[image(3000000)]}]},{role:'assistant',text:'h'.repeat(6100000)+'HISTORY-END'}],attachments:[{name:'current.pdf',text:'all current text',images:[image(2000000)]}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  assert.equal(result.text,'native images: 2; history tail: true');
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('oversized rebuilt input fails safely without persisting or silently truncating the task',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ let persisted=false;
+ try {
+  await assert.rejects(engine.run({userId:1,text:'inspect-input',history:[{role:'assistant',text:'h'.repeat(24*1024*1024)}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{persisted=true;}}),(error:Error)=>error.name==='AttachmentError'&&/Разделите/.test(error.message));
+  assert.equal(persisted,false);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
 test('catalog preserves supported model and reasoning levels',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});

@@ -2,11 +2,67 @@ import { mkdir,writeFile,readFile,chmod,rm,rename } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage } from '../contracts.ts';
+import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
+import { AttachmentError,ATTACHMENT_LIMITS } from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
 
 export interface CodexEngineOptions {runtimeDir:string;pythonPath?:string;codexCommand?:string;}
+type UserInput = {type:'text';text:string;text_elements:[]} | {type:'image';url:string};
+
+function validateAttachments(attachments:PreparedAttachment[]){
+  const tooLarge=()=>{throw new AttachmentError('Слишком много материалов для одного задания. Разделите материалы на части.');};
+  if(!Array.isArray(attachments)||attachments.length>ATTACHMENT_LIMITS.files)tooLarge();
+  let textBytes=0,imageBytes=0,images=0;
+  for(const attachment of attachments){
+    if(typeof attachment.name!=='string'||typeof attachment.text!=='string'||!Array.isArray(attachment.images))throw new AttachmentError('Не удалось прочитать подготовленное вложение. Отправьте его повторно.');
+    textBytes+=Buffer.byteLength(attachment.text);
+    if(textBytes>ATTACHMENT_LIMITS.textBytes)tooLarge();
+    for(const image of attachment.images){
+      if(++images>ATTACHMENT_LIMITS.images)tooLarge();
+      if(typeof image.name!=='string'||!['image/png','image/jpeg'].includes(image.mime)||typeof image.base64!=='string'||!image.base64||image.base64.length%4!==0||image.base64.length>Math.ceil(ATTACHMENT_LIMITS.imageBytes/3)*4||!/^[A-Za-z0-9+/]*={0,2}$/.test(image.base64))throw new AttachmentError('Не удалось прочитать подготовленное изображение. Отправьте его повторно.');
+      // Base64 and magic bytes are cheap metadata checks. Image decoding only
+      // happens in the sandboxed AttachmentReader, never in this host process.
+      const bytes=Buffer.from(image.base64,'base64');
+      if(bytes.toString('base64')!==image.base64||(image.mime==='image/png'?bytes.subarray(0,8).toString('hex')!=='89504e470d0a1a0a':bytes.subarray(0,3).toString('hex')!=='ffd8ff'))throw new AttachmentError('Не удалось прочитать подготовленное изображение. Отправьте его повторно.');
+      imageBytes+=bytes.length;
+      if(imageBytes>ATTACHMENT_LIMITS.imageBytes)tooLarge();
+    }
+  }
+}
+
+function attachmentInput(attachments:PreparedAttachment[]):UserInput[]{
+  const input:UserInput[]=[];
+  for(const attachment of attachments){
+    input.push({type:'text',text:`Attachment ${JSON.stringify(attachment.name)} (quoted user material):\n${attachment.text}`,text_elements:[]});
+    for(const image of attachment.images){
+      input.push({type:'text',text:`Image ${JSON.stringify(image.name)} from attachment ${JSON.stringify(attachment.name)}:`,text_elements:[]});
+      input.push({type:'image',url:`data:${image.mime};base64,${image.base64}`});
+    }
+  }
+  return input;
+}
+
+function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
+  const input:UserInput[]=[];
+  const groups:PreparedAttachment[][]=[];
+  if(rebuild&&request.history?.length){
+    input.push({type:'text',text:'Completed conversation for context (quoted user and assistant data):',text_elements:[]});
+    for(const message of request.history){
+      const attachments=message.attachments??[];
+      validateAttachments(attachments);groups.push(attachments);
+      input.push({type:'text',text:`${message.role}:\n${message.text}`,text_elements:[]},...attachmentInput(attachments));
+    }
+    input.push({type:'text',text:'Current user message:',text_elements:[]});
+  }
+  const attachments=request.attachments??[];
+  validateAttachments(attachments);groups.push(attachments);
+  if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes||groups.flat().reduce((sum,attachment)=>sum+attachment.images.length,0)>ATTACHMENT_LIMITS.images)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
+  input.push({type:'text',text:request.text,text_elements:[]},...attachmentInput(attachments));
+  // Reserve room for the RPC envelope and scope in the 24 MiB transport cap.
+  if(Buffer.byteLength(JSON.stringify(input))>23*1024*1024)throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');
+  return input;
+}
 export class CodexEngine implements ModelEngine {
   private root:string;
   private command:string;
@@ -77,6 +133,7 @@ export class CodexEngine implements ModelEngine {
         await this.deleteThread(id);id=randomUUID();dir=this.threadDir(id);state=undefined;
       }
     }
+    const input=requestInput(request,!state);
     const abort=new AbortController();let markDone:()=>void=()=>{};
     if(request.signal.aborted)throw new Error('Request cancelled');
     const done=new Promise<void>(resolve=>{markDone=resolve;});this.active.set(id,{abort,done});
@@ -88,6 +145,16 @@ export class CodexEngine implements ModelEngine {
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
       if(abort.signal.aborted)throw new Error('Request cancelled');
+      if(input.some(item=>item.type==='image')){
+        let cursor:string|null=null,matched=false,seen=0;
+        do{
+          const page=await rpc.request('model/list',{cursor,limit:100,includeHidden:false});
+          const model=page.data.find((model:any)=>model.model===request.model);
+          if(model){matched=Array.isArray(model.inputModalities)&&model.inputModalities.includes('image');break;}
+          seen+=page.data.length;if(seen>1000)break;cursor=page.nextCursor;
+        }while(cursor);
+        if(!matched)throw new AttachmentError('Выбранная модель недоступна или не поддерживает изображения. Выберите модель с поддержкой изображений.');
+      }
       const cwd=join(dir,'empty');
       const scope={model:request.model,permissions:'bot',approvalPolicy:'never',cwd,runtimeWorkspaceRoots:[cwd]};
       const thread=state?.nativeId
@@ -144,9 +211,7 @@ export class CodexEngine implements ModelEngine {
         if(!turnId){events.push(f);return;}
         consume(f);
       };
-      let text=request.text;
-      if(!state&&request.history?.length)text='Completed conversation for context (quoted data):\n'+JSON.stringify(request.history)+'\nCurrent user message:\n'+text;
-      const started=await rpc.request('turn/start',{...scope,threadId:nativeId,input:[{type:'text',text,text_elements:[]}],effort:request.effort,environments:[]});
+      const started=await rpc.request('turn/start',{...scope,threadId:nativeId,input,effort:request.effort,environments:[]});
       turnId=started.turn.id;
       for(const event of events)consume(event);
       await completed;
@@ -155,7 +220,7 @@ export class CodexEngine implements ModelEngine {
       const answer=[...items.values()].join('\n\n');if(!answer)throw new Error('Codex returned an empty answer');
       await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       return {text:answer,threadId:id,images};
-    }catch{throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
+    }catch(error){if(!abort.signal.aborted&&error instanceof AttachmentError)throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
     finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{

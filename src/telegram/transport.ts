@@ -1,4 +1,5 @@
 import type { ChatId, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
+import { AttachmentError, ATTACHMENT_LIMITS } from '../contracts.ts';
 import { formatText } from './format.ts';
 
 export class TelegramError extends Error {
@@ -31,7 +32,7 @@ export class TelegramApi implements TelegramTransport {
     const combined = signal ? AbortSignal.any([signal,timeout]) : timeout;
     try {
       const response = await this.#fetch(`${this.#baseUrl}/bot${this.#token}/${method}`, {
-        method:'POST', signal:combined,
+        method:'POST', signal:combined, redirect:'error',
         ...(data instanceof FormData ? {body:data} : {headers:{'content-type':'application/json'},body:JSON.stringify(data)}),
       });
       const body = await response.json() as {ok?:boolean;result:T;error_code?:number;description?:string;parameters?:{retry_after?:number}};
@@ -52,6 +53,41 @@ export class TelegramApi implements TelegramTransport {
   }
   getUpdates(options: {offset?:number;timeout:number;signal?:AbortSignal}): Promise<TelegramUpdate[]> {
     return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','callback_query']},options.signal,(options.timeout + 15) * 1000);
+  }
+  async downloadFile(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
+    const limit = Math.min(maxBytes,ATTACHMENT_LIMITS.fileBytes);
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new AttachmentError('Недопустимый размер вложения.');
+    // One deadline covers metadata, headers and the complete response stream.
+    const deadline = AbortSignal.timeout(60_000);
+    const combined = signal ? AbortSignal.any([signal,deadline]) : deadline;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const file = await this.#call<{file_path?:string;file_size?:number}>('getFile',{file_id:fileId},combined);
+      if (file.file_size !== undefined && (!Number.isSafeInteger(file.file_size) || file.file_size < 0 || file.file_size > limit)) throw new AttachmentError('Файл слишком большой. Разделите материалы на части.');
+      const path = file.file_path;
+      // Telegram paths are relative identifiers, never user-selected URLs or
+      // filesystem paths. A narrow alphabet also excludes encoded traversal.
+      if (typeof path !== 'string' || path.length > 1024 || !/^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(path) || path.split('/').some(part=>part === '.' || part === '..')) throw new AttachmentError('Не удалось получить файл Telegram. Отправьте его повторно.');
+      const response = await this.#fetch(`${this.#baseUrl}/file/bot${this.#token}/${path}`,{signal:combined,redirect:'error'});
+      if (!response.ok || !response.body) { await response.body?.cancel(); throw new TelegramError(response.status,'download failed'); }
+      const declared = response.headers.get('content-length');
+      if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > limit || !Number.isSafeInteger(Number(declared)))) { await response.body.cancel(); throw new AttachmentError('Файл слишком большой. Разделите материалы на части.'); }
+      reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > limit) throw new AttachmentError('Файл слишком большой. Разделите материалы на части.');
+        chunks.push(chunk.value);
+      }
+      return Buffer.concat(chunks,size);
+    } catch (error) {
+      if (signal?.aborted) throw new DOMException('Telegram request aborted','AbortError');
+      if (error instanceof AttachmentError || error instanceof TelegramError) throw error;
+      throw new TelegramError(0,'download failed');
+    } finally { await reader?.cancel().catch(()=>{}); reader?.releaseLock(); }
   }
   async sendText(chatId: ChatId, text: string, options: SendOptions = {}): Promise<number> {
     let id = 0;
