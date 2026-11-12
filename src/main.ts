@@ -37,13 +37,16 @@ async function main(): Promise<void> {
   const initial = config.snapshot();
   if (!initial.valid) { config.close(); throw new Error(`Ошибка конфигурации: ${initial.error}`); }
   const stop = new AbortController();
-  const onSignal = () => stop.abort();
+  let bot: ReturnType<typeof createBot> | undefined;
+  const onSignal = () => {
+    stop.abort();
+    void bot?.shutdown().catch(() => {});
+  };
   process.once('SIGINT',onSignal);
   process.once('SIGTERM',onSignal);
   let unlock: (() => Promise<void>) | undefined;
   let store: SqliteStore | undefined;
   let engine: CodexEngine | undefined;
-  let bot: ReturnType<typeof createBot> | undefined;
   let unwatch: (() => void) | undefined;
   try {
     await mkdir(initial.config.runtimeDir,{recursive:true,mode:0o700});
@@ -55,11 +58,13 @@ async function main(): Promise<void> {
     engine = new CodexEngine({runtimeDir:initial.config.runtimeDir});
     const telegram = new TelegramApi(initial.config.botToken);
     bot = createBot({config,store,engine,telegram});
+    if (stop.signal.aborted) return;
     unwatch = config.watch(snapshot => {
       if (!snapshot.valid) console.error(`Ошибка конфигурации: ${snapshot.error}`);
       else console.info('Конфигурация перечитана.');
     });
     await bot.recover();
+    if (stop.signal.aborted) return;
     console.info('Бот запущен. Остановка: Ctrl+C.');
     let startup = true;
     let failures = 0;

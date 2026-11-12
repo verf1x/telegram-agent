@@ -57,7 +57,7 @@ function richParts(text: string): OutgoingPart[] {
   const result: OutgoingPart[] = [];
   let pending = '';
   // Treat every formatting marker as a potential block: deliberately conservative.
-  const blocks = (value: string) => (value.match(/\n|[>*#|]|^\s*[-+]|^\s*\d+\./gm) ?? []).length + 1;
+  const blocks = (value: string) => (value.match(/\n|[<>*#|]|^\s*[-+]|^\s*\d+\./gm) ?? []).length + 1;
   const safe = (value: string) => value.length <= 4000 && blocks(value) <= 200;
   const flush = () => { if (pending) result.push({kind:'rich',text:pending}); pending = ''; };
   for (const value of units) {
