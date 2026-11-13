@@ -109,7 +109,15 @@ export interface SendOptions {
   signal?: AbortSignal;
 }
 
+export interface GeneratedFile { bytes: Uint8Array; name: string; mime: string; }
+export interface DialogueFile { id: string; name: string; mime: string; size: number; }
+export const RESPONSE_FILE_LIMITS = { files: 10, fileBytes: 50_000_000, dialogueBytes: 500_000_000 } as const;
+export class ResponseFileError extends Error {
+  constructor(message: string) { super(message); this.name = "ResponseFileError"; }
+}
+
 export interface TelegramTransport {
+  sendFile?(chatId: ChatId, file: GeneratedFile, options?: SendOptions): Promise<number>;
   getUpdates(options: {
     offset?: number;
     timeout: number;
@@ -159,6 +167,10 @@ export interface ModelRequest extends ModelSelection {
   text: string;
   history?: ConversationMessage[];
   attachments?: PreparedAttachment[];
+  files?: DialogueFile[];
+  readFile?: (id: string) => Uint8Array;
+  /** Persist each completed file before the agent continues or the request ends. */
+  onFile?: (file: GeneratedFile) => Promise<DialogueFile>;
   signal: AbortSignal;
   /** Await persistence of the thread before continuing the request. */
   onThread: (threadId: string) => void | Promise<void>;
@@ -168,6 +180,7 @@ export interface ModelResponse {
   text: string;
   threadId: string;
   images: GeneratedImage[];
+  fileIds?: string[];
 }
 
 export interface ModelEngine {
@@ -186,6 +199,7 @@ export interface BotConfig {
   runtimeDir: string;
   maxConcurrentRequests: number;
   requestTimeoutMs: number;
+  dialogueFileBytes?: number;
   pollTimeoutSeconds: number;
   configReloadIntervalMs: number;
   defaultModel: "gpt-6.1-sol";

@@ -961,3 +961,94 @@ test("a captioned album rejected by the global capacity limit never becomes an i
   assert.equal(f.requests[1].text, "Explicit repeated task");
   assert.equal(f.requests[1].attachments[0].name, "waiting.txt");
 });
+
+test('completed response files survive timeout, restart and are available only in their dialogue', async(t)=>{
+ const f=fixture(t);
+ const documents:any[]=[];
+ f.telegram.sendFile=async(chatId,file)=>{documents.push({chatId,...file});return 100;};
+ f.engine.run=async(request)=>{
+  await request.onThread('thread-'+request.userId);
+  await request.onFile!({name:'table.csv',mime:'text/csv',bytes:Buffer.from('a,b\n1,2')});
+  throw new Error('provider failed after export');
+ };
+ await f.bot.handleUpdate(f.update(2,'create CSV'));
+ await f.bot.drain();
+ assert.equal(documents.length,1);
+ assert.equal(documents[0].name,'table.csv');
+ await f.reopen();
+ f.engine.run=async(request)=>{
+  assert.equal(request.files?.length,request.userId===2?1:0);
+  if(request.userId===2)assert.equal(Buffer.from(request.readFile!(request.files![0]!.id)).toString(),'a,b\n1,2');
+  return {text:'done',threadId:'thread-'+request.userId,images:[]};
+ };
+ await f.bot.handleUpdate(f.update(2,'edit previous'));
+ await f.bot.drain();
+ await f.bot.handleUpdate(f.update(1,'other dialogue'));
+ await f.bot.drain();
+ await f.bot.handleUpdate(f.update(2,'/new'));
+ await f.bot.drain();
+ assert.equal(f.store.listFiles(2).length,0);
+});
+
+test('an exported file in an interrupted request is delivered on recovery without rerunning Codex',async(t)=>{
+ const f=fixture(t);const sent:string[]=[];
+ const file=f.store.saveFile(2,{name:'ready.csv',mime:'text/csv',bytes:Buffer.from('ready')});
+ f.store.put({userId:2,history:[],request:{id:'interrupted',text:'task',started:Date.now(),fileIds:[file.id]}});
+ f.telegram.sendFile=async(chatId,file)=>{assert.equal(chatId,2);sent.push(file.name);return 1;};
+ await f.reopen();
+ assert.deepEqual(sent,['ready.csv']);assert.equal(f.requests.length,0);
+});
+
+test('a timed-out turn delivers the completed file and enforces the ten-file limit',async(t)=>{
+ const f=fixture(t);writeFileSync(f.env,f.configText('2','REQUEST_TIMEOUT_MS=250'));
+ await new Promise(r=>setTimeout(r,60));
+ const sent:string[]=[];
+ f.telegram.sendFile=async(chatId,file)=>{sent.push(file.name);return sent.length;};
+ f.engine.run=async(request)=>{
+  for(let n=0;n<10;n++)await request.onFile!({name:n+'.csv',mime:'text/csv',bytes:Buffer.from('ready')});
+  await assert.rejects(request.onFile!({name:'11.csv',mime:'text/csv',bytes:Buffer.from('overflow')}),/10 файлов/);
+  return new Promise(()=>{});
+ };
+ await f.bot.handleUpdate(f.update(2,'create files'));
+ await f.bot.drain();
+ assert.equal(sent.length,10);assert.ok(f.sent.some(message=>message.text.includes('Время обработки')));
+});
+
+test('quota rejecting a later generated image still delivers earlier persisted images and assistant explanation',async(t)=>{
+ const f=fixture(t);writeFileSync(f.env,f.configText('2','DIALOGUE_FILE_BYTES='+generatedPng.length));
+ await new Promise(r=>setTimeout(r,60));
+ f.engine.run=async()=>({text:'Chart and illustration',threadId:'thread-2',images:[{name:'one.png',mime:'image/png',bytes:generatedPng},{name:'two.png',mime:'image/png',bytes:generatedPng}]});
+ await f.bot.handleUpdate(f.update(2,'two images'));await f.bot.drain();
+ const images=f.sent.flatMap(message=>message.part?.kind==='image'?[message.part]:[]);
+ assert.deepEqual(images.map(image=>image.name),['one.png']);
+ assert.ok(f.sent.some(message=>message.text.includes('Chart and illustration')));
+ assert.ok(f.sent.some(message=>message.text.includes('заполнено')));
+});
+
+test('saved original documents are reused after a failed request and restart without another Telegram download',async(t)=>{
+ const f=fixture(t,{prepare:async files=>files.map(file=>({name:file.name,text:'Source',images:[]}))});
+ let downloads=0;
+ f.telegram.downloadFile=async()=>{downloads++;return Buffer.from('source');};
+ f.engine.run=async()=>{throw new Error('interrupted');};
+ const update=f.update(2,'');delete update.message!.text;
+ update.message!.document={file_id:'source-id',file_name:'source.txt',mime_type:'text/plain'};
+ update.message!.caption='edit';
+ await f.bot.handleUpdate(update);await f.bot.drain();await f.reopen();
+ f.engine.run=async request=>({text:'done',threadId:'thread-2',images:[]});
+ await f.bot.handleUpdate(f.update(2,'retry edit'));await f.bot.drain();
+ assert.equal(downloads,1);assert.equal(f.store.listFiles(2).length,1);
+});
+
+test('a permanent error for one document reports it and still delivers the remaining ready files',async(t)=>{
+ const f=fixture(t);const sent:string[]=[];
+ f.engine.run=async request=>{
+  for(const name of ['one.csv','two.csv'])await request.onFile!({name,mime:'text/csv',bytes:Buffer.from('ready')});
+  return {text:'Files ready',threadId:'thread-2',images:[]};
+ };
+ f.telegram.sendFile=async(chatId,file)=>{
+  if(file.name==='one.csv')throw Object.assign(new Error('Telegram rejected document'),{permanent:true,code:400});
+  sent.push(file.name);return 1;
+ };
+ await f.bot.handleUpdate(f.update(2,'create files'));await f.bot.drain();
+ assert.deepEqual(sent,['two.csv']);assert.ok(f.sent.some(message=>message.text.includes('Не удалось доставить один')));
+});

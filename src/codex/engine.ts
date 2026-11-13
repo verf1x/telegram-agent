@@ -1,11 +1,12 @@
-import { mkdir,writeFile,readFile,chmod,rm,rename } from 'node:fs/promises';
+import { mkdir,writeFile,readFile,chmod,rm,rename,readdir } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
-import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS } from '../contracts.ts';
+import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS,ResponseFileError,RESPONSE_FILE_LIMITS } from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
+import { IsolatedWorkspace } from '../files/workspace.ts';
 import { nativePng } from './images.ts';
 
 export interface CodexEngineOptions {runtimeDir:string;pythonPath?:string;codexCommand?:string;}
@@ -71,8 +72,19 @@ export class CodexEngine implements ModelEngine {
   private workers=new Set<Rpc>();
   private active=new Map<string,{abort:AbortController;done:Promise<void>}>();
   private closed=false;
+  private cleanup?:Promise<void>;
   constructor(options:CodexEngineOptions){this.root=resolve(options.runtimeDir,'codex');this.command=options.codexCommand??'codex';this.pythonPath=options.pythonPath??resolve('.venv/bin/python');}
+  private async cleanWorkspaces() {
+    let entries;
+    try { entries=await readdir(join(this.root,'dialogs'),{withFileTypes:true}); }
+    catch(error) {if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error;}
+    for(const entry of entries)if(entry.isDirectory()&&/^[0-9a-f-]{36}$/.test(entry.name))
+      await rm(join(this.root,'dialogs',entry.name,'workspaces'),{recursive:true,force:true});
+  }
   private async worker(dir:string,signal?:AbortSignal){
+    // The runtime flock admits one bot instance. Collect document staging left
+    // by a killed previous process before accepting any new model work.
+    this.cleanup??=this.cleanWorkspaces();await this.cleanup;
     if(this.closed||signal?.aborted)throw new Error('Codex unavailable');
     const home=join(dir,'home'),cwd=join(dir,'empty');
     await mkdir(home,{recursive:true,mode:0o700});await mkdir(cwd,{recursive:true,mode:0o700});
@@ -141,6 +153,10 @@ export class CodexEngine implements ModelEngine {
     const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
     let rpc:Rpc|undefined;
     const computations=new Set<Promise<void>>();
+    const workspace=new IsolatedWorkspace(request.files??[],request.readFile??(()=>{throw new Error('File unavailable');}),join(dir,'workspaces'));
+    const fileIds:string[]=[];
+    let fileError:ResponseFileError|undefined;
+    const materializedImages=new Map<string,string>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
     try{
       await mkdir(dir,{recursive:true,mode:0o700});
@@ -158,10 +174,11 @@ export class CodexEngine implements ModelEngine {
       }
       const cwd=join(dir,'empty');
       const developerInstructions='Respond to the user in ordinary Markdown. Cite web sources as descriptive Markdown links to public URLs; internal citation tokens do not render in Telegram. Use the native tools.image_gen__imagegen tool for artwork, illustrations, posters and image editing. Use isolated_compute Python for numerical calculations and scientific plots, never as a substitute for native artwork. Image generation uses the current ChatGPT authorization and its model/account limits; if the native tool is unavailable, explain that limitation. Never ask for an API key or silently switch billing routes. For image editing use num_last_images_to_include for images in this conversation only; never use local reference paths. Computations use isolated_compute only. Generated PNG attachments are already delivered with your answer; do not link local paths.';
+      const fileInstructions=' For creating/editing documents use isolated_workspace with a shell command in /work; it can run programs and install packages (pip --target /work/packages) and access public HTTP(S) via the configured proxy. Available: Python, python-docx, openpyxl, python-pptx, reportlab, pypdf, matplotlib, LibreOffice, curl. Use /work for all working files. Call export_files with paths under /work to attach completed files; files are persisted immediately and delivered even if later work fails. Explicit file requests require actual export, never just a local link or a different format. Preserve editable text/cells/slides and searchable PDF text; preserve supported formatting when editing uploads and explain unavoidable losses. Inspect source files when necessary. Do not draw artwork with code; use native image generation. Generated native images and scientific plots from this turn are copied to /work/materials before workspace commands. Files available in this dialogue (quoted metadata): '+JSON.stringify(workspace.materials)+'. Existing threads may expose only isolated_compute: in that case pass JSON in its code string, either {"command":"shell command"} to use the workspace or {"files":[{"path":"/work/report.pdf","name":"report.pdf","mime":"application/pdf"}]} to export. Normal Python code still uses the restricted numerical sandbox. Limits: 10 exported files per task, 50 MB each; if one fails, explain partial completion and do not silently substitute formats.';
       const scope={model:request.model,permissions:'bot',approvalPolicy:'never',cwd,runtimeWorkspaceRoots:[cwd]};
       const thread=state?.nativeId
-        ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions})
-        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
+        ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions:developerInstructions+fileInstructions})
+        :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions:developerInstructions+fileInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}},{type:'function',name:'isolated_workspace',description:'Run a shell command in the isolated document workspace. No host files. Programs, package installation and public internet via HTTP(S) proxy are available. Files in /work survive tool calls during this task; export completed results with export_files.',inputSchema:{type:'object',properties:{command:{type:'string'}},required:['command'],additionalProperties:false}},{type:'function',name:'export_files',description:'Persist and attach completed files from /work to the current Telegram dialogue. Accepts arbitrary formats, up to 10 files per task, 50 MB each. Paths and symlinks cannot escape /work.',inputSchema:{type:'object',properties:{files:{type:'array',items:{type:'object',properties:{path:{type:'string'},name:{type:'string'},mime:{type:'string'}},required:['path','name','mime'],additionalProperties:false},maxItems:10}},required:['files'],additionalProperties:false}}]});
       const nativeId=thread.thread.id as string;
       await this.save(dir,{userId:request.userId,nativeId,status:'running'});
       await request.onThread(id);
@@ -179,20 +196,58 @@ export class CodexEngine implements ModelEngine {
       connection.onClose=()=>fail(new Error('Codex unavailable'));
       const handleTool=async(f:any)=>{
         const p=f.params;
-        if(f.method!=='item/tool/call'||p?.threadId!==nativeId||p.turnId!==turnId||p.tool!=='isolated_compute'||(p.namespace!==undefined&&p.namespace!==null)||typeof p.callId!=='string'||calls.has(p.callId)||calls.size>=16||computing||abort.signal.aborted||typeof p.arguments?.code!=='string'||Object.keys(p.arguments).length!==1){
+        if(f.method!=='item/tool/call'||p?.threadId!==nativeId||p.turnId!==turnId||!['isolated_compute','isolated_workspace','export_files'].includes(p.tool)||(p.namespace!==undefined&&p.namespace!==null)||typeof p.callId!=='string'||calls.has(p.callId)||calls.size>=64||computing||abort.signal.aborted||!p.arguments||typeof p.arguments!=='object'||Array.isArray(p.arguments)||Object.keys(p.arguments).length!==1){
           connection.send({id:f.id,error:{code:-32601,message:'Request denied'}});return;
         }
         calls.add(p.callId);computing=true;
         try{
-          const result=await compute(p.arguments.code,this.pythonPath,abort.signal);
+          let tool=p.tool,args=p.arguments;
+          // Backward-compatible control messages for already persisted native
+          // threads: app-server cannot replace their dynamic tool definitions.
+          if(tool==='isolated_compute'&&typeof args.code==='string'&&args.code.trimStart().startsWith('{')){
+            try {const value=JSON.parse(args.code);if(value&&Object.keys(value).length===1){if(typeof value.command==='string'){tool='isolated_workspace';args=value;}else if(Array.isArray(value.files)){tool='export_files';args=value;}}}catch{/* ordinary Python */}
+          }
+          if(tool==='isolated_workspace'){
+            if(typeof args.command!=='string')throw new Error('Invalid command');
+            for(const [index,image] of images.entries()) {
+              const key='calculation-'+index;
+              if(!materializedImages.has(key))materializedImages.set(key,await workspace.addImage(image,abort.signal));
+            }
+            for(const [key,image] of nativeImages)if(image&&!materializedImages.has(key))materializedImages.set(key,await workspace.addImage(image,abort.signal));
+            const result=await workspace.run(args.command,abort.signal);
+            if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:JSON.stringify({...result,nativeImages:Object.fromEntries(materializedImages)})}],success:result.code===0}});
+            return;
+          }
+          if(tool==='export_files'){
+            if(!Array.isArray(args.files)||!args.files.length||args.files.length>10)throw new ResponseFileError('Укажите от 1 до 10 файлов для отправки.');
+            const saved=[];const failed=[];
+            for(const item of args.files){
+              if(abort.signal.aborted)throw new Error('Cancelled');
+              try {
+                if(fileIds.length>=RESPONSE_FILE_LIMITS.files)throw new ResponseFileError('Не более 10 файлов ответа на задание. Готовые файлы сохранены.');
+                if(!item||typeof item.path!=='string'||typeof item.name!=='string'||typeof item.mime!=='string'||!request.onFile)throw new ResponseFileError('Не удалось сохранить файл ответа.');
+                const file=await workspace.export(item.path,item.name,item.mime,abort.signal);
+                const stored=await request.onFile(file);fileIds.push(stored.id);saved.push(stored);
+              } catch(error) {
+                if(abort.signal.aborted)throw error;
+                const notice=error instanceof ResponseFileError?error:new ResponseFileError('Не удалось сохранить один из файлов ответа.');
+                fileError??=notice;failed.push({name:typeof item?.name==='string'?item.name:'document',error:notice.message});
+              }
+            }
+            if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:JSON.stringify({saved,failed})}],success:!failed.length}});
+            return;
+          }
+          if(typeof args.code!=='string')throw new Error('Invalid calculation');
+          const result=await compute(args.code,this.pythonPath,abort.signal);
           const bytes=result.images.reduce((sum,image)=>sum+image.bytes.length,0);
           if(images.length+result.images.length>4||imageBytes+bytes>6*1024*1024)throw new Error();
           imageBytes+=bytes;images.push(...result.images);
           const contentItems:any[]=[{type:'inputText',text:JSON.stringify({stdout:result.stdout,stderr:result.stderr,images:result.images.map(i=>i.name)})}];
           for(const image of result.images)contentItems.push({type:'inputImage',imageUrl:'data:image/png;base64,'+Buffer.from(image.bytes).toString('base64')});
           if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems,success:result.success}});
-        }catch{
-          if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:'Calculation unavailable or resource limit exceeded'}],success:false}});
+        }catch(error){
+          if(p.tool!=='isolated_compute'||error instanceof ResponseFileError)fileError??=error instanceof ResponseFileError?error:new ResponseFileError('Не удалось завершить работу с файлами. Готовая часть сохранена.');
+          if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:error instanceof ResponseFileError?error.message:'Calculation unavailable or resource limit exceeded'}],success:false}});
         }finally{computing=false;}
       };
       const recordImage=(item:any,completedItem:boolean)=>{
@@ -227,15 +282,15 @@ export class CodexEngine implements ModelEngine {
           for(const item of f.params.turn.items??[])recordItem(item);
           if(f.params.turn.status!=='completed'){
             const error=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
-            if(f.params.turn.status!=='failed'||![...nativeImages.values()].some(image=>!!image)){
-              fail(nativeError??(nativeImages.size?error:new Error('Codex request failed')));return;
+            if(f.params.turn.status!=='failed'||(!fileIds.length&&![...nativeImages.values()].some(image=>!!image))){
+              fail(fileError??nativeError??(nativeImages.size?error:new Error('Codex request failed')));return;
             }
-            nativeError??=error;
+            if(fileIds.length)fileError??=new ResponseFileError('Не удалось завершить всё задание. Готовые файлы сохранены.');else nativeError??=error;
           }
           if([...nativeImages.values()].some(image=>!image)){
             nativeError??=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
           }
-          if(nativeError&&![...nativeImages.values()].some(image=>!!image)){fail(nativeError);return;}
+          if(nativeError&&!fileIds.length&&![...nativeImages.values()].some(image=>!!image)){fail(nativeError);return;}
           finish(f.params.turn);
         }
       };
@@ -247,17 +302,19 @@ export class CodexEngine implements ModelEngine {
       turnId=started.turn.id;
       for(const event of events)consume(event);
       const turn=await completed;
+      await Promise.allSettled(computations);
       abort.signal.removeEventListener('abort',stop);
       if(abort.signal.aborted)throw new Error('Request cancelled');
-      let answer=[...items.values()].join('\n\n').trim()||(nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
+      let answer=[...items.values()].join('\n\n').trim()||(fileIds.length?'Файлы готовы.':nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
+      if(fileError)answer+='\n\n'+fileError.message;
       if(nativeError)answer+='\n\nГотова только часть изображений. '+nativeError.message;
       // A failed turn may have usable images, but must not be resumed as a
       // completed conversation. The existing rebuild path handles the next request.
       if(turn.status==='completed')await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
-      return {text:answer,threadId:id,images};
-    }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
-    finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
+      return {text:answer,threadId:id,images,fileIds};
+    }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError||error instanceof ResponseFileError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
+    finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);await workspace.close();this.active.delete(id);markDone();}
   }
   async deleteThread(threadId:string):Promise<void>{
     const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();

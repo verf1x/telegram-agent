@@ -420,3 +420,29 @@ test('an app-server frame above the bounded native media budget fails safely',as
   await assert.rejects(engine.run({userId:1,text:'native-image:oversized-frame',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),/^Error: Codex request failed$/);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
+
+for(const scenario of ['complete','partial','legacy','missing-first'])test('document tool exports completed files through persistence: '+scenario,{skip:!process.env.VERFIX_TEST_FILES},async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-files-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const files:any[]=[];
+ try {
+  const result=await engine.run({userId:2,text:'files:'+scenario,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{},onFile:async file=>{
+   files.push(file);return {id:'stored-'+files.length,name:file.name,mime:file.mime,size:file.bytes.length};
+  }});
+  assert.equal(files.length,1);assert.equal(Buffer.from(files[0].bytes).toString(),'a,b\n1,2');
+  assert.deepEqual(result.fileIds,['stored-1']);
+  if(scenario==='partial'||scenario==='missing-first')assert.match(result.text,/Не удалось/);
+ } finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('engine startup collects document staging left by an interrupted previous process',async()=>{
+ const {mkdir,writeFile,stat}=await import('node:fs/promises');
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-staging-'));
+ const directory=join(runtimeDir,'codex','dialogs','11111111-1111-4111-8111-111111111111','workspaces');
+ await mkdir(directory,{recursive:true});await writeFile(join(directory,'private-source'),'private material');
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  assert.equal((await engine.health()).available,true);
+  await assert.rejects(stat(directory));
+ } finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});

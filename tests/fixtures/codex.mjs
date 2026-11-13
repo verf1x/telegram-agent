@@ -3,13 +3,18 @@ import readline from 'node:readline';
 import {crc32} from 'node:zlib';
 import {readFileSync,writeFileSync} from 'node:fs';
 const memory=process.env.CODEX_HOME+'/fake-memory';
-let toolTurn,threadParams,threadMethod;
+let toolTurn,threadParams,threadMethod,fileScenario,fileStep=0;
 const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
 const chunk=(kind,data)=>{const bytes=Buffer.alloc(data.length+12);bytes.writeUInt32BE(data.length);bytes.write(kind,4);data.copy(bytes,8);bytes.writeUInt32BE(crc32(bytes.subarray(4,-4)),bytes.length-4);return bytes;};
 const paddedPng=size=>{const png=readFileSync(new URL('./attachments/tiny.png',import.meta.url));return Buffer.concat([png.subarray(0,-12),chunk('vpAg',Buffer.alloc(size-png.length-12)),png.subarray(-12)]);};
 const dimensions=(width,height)=>{const png=readFileSync(new URL('./attachments/tiny.png',import.meta.url));png.writeUInt32BE(width,16);png.writeUInt32BE(height,20);png.writeUInt32BE(crc32(png.subarray(12,29)),29);return png;};
 readline.createInterface({input:process.stdin}).on('line',line=>{
- const x=JSON.parse(line); if(x.id===999&&(x.result||x.error)){send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:x.result?.contentItems[0].text??'Tool denied'}]}}});return;} if(x.id===undefined)return;
+ const x=JSON.parse(line);
+ if(fileScenario&&x.id===999&&(x.result||x.error)){
+  if(fileStep++===0){send({id:999,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'export-1',tool:'export_files',arguments:{files:[...(fileScenario==='missing-first'?[{path:'/work/missing.csv',name:'missing.csv',mime:'text/csv'}]:[]),{path:'/work/result.csv',name:'result.csv',mime:'text/csv'},...(fileScenario==='partial'?[{path:'/work/missing.csv',name:'missing.csv',mime:'text/csv'}]:[])]}}});return;}
+  send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:fileScenario==='partial'?'failed':'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'Created CSV'}]}}});return;
+ }
+ if(x.id===999&&(x.result||x.error)){send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:x.result?.contentItems[0].text??'Tool denied'}]}}});return;} if(x.id===undefined)return;
  if(x.method==='initialize')send({id:x.id,result:{}});
  else if(x.method==='model/list')send({id:x.id,result:{data:[{model:'gpt-6.1-sol',displayName:'Sol',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']}],nextCursor:null}});
  else if(x.method==='account/read')send({id:x.id,result:{account:{type:'chatgpt'}}});
@@ -23,6 +28,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   if(x.params.input.some(item=>item.type==='text'&&item.text==='accept-large-input')){
    send({method:'item/completed',params:{threadId:x.params.threadId,turnId:'turn-1',item:{id:'u',type:'userMessage',content:x.params.input}}});
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:`native images: ${x.params.input.filter(item=>item.type==='image').length}; history tail: ${x.params.input.some(item=>item.text?.endsWith('HISTORY-END'))}`}]}}});return;
+  }
+  if(text.startsWith('files:')){
+   fileScenario=text.slice(6);toolTurn=x.params.threadId;
+   send({id:999,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'workspace-1',tool:fileScenario==='legacy'?'isolated_compute':'isolated_workspace',arguments:fileScenario==='legacy'?{code:JSON.stringify({command:"printf 'a,b\\n1,2' > /work/result.csv"})}:{command:"printf 'a,b\\n1,2' > /work/result.csv"}}});return;
   }
   if(text.startsWith('native-image:')){
    const scenario=text.slice('native-image:'.length);

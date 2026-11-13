@@ -210,3 +210,18 @@ test('generated PNGs arrive as multipart images, with image-document fallback fo
     assert.equal(seen[1]?.[0],'sendDocument');
   } finally { await remote.close(); }
 });
+
+test('arbitrary response files use sendDocument with their original editable bytes and Unicode filename',async()=>{
+ let received:any;
+ const api=new TelegramApi('123:secret',{fetch:async(url,options)=>{
+  received={url,body:options!.body};
+  return new Response(JSON.stringify({ok:true,result:{message_id:9}}));
+ }});
+ const bytes=Buffer.from('a,b\n1,2');
+ assert.equal(await api.sendFile(2,{name:'Отчёт.csv',mime:'text/csv',bytes}),9);
+ assert.ok(received.url.endsWith('/sendDocument'));
+ assert.equal(received.body.get('chat_id'),'2');
+ const file=received.body.get('document') as File;
+ assert.equal(file.name,'Отчёт.csv');assert.deepEqual(Buffer.from(await file.arrayBuffer()),bytes);
+ await assert.rejects(api.sendFile(2,{name:'large.bin',mime:'application/octet-stream',bytes:Buffer.alloc(50_000_001)}));
+});

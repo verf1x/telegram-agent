@@ -1,5 +1,5 @@
-import type { ChatId, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
-import { AttachmentError, ATTACHMENT_LIMITS } from '../contracts.ts';
+import type { ChatId, GeneratedFile, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
+import { AttachmentError, ATTACHMENT_LIMITS, RESPONSE_FILE_LIMITS } from '../contracts.ts';
 import { formatText } from './format.ts';
 
 export class TelegramError extends Error {
@@ -97,6 +97,15 @@ export class TelegramApi implements TelegramTransport {
       id = sent.message_id;
     }
     return id;
+  }
+  async sendFile(chatId: ChatId, file: GeneratedFile, options: SendOptions = {}): Promise<number> {
+    if (file.bytes.byteLength > RESPONSE_FILE_LIMITS.fileBytes) throw new TelegramError(413,'file too large');
+    const form = new FormData();
+    form.set('chat_id',String(chatId));
+    form.set('document',new Blob([Buffer.from(file.bytes)],{type:file.mime}),file.name.replace(/[\x00-\x1f\x7f/\\]/g,'_').slice(0,180) || 'document');
+    form.set('disable_content_type_detection','true');
+    const sent = await this.#call<{message_id:number}>('sendDocument',form,options.signal,120_000);
+    return sent.message_id;
   }
   async sendPart(chatId: ChatId, part: OutgoingPart, options: SendOptions = {}): Promise<number> {
     if (part.kind === 'text') return this.sendText(chatId,part.text,options);

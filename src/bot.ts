@@ -13,7 +13,7 @@ import type {
   TelegramTransport,
   TelegramUpdate,
 } from "./contracts.ts";
-import { ATTACHMENT_LIMITS, AttachmentError, ImageGenerationError } from "./contracts.ts";
+import { ATTACHMENT_LIMITS, AttachmentError, ImageGenerationError, ResponseFileError } from "./contracts.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
@@ -319,16 +319,31 @@ export class BotController implements Bot {
         let total = 0;
         for (const [index, ref] of request.attachments.entries()) {
           this.ensureActive(userId, request.id, controller.signal);
-          const bytes = await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+          const savedId = state.pending?.savedFiles?.[ref.fileId];
+          const bytes = savedId ? this.deps.store.readFile(userId,savedId)
+            : await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
           this.ensureActive(userId, request.id, controller.signal);
           total += bytes.byteLength;
           const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
           if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes || total + remaining > ATTACHMENT_LIMITS.batchBytes)
             throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы или используйте /new.");
           files.push({ name: ref.name, mime: ref.mime, bytes });
+          const current = this.deps.store.get(userId);
+          if (current.pending && !current.pending.savedFiles?.[ref.fileId]) {
+            const saved = this.deps.store.saveFile(userId,{name:ref.name,mime:ref.mime,bytes},config.dialogueFileBytes);
+            (current.pending.savedFiles ??= {})[ref.fileId] = saved.id;
+            this.deps.store.put(current);
+          }
         }
         this.ensureActive(userId, request.id, controller.signal);
-        attachments = await this.abortable(this.deps.attachments.prepare(files, controller.signal), controller.signal);
+        try {
+          attachments = await this.abortable(this.deps.attachments.prepare(files, controller.signal), controller.signal);
+        } catch (error) {
+          if (!(error instanceof AttachmentError) || !error.message.includes("Экспортируйте его в PDF")) throw error;
+          // Complex Office layouts still have their original bytes available to
+          // document tools. Never present an incomplete extraction as complete.
+          attachments = files.map(file=>({name:file.name,text:"Предварительное чтение оформления недоступно. Исходный файл сохранён в материалах диалога; изучите его инструментами среды документов. Сообщите о потерях оформления, если они неизбежны.",images:[]}));
+        }
         this.ensureActive(userId, request.id, controller.signal);
         if (attachments.length !== files.length)
           throw new AttachmentError("Не удалось подготовить все материалы. Файлы сохранены; повторите текст задания или используйте /new.");
@@ -353,6 +368,12 @@ export class BotController implements Bot {
           ...(state.threadId
             ? { threadId: state.threadId }
             : { history: state.history }),
+          files: this.deps.store.listFiles(userId),
+          readFile: (id) => this.deps.store.readFile(userId,id),
+          onFile: async (file) => {
+            this.ensureActive(userId,request.id,controller.signal);
+            return this.deps.store.saveResponseFile(userId,request.id,file,config.dialogueFileBytes);
+          },
           signal: controller.signal,
           onThread: (id) => {
             const current = this.deps.store.get(userId);
@@ -378,11 +399,22 @@ export class BotController implements Bot {
         { role: "assistant", text: response.text },
       );
       if (attachments) delete current.pending;
-      current.lastResponse = response.text;
+      const fileIds = current.request.fileIds ?? [];
+      const readyImages = [];
+      let imageWarning = "";
+      for (const image of response.images) {
+        try { this.deps.store.saveFile(userId,image,config.dialogueFileBytes); readyImages.push(image); }
+        catch (error) {
+          if (!(error instanceof ResponseFileError)) throw error;
+          imageWarning = "\n\nГотова только часть изображений. " + error.message;
+        }
+      }
+      const answer = {...response,text:response.text+imageWarning,images:readyImages};
+      current.lastResponse = answer.text;
       const revoked = current.request.revoked;
       delete current.request;
       if (!revoked)
-        current.delivery = { parts: formatAnswer(response), next: 0 };
+        current.delivery = { parts: [...formatAnswer(answer),...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
       this.deps.store.put(current);
     } catch (error) {
       if (this.closed) return;
@@ -390,6 +422,7 @@ export class BotController implements Bot {
       if (current.request?.id !== request.id) return;
       const poisoned = engineStarted ? current.request?.threadId ?? current.threadId : undefined;
       const revoked = current.request?.revoked;
+      const fileIds = current.request?.fileIds ?? [];
       delete current.request;
       if (engineStarted) delete current.threadId;
       if (!revoked)
@@ -397,10 +430,11 @@ export class BotController implements Bot {
           parts: [
             {
               kind: "text",
-              text: error instanceof AttachmentError || error instanceof ImageGenerationError ? error.message : controller.signal.aborted
+              text: (fileIds.length ? "Готова только часть задания; созданные файлы приложены. " : "") + (error instanceof AttachmentError || error instanceof ImageGenerationError || error instanceof ResponseFileError ? error.message : controller.signal.aborted
                 ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
-                : "Не удалось обработать запрос. Пожалуйста, повторите позже.",
+                : "Не удалось обработать запрос. Пожалуйста, повторите позже."),
             },
+            ...fileIds.map(id=>({kind:"file" as const,id})),
           ],
           next: 0,
         };
@@ -452,7 +486,11 @@ export class BotController implements Bot {
       const controller = new AbortController();
       this.controllers.set(userId, controller);
       try {
-        await this.deps.telegram.sendPart(userId, part, {
+        if (part.kind === "file") {
+          const file = this.deps.store.listFiles(userId).find(file=>file.id===part.id);
+          if (!file || !this.deps.telegram.sendFile) throw new Error("File delivery unavailable");
+          await this.deps.telegram.sendFile(userId,{...file,bytes:this.deps.store.readFile(userId,file.id)},{signal:controller.signal});
+        } else await this.deps.telegram.sendPart(userId, part, {
           signal: controller.signal,
         });
       } catch (error) {
@@ -463,6 +501,11 @@ export class BotController implements Bot {
           error.permanent
         ) {
           const current = this.deps.store.get(userId);
+          if (part.kind === "file" && current.delivery && "code" in error && error.code === 400) {
+            current.delivery.parts[current.delivery.next] = {kind:"text",text:"Не удалось доставить один из файлов. Он сохранён в диалоге; попросите отправить его повторно."};
+            this.deps.store.put(current);
+            continue;
+          }
           delete current.delivery;
           this.deps.store.put(current);
         } else {
@@ -531,7 +574,7 @@ export class BotController implements Bot {
       case "help":
         await this.safeText(
           id,
-          "Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
+          "Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. Для получения документа попросите PDF, Word, Excel, презентацию или другой файл; до 10 файлов по 50 МБ. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
             (id === config.ownerId
               ? " /users — список доступа; /model — выбор модели."
               : ""),
@@ -596,6 +639,7 @@ export class BotController implements Bot {
     } catch {
       return;
     }
+    this.deps.store.deleteFiles(userId);
     delete state.reset;
     delete state.threadId;
     delete state.lastResponse;
@@ -793,10 +837,11 @@ export class BotController implements Bot {
       if (state.request) {
         const threadId = state.request.threadId ?? state.threadId,
           revoked = state.request.revoked;
+        const fileIds = state.request.fileIds ?? [];
         delete state.request;
         delete state.threadId;
         if (!revoked)
-          state.delivery = { parts: [{ kind: "text", text: REPEAT }], next: 0 };
+          state.delivery = { parts: [{ kind: "text", text: REPEAT },...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
         this.deps.store.put(state);
         if (threadId)
           void this.deps.engine.deleteThread(threadId).catch(() => {});
