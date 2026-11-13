@@ -23,6 +23,25 @@ test('prepared documents and images reach native input in attachment order with 
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
+test('long lecture pages all reach native input, including when restored from history',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const attachments=[{name:'lecture.pdf',text:'Complete lecture text',images:Array.from({length:101},(_,i)=>({name:`page-${i+1}.png`,mime:'image/png' as const,base64:png}))}];
+ const base={userId:1,text:'inspect-input',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  for(const material of [{attachments},{history:[{role:'user' as const,text:'Напиши конспект',attachments}]}]){
+   const response=await engine.run({...base,...material});
+   const input=JSON.parse(response.text);
+   assert.equal(input.filter((item:any)=>item.type==='image').length,101);
+   assert.ok(input.some((item:any)=>item.text?.includes('Complete lecture text')));
+   const labels=input.filter((item:any)=>item.text?.startsWith('Image ')).map((item:any)=>item.text);
+   assert.equal(labels.length,101);
+   assert.match(labels[0],/page-1\.png/);
+   assert.match(labels.at(-1),/page-101\.png/);
+  }
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
 test('resumed native dialogs retain old images and interrupted dialogs rebuild them as images',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};

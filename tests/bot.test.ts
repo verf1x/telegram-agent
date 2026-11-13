@@ -7,6 +7,7 @@ import { FileConfigSource } from "../src/config.ts";
 import { SqliteStore } from "../src/store.ts";
 import { AttachmentError, ImageGenerationError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
+import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
 import type {
   AttachmentReader,
   ModelEngine,
@@ -603,6 +604,29 @@ test("files wait for a task and pending materials survive restart without a mode
   assert.equal(f.requests[0].text, "Explain my notes");
 });
 
+test("a small lecture PDF reaches the model with every page after a separate summary request and restart", {skip: !process.env.VERFIX_TEST_PYTHON}, async (t) => {
+  const f = fixture(t, new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON!}));
+  const bytes = readFileSync(new URL("./fixtures/attachments/twenty-one-pages.pdf", import.meta.url));
+  const upload = fileUpdate(f.update(2, ""), "lecture.pdf");
+  upload.message!.document!.mime_type = "application/pdf";
+  upload.message!.document!.file_size = bytes.length;
+  f.telegram.downloadFile = async () => bytes;
+  await f.bot.handleUpdate(upload);
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /Материалы сохранены/);
+  assert.equal(f.requests.length, 0);
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Напиши конспект"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].text, "Напиши конспект");
+  assert.equal(f.requests[0].attachments[0].images.length, 21);
+  assert.match(f.requests[0].attachments[0].text, /Page 21\n/);
+  await f.reopen();
+  assert.equal(f.store.get(2).history[0]!.attachments![0]!.images.length, 21);
+  assert.equal(f.store.get(2).pending, undefined);
+});
+
 test("an album waits for its last member and all captions describe the entire ordered group", async (t) => {
   const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "material", images: [] })) });
   const downloads: string[] = [];
@@ -657,18 +681,19 @@ test("prepared text over the batch limit is rejected without silently truncating
   assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
 });
 
-test("prepared images respect batch size and count limits before model analysis", async (t) => {
+test("prepared images respect the byte budget and many small pages can be retried before model analysis", async (t) => {
   let images = [{ name: "scan.png", mime: "image/png" as const, base64: Buffer.alloc(6_000_001).toString("base64") }];
   const f = fixture(t, { prepare: async () => [{ name: "scan.pdf", text: "", images }] });
   f.telegram.downloadFile = async () => new Uint8Array(4);
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "scan.pdf", "Read"));
   await f.bot.drain();
   assert.equal(f.requests.length, 0);
-  images = Array.from({ length: 21 }, (_, i) => ({ name: `page-${i}.png`, mime: "image/png" as const, base64: "AA==" }));
+  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
+  images = Array.from({ length: 101 }, (_, i) => ({ name: `page-${i}.png`, mime: "image/png" as const, base64: "AA==" }));
   await f.bot.handleUpdate(f.update(2, "Retry"));
   await f.bot.drain();
-  assert.equal(f.requests.length, 0);
-  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].attachments[0].images.length, 101);
 });
 
 test("cumulative serialized material context is bounded and /new makes room for a fresh task", async (t) => {

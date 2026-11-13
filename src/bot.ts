@@ -333,11 +333,11 @@ export class BotController implements Bot {
         if (attachments.length !== files.length)
           throw new AttachmentError("Не удалось подготовить все материалы. Файлы сохранены; повторите текст задания или используйте /new.");
         const context = [...state.history.flatMap((m) => m.attachments ?? []), ...attachments];
-        if (Buffer.byteLength(JSON.stringify(context)) > ATTACHMENT_LIMITS.dialogueBytes || context.reduce((n, a) => n + a.images.length, 0) > ATTACHMENT_LIMITS.images)
+        if (Buffer.byteLength(JSON.stringify(context)) > ATTACHMENT_LIMITS.dialogueBytes)
           throw new AttachmentError("Материалы заняли весь контекст диалога. Начните новый диалог через /new и разделите материалы.");
         const images = attachments.flatMap((a) => a.images);
-        if (images.length > ATTACHMENT_LIMITS.images || images.reduce((n, i) => n + Buffer.byteLength(i.base64, "base64"), 0) > ATTACHMENT_LIMITS.imageBytes)
-          throw new AttachmentError("Слишком много изображений во вложениях. Разделите материалы или очистите диалог через /new.");
+        if (images.reduce((n, i) => n + Buffer.byteLength(i.base64, "base64"), 0) > ATTACHMENT_LIMITS.imageBytes)
+          throw new AttachmentError("Слишком большой объём изображений во вложениях. Разделите материалы или очистите диалог через /new.");
         if (attachments.reduce((n, a) => n + Buffer.byteLength(a.text), 0) > ATTACHMENT_LIMITS.textBytes)
           throw new AttachmentError("Слишком много текста во вложениях. Разделите материалы или очистите диалог через /new.");
       }

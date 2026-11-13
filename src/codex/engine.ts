@@ -14,13 +14,12 @@ type UserInput = {type:'text';text:string;text_elements:[]} | {type:'image';url:
 function validateAttachments(attachments:PreparedAttachment[]){
   const tooLarge=()=>{throw new AttachmentError('Слишком много материалов для одного задания. Разделите материалы на части.');};
   if(!Array.isArray(attachments)||attachments.length>ATTACHMENT_LIMITS.files)tooLarge();
-  let textBytes=0,imageBytes=0,images=0;
+  let textBytes=0,imageBytes=0;
   for(const attachment of attachments){
     if(typeof attachment.name!=='string'||typeof attachment.text!=='string'||!Array.isArray(attachment.images))throw new AttachmentError('Не удалось прочитать подготовленное вложение. Отправьте его повторно.');
     textBytes+=Buffer.byteLength(attachment.text);
     if(textBytes>ATTACHMENT_LIMITS.textBytes)tooLarge();
     for(const image of attachment.images){
-      if(++images>ATTACHMENT_LIMITS.images)tooLarge();
       if(typeof image.name!=='string'||!['image/png','image/jpeg'].includes(image.mime)||typeof image.base64!=='string'||!image.base64||image.base64.length%4!==0||image.base64.length>Math.ceil(ATTACHMENT_LIMITS.imageBytes/3)*4||!/^[A-Za-z0-9+/]*={0,2}$/.test(image.base64))throw new AttachmentError('Не удалось прочитать подготовленное изображение. Отправьте его повторно.');
       // Base64 and magic bytes are cheap metadata checks. Image decoding only
       // happens in the sandboxed AttachmentReader, never in this host process.
@@ -58,7 +57,7 @@ function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
   }
   const attachments=request.attachments??[];
   validateAttachments(attachments);groups.push(attachments);
-  if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes||groups.flat().reduce((sum,attachment)=>sum+attachment.images.length,0)>ATTACHMENT_LIMITS.images)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
+  if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
   input.push({type:'text',text:request.text,text_elements:[]},...attachmentInput(attachments));
   // Reserve room for the RPC envelope and scope in the 24 MiB transport cap.
   if(Buffer.byteLength(JSON.stringify(input))>23*1024*1024)throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');

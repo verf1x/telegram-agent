@@ -27,7 +27,6 @@ export const ATTACHMENT_LIMITS = {
   batchBytes: 50_000_000,
   imageBytes: 6_000_000,
   textBytes: 500_000,
-  images: 20,
   dialogueBytes: 12_000_000,
   albumQuietMs: 1500,
 } as const;

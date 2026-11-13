@@ -26,6 +26,17 @@ test('a PDF retains extracted text and every rendered page including its scan',{
  assert.ok(file!.images.every(image=>Buffer.from(image.base64,'base64').length>1000));
 });
 
+test('small lecture PDFs retain every page without a page count cutoff',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ for(const [name,pages] of [['twenty-one-pages.pdf',21],['hundred-one-pages.pdf',101]] as const){
+  const input=await fixture(name,'application/pdf');
+  assert.ok(input.bytes.length<323_500);
+  const [file]=await reader.prepare([input],new AbortController().signal);
+  assert.equal(file!.images.length,pages);
+  assert.match(file!.text,new RegExp(`Page ${pages}\\n`));
+ }
+});
+
 test('DOCX paragraphs, table cells and embedded pictures retain their order',{skip:!pythonPath},async()=>{
  const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('report.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document')],new AbortController().signal);
  assert.match(file!.text,/First paragraph\.\nAlice\t42\nLast paragraph\.\[Image 1\]/);
@@ -103,9 +114,8 @@ test('archive traversal, XML DTDs, decompression bombs and external image links 
  const reader=new SandboxedAttachmentReader({pythonPath});
  for(const name of ['traversal.docx','dtd.docx','zipbomb.docx','linked.docx'])await assert.rejects(reader.prepare([await fixture(name,'application/vnd.openxmlformats-officedocument.wordprocessingml.document')],new AbortController().signal),{name:'AttachmentError'});
 });
-test('PDF pages and text bytes are bounded without returning a truncated task',{skip:!pythonPath},async()=>{
+test('text bytes are bounded without returning a truncated task',{skip:!pythonPath},async()=>{
  const reader=new SandboxedAttachmentReader({pythonPath});
- await assert.rejects(reader.prepare([await fixture('too-many-pages.pdf','application/pdf')],new AbortController().signal),/Разделите/);
  await assert.rejects(reader.prepare([{name:'large.txt',mime:'text/plain',bytes:Buffer.alloc(500001,65)}],new AbortController().signal),/Разделите/);
 });
 
@@ -166,5 +176,9 @@ test('transparent screenshots are flattened on white and EXIF orientation is res
 });
 test('rendered PDF image counts accumulate across files, without losing later pages',{skip:!pythonPath},async()=>{
  const file=await fixture('eleven-pages.pdf','application/pdf');
- await assert.rejects(new SandboxedAttachmentReader({pythonPath}).prepare([file,file],new AbortController().signal),/Разделите/);
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ const result=await reader.prepare([file,file],new AbortController().signal);
+ assert.deepEqual(result.map(part=>part.images.length),[11,11]);
+ const larger=await reader.prepare([await fixture('hundred-one-pages.pdf','application/pdf'),file],new AbortController().signal);
+ assert.deepEqual(larger.map(part=>part.images.length),[101,11]);
 });
