@@ -2,7 +2,7 @@ import { mkdir,writeFile,readFile,chmod,rm,rename } from 'node:fs/promises';
 import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
+import type { DialogueAddress, ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
 import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS } from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
@@ -128,7 +128,7 @@ export class CodexEngine implements ModelEngine {
     let state:any;
     if(request.threadId){
       try{state=JSON.parse(await readFile(join(dir,'state.json'),'utf8'));}catch{throw new Error('Dialog unavailable');}
-      if(state.userId!==request.userId)throw new Error('Dialog unavailable');
+      if(state.userId!==request.userId || state.topicId!==request.topicId)throw new Error('Dialog unavailable');
       if(state.status!=='completed'){
         await this.deleteThread(id);id=randomUUID();dir=this.threadDir(id);state=undefined;
       }
@@ -142,6 +142,11 @@ export class CodexEngine implements ModelEngine {
     const computations=new Set<Promise<void>>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
     try{
+      // A durable owner must know the allocation before any new native files exist.
+      // Existing contexts are marked interrupted before a potentially cancelled resume.
+      if(state)await this.save(dir,{...state,status:'running'});
+      await request.onThread(id);
+      if(abort.signal.aborted)throw new Error('Request cancelled');
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
       if(abort.signal.aborted)throw new Error('Request cancelled');
@@ -162,8 +167,7 @@ export class CodexEngine implements ModelEngine {
         ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions})
         :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}}]});
       const nativeId=thread.thread.id as string;
-      await this.save(dir,{userId:request.userId,nativeId,status:'running'});
-      await request.onThread(id);
+      await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'running'});
       if(abort.signal.aborted)throw new Error('Request cancelled');
       const events:any[]=[];let turnId:string|undefined;const items=new Map<string,string>();
       const images:GeneratedImage[]=[];let imageBytes=0;
@@ -252,11 +256,18 @@ export class CodexEngine implements ModelEngine {
       if(nativeError)answer+='\n\nГотова только часть изображений. '+nativeError.message;
       // A failed turn may have usable images, but must not be resumed as a
       // completed conversation. The existing rebuild path handles the next request.
-      if(turn.status==='completed')await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
+      if(turn.status==='completed')await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images};
     }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
     finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);this.active.delete(id);markDone();}
+  }
+  /** Only the migration path may assign an unscoped legacy thread to a topic. */
+  async bindLegacyThread(threadId:string,address:DialogueAddress):Promise<void>{
+    const dir=this.threadDir(threadId);
+    const state=JSON.parse(await readFile(join(dir,'state.json'),'utf8'));
+    if(!address.topicId || state.userId!==address.userId || (state.topicId!==undefined && state.topicId!==address.topicId) || this.active.has(threadId))throw new Error('Dialog unavailable');
+    await this.save(dir,{...state,topicId:address.topicId});
   }
   async deleteThread(threadId:string):Promise<void>{
     const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();

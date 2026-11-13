@@ -7,6 +7,7 @@ export class TelegramError extends Error {
   readonly permanent: boolean;
   readonly code: number;
   readonly richUnsupported: boolean;
+  readonly topicMissing: boolean;
   constructor(code: number, description: string, retryAfter?: number, richUnsupported = false) {
     // Descriptions and network causes can include the URL, hence the bot token.
     super(`Telegram API: ${code || 'network error'}`);
@@ -15,6 +16,7 @@ export class TelegramError extends Error {
     this.retryAfter = retryAfter;
     this.permanent = code >= 400 && code < 500 && ![408,409,429].includes(code);
     this.richUnsupported = richUnsupported;
+    this.topicMissing = code === 400 && /TOPIC_ID_INVALID|TOPIC_DELETED|message thread not found|topic (not found|does not exist)/i.test(description);
   }
 }
 
@@ -50,6 +52,11 @@ export class TelegramApi implements TelegramTransport {
       if (signal?.aborted) throw new DOMException('Telegram request aborted','AbortError');
       throw new TelegramError(0,'network error');
     }
+  }
+  async requireTopics(signal?: AbortSignal): Promise<void> {
+    const bot = await this.#call<{has_topics_enabled?:boolean;allows_users_to_create_topics?:boolean}>('getMe',{},signal);
+    if (!bot.has_topics_enabled || !bot.allows_users_to_create_topics)
+      throw new Error('Включите Threaded Mode и управление темами пользователями в BotFather.');
   }
   getUpdates(options: {offset?:number;timeout:number;signal?:AbortSignal}): Promise<TelegramUpdate[]> {
     return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','callback_query']},options.signal,(options.timeout + 15) * 1000);
@@ -93,7 +100,7 @@ export class TelegramApi implements TelegramTransport {
     let id = 0;
     for (const part of formatText(text)) {
       if (part.kind === 'image') continue;
-      const sent = await this.#call<{message_id:number}>('sendMessage',{chat_id:chatId,text:part.text,...(options.reply_markup ? {reply_markup:options.reply_markup} : {})},options.signal);
+      const sent = await this.#call<{message_id:number}>('sendMessage',{chat_id:chatId,message_thread_id:options.message_thread_id,text:part.text,...(options.reply_markup ? {reply_markup:options.reply_markup} : {})},options.signal);
       id = sent.message_id;
     }
     return id;
@@ -102,7 +109,7 @@ export class TelegramApi implements TelegramTransport {
     if (part.kind === 'text') return this.sendText(chatId,part.text,options);
     if (part.kind === 'rich') {
       try {
-        const sent = await this.#call<{message_id:number}>('sendRichMessage',{chat_id:chatId,rich_message:{markdown:part.text},...(options.reply_markup ? {reply_markup:options.reply_markup} : {})},options.signal);
+        const sent = await this.#call<{message_id:number}>('sendRichMessage',{chat_id:chatId,message_thread_id:options.message_thread_id,rich_message:{markdown:part.text},...(options.reply_markup ? {reply_markup:options.reply_markup} : {})},options.signal);
         return sent.message_id;
       } catch (error) {
         if (error instanceof TelegramError && error.richUnsupported) return this.sendText(chatId,part.text,options);
@@ -119,11 +126,20 @@ export class TelegramApi implements TelegramTransport {
     const field = photo ? 'photo' : 'document';
     const form = new FormData();
     form.set('chat_id',String(chatId));
+    if (options.message_thread_id !== undefined) form.set('message_thread_id',String(options.message_thread_id));
     form.set(field,new Blob([bytes],{type:'image/png'}),part.name.replace(/[^a-zA-Z0-9_.-]/g,'_').slice(0,120) || 'image.png');
     if (options.reply_markup) form.set('reply_markup',JSON.stringify(options.reply_markup));
     const sent = await this.#call<{message_id:number}>(photo ? 'sendPhoto' : 'sendDocument',form,options.signal,60_000);
     return sent.message_id;
   }
-  async typing(chatId: ChatId, signal?: AbortSignal): Promise<void> { await this.#call('sendChatAction',{chat_id:chatId,action:'typing'},signal); }
+  async typing(chatId: ChatId, signal?: AbortSignal, topicId?: number): Promise<void> { await this.#call('sendChatAction',{chat_id:chatId,message_thread_id:topicId,action:'typing'},signal); }
+  async createTopic(chatId: ChatId, name: string, signal?: AbortSignal): Promise<number> {
+    const topic = await this.#call<{message_thread_id:number}>('createForumTopic',{chat_id:chatId,name},signal);
+    return topic.message_thread_id;
+  }
+  async deleteTopic(chatId: ChatId, topicId: number, signal?: AbortSignal): Promise<void> {
+    try { await this.#call('deleteForumTopic',{chat_id:chatId,message_thread_id:topicId},signal); }
+    catch (error) { if (!(error instanceof TelegramError && error.topicMissing)) throw error; }
+  }
   async answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void> { await this.#call('answerCallbackQuery',{callback_query_id:id,...(text ? {text} : {})},signal); }
 }

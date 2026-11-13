@@ -210,3 +210,26 @@ test('generated PNGs arrive as multipart images, with image-document fallback fo
     assert.equal(seen[1]?.[0],'sendDocument');
   } finally { await remote.close(); }
 });
+
+test('topic routing survives rich fallback, uploads, typing and topic management', async () => {
+  const seen:Array<{method:string;body:string}> = [];
+  const remote = await server((method,body) => {
+    seen.push({method,body});
+    if (method === 'sendRichMessage') return {ok:false,error_code:400,description:'unsupported markdown format'};
+    if (method === 'createForumTopic') return {ok:true,result:{message_thread_id:78}};
+    return {ok:true,result:{message_id:9}};
+  });
+  try {
+    await remote.api.sendPart(2,{kind:'rich',text:'hello'},{message_thread_id:78});
+    await remote.api.typing(2,undefined,78);
+    const {readFileSync} = await import('node:fs');
+    const png = readFileSync(new URL('../../tests/fixtures/attachments/tiny.png',import.meta.url));
+    await remote.api.sendPart(2,{kind:'image',name:'result.png',mime:'image/png',base64:png.toString('base64')},{message_thread_id:78});
+    assert.equal(await remote.api.createTopic(2,'Предыдущий диалог'),78);
+    await remote.api.deleteTopic(2,78);
+    for (const call of seen.filter(x=>x.method!=='createForumTopic')) {
+      if (call.method==='sendPhoto') assert.match(call.body,/name="message_thread_id"\r\n\r\n78/);
+      else assert.equal(JSON.parse(call.body).message_thread_id,78,call.method);
+    }
+  } finally { await remote.close(); }
+});

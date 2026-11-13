@@ -39,15 +39,18 @@ function fixture(t: any, attachments?: AttachmentReader) {
       sent.push({ chatId, text, options });
       return sent.length;
     },
-    sendPart: async (chatId, part) => {
+    sendPart: async (chatId, part, options) => {
       sent.push({
         chatId,
         text: part.kind === "image" ? part.name : part.text,
         part,
+        options,
       });
       return sent.length;
     },
     typing: async () => {},
+    createTopic: async () => 77,
+    deleteTopic: async () => {},
     answerCallback: async () => {},
   };
   const engine: ModelEngine = {
@@ -64,6 +67,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
       { id: "gpt-6.1-sol", supportedEfforts: ["medium", "high"] },
     ],
     deleteThread: async () => {},
+    bindLegacyThread: async () => {},
     health: async () => ({ available: true }),
     close: async () => {},
   };
@@ -78,6 +82,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
   const update = (userId: number, text: string): TelegramUpdate => ({
     update_id: ++id,
     message: {
+      message_thread_id: 10,
       message_id: id,
       date: Math.floor(Date.now() / 1000),
       chat: { id: userId, type: "private" },
@@ -275,7 +280,7 @@ test("reset invalidates a model callback whose catalog finishes after the reset"
     ...f.update(1, ""),
     callback_query: {
       id: "pending-choice", from: { id: 1 }, data,
-      message: { message_id: 1, date: 0, chat: { id: 1, type: "private" } },
+      message: { message_thread_id: 10, message_id: 1, date: 0, chat: { id: 1, type: "private" } },
     },
   });
   await f.bot.handleUpdate(f.update(1, "/new"));
@@ -467,7 +472,7 @@ test("owner picker binds model identity when catalog order changes and survives 
     callback_query: {
       id: "cb",
       from: { id: 1 },
-      message: { message_id: 1, date: 0, chat: { id: 1, type: "private" } },
+      message: { message_thread_id: 10, message_id: 1, date: 0, chat: { id: 1, type: "private" } },
       data,
     },
   });
@@ -623,8 +628,8 @@ test("a small lecture PDF reaches the model with every page after a separate sum
   assert.equal(f.requests[0].attachments[0].images.length, 21);
   assert.match(f.requests[0].attachments[0].text, /Page 21\n/);
   await f.reopen();
-  assert.equal(f.store.get(2).history[0]!.attachments![0]!.images.length, 21);
-  assert.equal(f.store.get(2).pending, undefined);
+  assert.equal(f.store.get(2,10).history[0]!.attachments![0]!.images.length, 21);
+  assert.equal(f.store.get(2,10).pending, undefined);
 });
 
 test("an album waits for its last member and all captions describe the entire ordered group", async (t) => {
@@ -985,4 +990,227 @@ test("a captioned album rejected by the global capacity limit never becomes an i
   await f.bot.drain();
   assert.equal(f.requests[1].text, "Explicit repeated task");
   assert.equal(f.requests[1].attachments[0].name, "waiting.txt");
+});
+
+test('topics of one user run concurrently with separate history, outboxes and busy slots', async (t) => {
+  const f=fixture(t);
+  let finish!: () => void;
+  const waiting=new Promise<void>(r=>finish=r);
+  f.engine.run=async r=>{
+    f.requests.push(r);
+    if(r.text==='work') await waiting;
+    return {text:`answer ${r.text}`,threadId:`topic-${r.topicId}`,images:[]};
+  };
+  const topic=(text:string,id:number)=>{const u=f.update(2,text);u.message!.message_thread_id=id;return u;};
+  await f.bot.handleUpdate(topic('work',11));
+  await f.bot.handleUpdate(topic('study',12));
+  await f.bot.handleUpdate(topic('reject',11));
+  await new Promise(r=>setImmediate(r));
+  assert.equal(f.requests.length,2);
+  assert.equal(f.requests.find(r=>r.text==='study').topicId,12);
+  finish(); await f.bot.drain();
+  assert.deepEqual(f.sent.filter(s=>s.part).map(s=>[s.options.message_thread_id,s.text]).sort(),[[11,'answer work'],[12,'answer study']]);
+  await f.reopen();
+  await f.bot.handleUpdate(topic('continue',12));await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId,'topic-12');
+  assert.equal(f.store.get(2,11).history[0]?.text,'work');
+  assert.equal(f.store.get(2,12).history[0]?.text,'study');
+});
+
+test('/new cancels a running topic and ignores late completion while its neighbour continues', async (t) => {
+  const f=fixture(t);let finish!:()=>void;
+  const wait=new Promise<void>(r=>finish=r);
+  f.engine.run=async r=>{
+    f.requests.push(r);
+    await r.onThread(`thread-${r.topicId}`);
+    if(r.text==='slow') await wait;
+    return {text:`answer ${r.text}`,threadId:`thread-${r.topicId}`,images:[]};
+  };
+  const topic=(text:string,id:number)=>{const u=f.update(2,text);u.message!.message_thread_id=id;return u;};
+  await f.bot.handleUpdate(topic('slow',11));
+  await new Promise(r=>setImmediate(r));
+  await f.bot.handleUpdate(topic('neighbour',12));
+  await f.bot.handleUpdate(topic('/new',11));
+  finish();await f.bot.drain();
+  assert.equal(f.requests[0].signal.aborted,true);
+  assert.equal(f.sent.some(s=>s.text==='answer slow'),false);
+  assert.equal(f.store.get(2,11).history.length,0);
+  assert.equal(f.store.get(2,12).history[0]?.text,'neighbour');
+  assert.match(f.sent.find(s=>s.options?.message_thread_id===11 && s.part)?.text??'',/сброшен/);
+});
+
+test('/delete binds confirmation to user and topic, supports cancellation, and consumes it once', async (t) => {
+  const f=fixture(t);const deleted:Array<[number,number]>=[];
+  f.telegram.deleteTopic=async (u,id)=>{deleted.push([u,id]);};
+  await f.bot.handleUpdate(f.update(2,'keep until confirmed'));await f.bot.drain();
+  await f.bot.handleUpdate(f.update(2,'/delete'));await f.bot.drain();
+  const buttons=f.sent.at(-1)!.options.reply_markup.inline_keyboard[0];
+  const callback=(user:number,topic:number,data:string):TelegramUpdate=>{
+    const u=f.update(user,'');return {update_id:u.update_id,callback_query:{id:String(u.update_id),from:{id:user},message:{...u.message!,message_thread_id:topic},data}};
+  };
+  await f.bot.handleUpdate(callback(1,10,buttons[0].callback_data));
+  await f.bot.handleUpdate(callback(2,11,buttons[0].callback_data));await f.bot.drain();
+  assert.deepEqual(deleted,[]);
+  await f.bot.handleUpdate(callback(2,10,buttons[1].callback_data));await f.bot.drain();
+  assert.equal(f.store.get(2,10).history.length,2);
+  await f.bot.handleUpdate(callback(2,10,buttons[0].callback_data));await f.bot.drain();
+  assert.deepEqual(deleted,[]);
+  await f.bot.handleUpdate(f.update(2,'/delete'));await f.bot.drain();
+  const confirm=f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await f.bot.handleUpdate(callback(2,10,confirm));await f.bot.drain();
+  assert.deepEqual(deleted,[[2,10]]);
+  assert.equal(f.store.get(2,10).history.length,0);
+  await f.bot.handleUpdate(callback(2,10,confirm));await f.bot.drain();
+  assert.deepEqual(deleted,[[2,10]]);
+});
+
+test('plain text outside topics gives guidance without creating a common dialogue or calling Codex', async(t)=>{
+  const f=fixture(t);const u=f.update(2,'outside');delete u.message!.message_thread_id;
+  await f.bot.handleUpdate(u);await f.bot.drain();
+  assert.equal(f.requests.length,0);
+  assert.equal(f.store.all().length,0);
+  assert.match(f.sent.at(-1)!.text,/тем/);
+});
+
+test('legacy migration preserves pending materials and outbox without duplicating history or topics',async(t)=>{
+  const f=fixture(t);let created=0;const bound:string[]=[];
+  f.telegram.createTopic=async()=>{created++;return 77;};
+  f.engine.bindLegacyThread=async(id,address)=>{bound.push(`${id}:${address.topicId}`);};
+  f.store.put({userId:2,threadId:'old',history:[{role:'user',text:'old fact'}],pending:{refs:[{fileId:'file',name:'x',mime:'text/plain',source:'document'}],captions:[]},delivery:{parts:[{kind:'text',text:'remaining answer'}],next:0}});
+  await f.bot.recover();
+  assert.equal(created,1);
+  assert.deepEqual(bound,['old:77']);
+  assert.equal(f.store.get(2,77).history[0]?.text,'old fact');
+  assert.equal(f.store.get(2,77).pending?.refs[0]?.fileId,'file');
+  assert.equal(f.sent.filter(s=>s.text==='remaining answer').length,1);
+  assert.equal(f.sent.find(s=>s.text==='remaining answer')?.options.message_thread_id,77);
+  assert.equal(f.sent.some(s=>s.text==='old fact'),false);
+  await f.reopen();assert.equal(created,1);
+  const u=f.update(2,'continue');u.message!.message_thread_id=77;
+  // Pending material is intact; clear it here to exercise the old native context.
+  const state=f.store.get(2,77);delete state.pending;f.store.put(state);
+  await f.bot.handleUpdate(u);await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId,'old');
+});
+
+test('ambiguous topic creation waits across restart and adopts its service event without a second API call',async(t)=>{
+  const f=fixture(t);let created=0;
+  f.telegram.createTopic=async()=>{created++;throw new Error('response lost');};
+  f.store.put({userId:2,history:[{role:'user',text:'old fact'}]});
+  await f.bot.recover();await f.reopen();
+  assert.equal(created,1);
+  assert.equal(f.store.get(2).history[0]?.text,'old fact');
+  const event=f.update(2,'');event.message!.message_thread_id=77;event.message!.forum_topic_created={name:'Предыдущий диалог'};
+  await f.bot.discardOfflineUpdates([event]);await f.bot.drain();
+  assert.equal(f.store.get(2,77).history[0]?.text,'old fact');
+  assert.equal(f.requests.length,0);
+  await f.reopen();assert.equal(created,1);
+});
+
+test('reset during delivery aborts its send and never emits the remaining images',async(t)=>{
+  const f=fixture(t);let entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(r=>entered=r),blocked=new Promise<void>(r=>release=r);
+  const sentPart=f.telegram.sendPart;let deliverySignal:AbortSignal|undefined;
+  f.telegram.sendPart=async(u,p,o)=>{
+    if(p.kind==='rich'){deliverySignal=o?.signal;entered();await blocked;}
+    return sentPart(u,p,o);
+  };
+  f.engine.run=async()=>({text:'old answer',threadId:'old',images:[{bytes:generatedPng,name:'late.png',mime:'image/png'}]});
+  await f.bot.handleUpdate(f.update(2,'old'));await started;
+  await f.bot.handleUpdate(f.update(2,'/new'));await f.bot.drain();
+  assert.equal(deliverySignal?.aborted,true);
+  release();await new Promise(r=>setImmediate(r));
+  assert.equal(f.sent.some(s=>s.part?.kind==='image'),false);
+  assert.equal(f.store.get(2,10).history.length,0);
+});
+
+test('deletion stops a running task and a failed Telegram delete stays pending with an honest error',async(t)=>{
+  const f=fixture(t);let finish!:()=>void;const blocked=new Promise<void>(r=>finish=r);
+  f.engine.run=async r=>{f.requests.push(r);await r.onThread('old');await blocked;return {text:'late answer',threadId:'old',images:[]};};
+  f.telegram.deleteTopic=async()=>{throw new Error('failure');};
+  await f.bot.handleUpdate(f.update(2,'slow'));await new Promise(r=>setImmediate(r));
+  await f.bot.handleUpdate(f.update(2,'/delete'));await new Promise(r=>setImmediate(r));
+  const confirm=f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  const u=f.update(2,'');
+  await f.bot.handleUpdate({update_id:u.update_id,callback_query:{id:'delete',from:{id:2},message:u.message!,data:confirm}});
+  finish();await f.bot.drain();
+  assert.equal(f.requests[0].signal.aborted,true);
+  assert.equal(f.sent.some(s=>s.text==='late answer'),false);
+  assert.match(f.sent.at(-1)!.text,/Не удалось удалить.*Полное удаление не завершено/);
+  assert.ok(f.store.get(2,10).deleting);
+  f.telegram.deleteTopic=async()=>{};
+  const state=f.store.get(2,10);state.deleting!.retryAt=0;f.store.put(state);
+  await f.reopen();
+  assert.equal(f.store.all().length,0);
+});
+
+test('pending files, albums and fresh model defaults are scoped to topics',async(t)=>{
+  const f=fixture(t,{prepare:async files=>files.map(x=>({name:x.name,text:Buffer.from(x.bytes).toString(),images:[]}))});
+  f.telegram.downloadFile=async id=>Buffer.from(id);
+  const topic=(text:string,id:number)=>{const u=f.update(1,text);u.message!.message_thread_id=id;return u;};
+  const file=topic('',11);file.message!.document={file_id:'PRIVATE-WORK',file_name:'work.txt',mime_type:'text/plain'};
+  await f.bot.handleUpdate(file);await f.bot.drain();
+  const state=f.store.get(1,11);state.selection={model:'chosen-model',effort:'high'};f.store.put(state);
+  await f.bot.handleUpdate(topic('study',12));await f.bot.drain();
+  assert.equal(f.requests.at(-1).model,'gpt-6.1-sol');
+  assert.equal(f.requests.at(-1).attachments,undefined);
+  await f.bot.handleUpdate(topic('work',11));await f.bot.drain();
+  assert.equal(f.requests.at(-1).model,'chosen-model');
+  assert.equal(f.requests.at(-1).attachments[0].text,'PRIVATE-WORK');
+  await f.reopen();
+  assert.equal(f.store.get(1,11).selection?.model,'chosen-model');
+  assert.equal(f.store.get(1,12).selection,undefined);
+});
+
+test('a displayed delete confirmation survives completion of legacy binding and reset cleanup',async(t)=>{
+  for(const operation of ['binding','reset']) {
+    const f=fixture(t);let started!:()=>void,release!:()=>void;
+    const entered=new Promise<void>(r=>started=r),blocked=new Promise<void>(r=>release=r);
+    if(operation==='binding'){
+      f.engine.bindLegacyThread=async()=>{started();await blocked;};
+      f.store.put({userId:2,topicId:10,threadId:'legacy',legacyBinding:true,history:[]});
+      void f.bot.recover();
+    }else{
+      f.engine.deleteThread=async()=>{started();await blocked;};
+      f.store.put({userId:2,topicId:10,threadId:'old',history:[]});
+      await f.bot.handleUpdate(f.update(2,'/new'));
+    }
+    await entered;
+    await f.bot.handleUpdate(f.update(2,'/delete'));
+    await new Promise(r=>setImmediate(r));
+    const token=f.store.get(2,10).deleteConfirmation!.token;
+    release();await f.bot.drain();
+    assert.equal(f.store.get(2,10).deleteConfirmation?.token,token,operation);
+    const u=f.update(2,'');let deleted=0;f.telegram.deleteTopic=async()=>{deleted++;};
+    await f.bot.handleUpdate({update_id:u.update_id,callback_query:{id:'confirm',from:{id:2},message:u.message!,data:`delete:yes:${token}`}});
+    await f.bot.drain();assert.equal(deleted,1,operation);
+  }
+});
+
+test('reset retries cleanup of native contexts left by an earlier failed turn',async(t)=>{
+  const f=fixture(t);const cleaned:string[]=[];
+  f.engine.run=async r=>{await r.onThread('failed-context');throw new Error('failed turn');};
+  f.engine.deleteThread=async()=>{throw new Error('temporary filesystem failure');};
+  await f.bot.handleUpdate(f.update(2,'fail'));await f.bot.drain();
+  f.engine.deleteThread=async id=>{cleaned.push(id);};
+  await f.bot.handleUpdate(f.update(2,'/new'));await f.bot.drain();
+  assert.ok(cleaned.includes('failed-context'));
+  assert.equal(f.store.get(2,10).history.length,0);
+});
+
+test('native topic renaming is acknowledged without an unsolicited task or error',async(t)=>{
+  const f=fixture(t);const u=f.update(2,'');u.message!.forum_topic_edited={name:'Работа'};
+  await f.bot.handleUpdate(u);await f.bot.drain();
+  assert.equal(f.requests.length,0);assert.equal(f.sent.length,0);
+});
+
+test('expired delete confirmation cannot delete a topic, including after restart',async(t)=>{
+  const f=fixture(t);let deletes=0;f.telegram.deleteTopic=async()=>{deletes++;};
+  await f.bot.handleUpdate(f.update(2,'context'));await f.bot.drain();
+  await f.bot.handleUpdate(f.update(2,'/delete'));await f.bot.drain();
+  const state=f.store.get(2,10),token=state.deleteConfirmation!.token;
+  state.deleteConfirmation!.expires=1;f.store.put(state);await f.reopen();
+  const u=f.update(2,'');
+  await f.bot.handleUpdate({update_id:u.update_id,callback_query:{id:'expired',from:{id:2},message:u.message!,data:`delete:yes:${token}`}});
+  await f.bot.drain();assert.equal(deletes,0);assert.equal(f.store.get(2,10).history[0]?.text,'context');
 });
