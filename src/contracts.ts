@@ -2,6 +2,11 @@
 export type UserId = number;
 export type ChatId = number;
 
+export interface DialogueAddress { userId: UserId; topicId?: number | undefined; }
+export function dialogueKey(address: DialogueAddress): string {
+  return `${address.userId}:${address.topicId ?? 0}`;
+}
+
 export interface TelegramUser {
   id: UserId;
   is_bot?: boolean;
@@ -17,6 +22,9 @@ export interface TelegramMessage {
   text?: string;
   caption?: string;
   media_group_id?: string;
+  message_thread_id?: number | undefined;
+  forum_topic_created?: { name: string };
+  forum_topic_edited?: { name?: string };
   photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>;
   document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
 }
@@ -27,7 +35,6 @@ export const ATTACHMENT_LIMITS = {
   batchBytes: 50_000_000,
   imageBytes: 6_000_000,
   textBytes: 500_000,
-  images: 20,
   dialogueBytes: 12_000_000,
   albumQuietMs: 1500,
 } as const;
@@ -105,6 +112,7 @@ export type OutgoingPart =
   | { kind: "image"; base64: string; name: string; mime: string };
 
 export interface SendOptions {
+  message_thread_id?: number | undefined;
   reply_markup?: InlineKeyboard;
   signal?: AbortSignal;
 }
@@ -125,7 +133,9 @@ export interface TelegramTransport {
   }): Promise<TelegramUpdate[]>;
   sendText(chatId: ChatId, text: string, options?: SendOptions): Promise<number>;
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
-  typing(chatId: ChatId, signal?: AbortSignal): Promise<void>;
+  typing(chatId: ChatId, signal?: AbortSignal, topicId?: number | undefined): Promise<void>;
+  createTopic(chatId: ChatId, name: string, signal?: AbortSignal): Promise<number>;
+  deleteTopic(chatId: ChatId, topicId: number, signal?: AbortSignal): Promise<void>;
   answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void>;
   downloadFile?(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
@@ -163,6 +173,7 @@ export interface EngineHealth {
 
 export interface ModelRequest extends ModelSelection {
   userId: UserId;
+  topicId?: number | undefined;
   threadId?: string;
   text: string;
   history?: ConversationMessage[];
@@ -187,6 +198,7 @@ export interface ModelEngine {
   run(request: ModelRequest): Promise<ModelResponse>;
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   deleteThread(threadId: string): Promise<void>;
+  bindLegacyThread(threadId: string, address: DialogueAddress): Promise<void>;
   health(signal?: AbortSignal): Promise<EngineHealth>;
   close(): Promise<void>;
 }

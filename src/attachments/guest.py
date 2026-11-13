@@ -17,7 +17,6 @@ from contextlib import closing
 from PIL import Image, ImageOps
 
 MAX_TEXT = 500_000
-MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 6_000_000
 SPLIT = 'Материалы превышают лимит. Разделите их на несколько заданий.'
 INVALID = 'Не удалось прочитать файл. Проверьте формат или разделите материалы.'
@@ -31,7 +30,6 @@ image_bytes = 0
 
 def add_image(data):
     global image_bytes
-    if len(images) >= MAX_IMAGES: raise Limit()
     warnings.simplefilter('error', Image.DecompressionBombWarning)
     Image.MAX_IMAGE_PIXELS = 32_000_000
     with Image.open(io.BytesIO(data)) as source:
@@ -365,7 +363,6 @@ def read(data, name, mime):
         parts = []
         with closing(pdfium.PdfDocument(data)) as document:
             if not len(document): raise Rejected()
-            if len(document) > 20: raise Limit()
             for index in range(len(document)):
                 with closing(document[index]) as page:
                     with closing(page.get_textpage()) as textpage:

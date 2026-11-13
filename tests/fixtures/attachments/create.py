@@ -31,7 +31,8 @@ def pdf(path,count=2):
  output+=b''.join(f'{n:010d} 00000 n \n'.encode() for n in offsets[1:])
  output+=f'trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode()
  (ROOT/path).write_bytes(output)
-pdf('pages.pdf');pdf('too-many-pages.pdf',21)
+pdf('pages.pdf');pdf('twenty-one-pages.pdf',21)
+pdf('hundred-one-pages.pdf',101)
 
 R='http://schemas.openxmlformats.org/package/2006/relationships'
 D='http://schemas.openxmlformats.org/officeDocument/2006/relationships'

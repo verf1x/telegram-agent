@@ -49,3 +49,31 @@ test('500 MB dialogue quota accepts its exact boundary, survives restart and res
   assert.equal(Buffer.from(store.readFile(3,other.id)).toString(),'other');
  } finally {store.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('files and quota are independent between topics of the same user',()=>{
+ const store=new SqliteStore(':memory:');
+ const work={userId:2,topicId:11},study={userId:2,topicId:12};
+ try {
+  const first=store.saveFile(work,{name:'work.csv',mime:'text/csv',bytes:Buffer.from('work')},4);
+  const second=store.saveFile(study,{name:'study.csv',mime:'text/csv',bytes:Buffer.from('study')},5);
+  assert.throws(()=>store.readFile(study,first.id),/недоступен/);
+  assert.throws(()=>store.readFile(work,second.id),/недоступен/);
+  assert.equal(store.listFiles(work).length,1);assert.equal(store.listFiles(study).length,1);
+  assert.throws(()=>store.saveFile(work,{name:'overflow',mime:'text/plain',bytes:Buffer.from('x')},4),/заполнено/);
+  store.deleteFiles(work);assert.equal(Buffer.from(store.readFile(study,second.id)).toString(),'study');
+ } finally {store.close();}
+});
+
+test('moving a legacy dialogue moves its saved originals and response file references atomically',()=>{
+ const store=new SqliteStore(':memory:');
+ try {
+  const file=store.saveFile(2,{name:'legacy.csv',mime:'text/csv',bytes:Buffer.from('legacy')});
+  store.put({userId:2,history:[],delivery:{parts:[{kind:'file',id:file.id}],next:0}});
+  assert.equal(store.moveLegacy(2,77),true);
+  assert.equal(store.listFiles(2).length,0);
+  assert.equal(Buffer.from(store.readFile({userId:2,topicId:77},file.id)).toString(),'legacy');
+  assert.equal(store.get(2,77).delivery!.parts[0]!.kind,'file');
+  assert.throws(()=>store.readFile({userId:2,topicId:78},file.id));
+  store.remove({userId:2,topicId:77});assert.equal(store.listFiles({userId:2,topicId:77}).length,0);
+ } finally {store.close();}
+});

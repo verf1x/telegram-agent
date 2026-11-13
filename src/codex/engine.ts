@@ -2,7 +2,7 @@ import { mkdir,writeFile,readFile,chmod,rm,rename,readdir } from 'node:fs/promis
 import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import type { ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
+import type { DialogueAddress, ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
 import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS,ResponseFileError,RESPONSE_FILE_LIMITS } from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
@@ -15,13 +15,12 @@ type UserInput = {type:'text';text:string;text_elements:[]} | {type:'image';url:
 function validateAttachments(attachments:PreparedAttachment[]){
   const tooLarge=()=>{throw new AttachmentError('Слишком много материалов для одного задания. Разделите материалы на части.');};
   if(!Array.isArray(attachments)||attachments.length>ATTACHMENT_LIMITS.files)tooLarge();
-  let textBytes=0,imageBytes=0,images=0;
+  let textBytes=0,imageBytes=0;
   for(const attachment of attachments){
     if(typeof attachment.name!=='string'||typeof attachment.text!=='string'||!Array.isArray(attachment.images))throw new AttachmentError('Не удалось прочитать подготовленное вложение. Отправьте его повторно.');
     textBytes+=Buffer.byteLength(attachment.text);
     if(textBytes>ATTACHMENT_LIMITS.textBytes)tooLarge();
     for(const image of attachment.images){
-      if(++images>ATTACHMENT_LIMITS.images)tooLarge();
       if(typeof image.name!=='string'||!['image/png','image/jpeg'].includes(image.mime)||typeof image.base64!=='string'||!image.base64||image.base64.length%4!==0||image.base64.length>Math.ceil(ATTACHMENT_LIMITS.imageBytes/3)*4||!/^[A-Za-z0-9+/]*={0,2}$/.test(image.base64))throw new AttachmentError('Не удалось прочитать подготовленное изображение. Отправьте его повторно.');
       // Base64 and magic bytes are cheap metadata checks. Image decoding only
       // happens in the sandboxed AttachmentReader, never in this host process.
@@ -59,7 +58,7 @@ function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
   }
   const attachments=request.attachments??[];
   validateAttachments(attachments);groups.push(attachments);
-  if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes||groups.flat().reduce((sum,attachment)=>sum+attachment.images.length,0)>ATTACHMENT_LIMITS.images)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
+  if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
   input.push({type:'text',text:request.text,text_elements:[]},...attachmentInput(attachments));
   // Reserve room for the RPC envelope and scope in the 24 MiB transport cap.
   if(Buffer.byteLength(JSON.stringify(input))>23*1024*1024)throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');
@@ -141,7 +140,7 @@ export class CodexEngine implements ModelEngine {
     let state:any;
     if(request.threadId){
       try{state=JSON.parse(await readFile(join(dir,'state.json'),'utf8'));}catch{throw new Error('Dialog unavailable');}
-      if(state.userId!==request.userId)throw new Error('Dialog unavailable');
+      if(state.userId!==request.userId || state.topicId!==request.topicId)throw new Error('Dialog unavailable');
       if(state.status!=='completed'){
         await this.deleteThread(id);id=randomUUID();dir=this.threadDir(id);state=undefined;
       }
@@ -159,6 +158,11 @@ export class CodexEngine implements ModelEngine {
     const materializedImages=new Map<string,string>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
     try{
+      // A durable owner must know the allocation before any new native files exist.
+      // Existing contexts are marked interrupted before a potentially cancelled resume.
+      if(state)await this.save(dir,{...state,status:'running'});
+      await request.onThread(id);
+      if(abort.signal.aborted)throw new Error('Request cancelled');
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
       if(abort.signal.aborted)throw new Error('Request cancelled');
@@ -180,8 +184,7 @@ export class CodexEngine implements ModelEngine {
         ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions:developerInstructions+fileInstructions})
         :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions:developerInstructions+fileInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}},{type:'function',name:'isolated_workspace',description:'Run a shell command in the isolated document workspace. No host files. Programs, package installation and public internet via HTTP(S) proxy are available. Files in /work survive tool calls during this task; export completed results with export_files.',inputSchema:{type:'object',properties:{command:{type:'string'}},required:['command'],additionalProperties:false}},{type:'function',name:'export_files',description:'Persist and attach completed files from /work to the current Telegram dialogue. Accepts arbitrary formats, up to 10 files per task, 50 MB each. Paths and symlinks cannot escape /work.',inputSchema:{type:'object',properties:{files:{type:'array',items:{type:'object',properties:{path:{type:'string'},name:{type:'string'},mime:{type:'string'}},required:['path','name','mime'],additionalProperties:false},maxItems:10}},required:['files'],additionalProperties:false}}]});
       const nativeId=thread.thread.id as string;
-      await this.save(dir,{userId:request.userId,nativeId,status:'running'});
-      await request.onThread(id);
+      await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'running'});
       if(abort.signal.aborted)throw new Error('Request cancelled');
       const events:any[]=[];let turnId:string|undefined;const items=new Map<string,string>();
       const images:GeneratedImage[]=[];let imageBytes=0;
@@ -310,11 +313,18 @@ export class CodexEngine implements ModelEngine {
       if(nativeError)answer+='\n\nГотова только часть изображений. '+nativeError.message;
       // A failed turn may have usable images, but must not be resumed as a
       // completed conversation. The existing rebuild path handles the next request.
-      if(turn.status==='completed')await this.save(dir,{userId:request.userId,nativeId,status:'completed'});
+      if(turn.status==='completed')await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images,fileIds};
     }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError||error instanceof ResponseFileError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
     finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);await workspace.close();this.active.delete(id);markDone();}
+  }
+  /** Only the migration path may assign an unscoped legacy thread to a topic. */
+  async bindLegacyThread(threadId:string,address:DialogueAddress):Promise<void>{
+    const dir=this.threadDir(threadId);
+    const state=JSON.parse(await readFile(join(dir,'state.json'),'utf8'));
+    if(!address.topicId || state.userId!==address.userId || (state.topicId!==undefined && state.topicId!==address.topicId) || this.active.has(threadId))throw new Error('Dialog unavailable');
+    await this.save(dir,{...state,topicId:address.topicId});
   }
   async deleteThread(threadId:string):Promise<void>{
     const dir=this.threadDir(threadId);const active=this.active.get(threadId);active?.abort.abort();

@@ -26,12 +26,12 @@ export class SandboxedAttachmentReader implements AttachmentReader {
     if(files.length>ATTACHMENT_LIMITS.files||files.some(file=>file.bytes.byteLength>ATTACHMENT_LIMITS.fileBytes)||files.reduce((sum,file)=>sum+file.bytes.byteLength,0)>ATTACHMENT_LIMITS.batchBytes)throw new AttachmentError(split);
     if(files.some(file=>file.name.length>4096||file.mime.length>256))throw new AttachmentError(unavailable);
     const prepared:PreparedAttachment[]=[];
-    let imageCount=0,imageBytes=0,textBytes=0;
+    let imageBytes=0,textBytes=0;
     for(const file of files) {
       const result=await this.read(file,signal);
-      textBytes+=Buffer.byteLength(result.text); imageCount+=result.images.length;
+      textBytes+=Buffer.byteLength(result.text);
       for(const image of result.images)imageBytes+=Buffer.from(image.base64,'base64').length;
-      if(textBytes>ATTACHMENT_LIMITS.textBytes||imageCount>ATTACHMENT_LIMITS.images||imageBytes>ATTACHMENT_LIMITS.imageBytes)throw new AttachmentError(split);
+      if(textBytes>ATTACHMENT_LIMITS.textBytes||imageBytes>ATTACHMENT_LIMITS.imageBytes)throw new AttachmentError(split);
       prepared.push(result);
     }
     return prepared;
@@ -74,7 +74,7 @@ export class SandboxedAttachmentReader implements AttachmentReader {
     const data=value as {text?:unknown;images?:unknown;error?:unknown};
     if(!data||typeof data!=='object')throw new AttachmentError(unavailable);
     if(typeof data.error==='string')throw new AttachmentError(data.error===split?split:data.error===pdfExport?pdfExport:unavailable);
-    if(typeof data.text!=='string'||Buffer.byteLength(data.text)>ATTACHMENT_LIMITS.textBytes||!Array.isArray(data.images)||data.images.length>ATTACHMENT_LIMITS.images)throw new AttachmentError(unavailable);
+    if(typeof data.text!=='string'||Buffer.byteLength(data.text)>ATTACHMENT_LIMITS.textBytes||!Array.isArray(data.images))throw new AttachmentError(unavailable);
     let total=0;
     const images:InputImage[]=data.images.map((value:unknown,index:number)=>{
       const image=value as {mime?:unknown;base64?:unknown};

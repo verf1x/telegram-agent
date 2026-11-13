@@ -23,6 +23,25 @@ test('prepared documents and images reach native input in attachment order with 
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
+test('long lecture pages all reach native input, including when restored from history',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const attachments=[{name:'lecture.pdf',text:'Complete lecture text',images:Array.from({length:101},(_,i)=>({name:`page-${i+1}.png`,mime:'image/png' as const,base64:png}))}];
+ const base={userId:1,text:'inspect-input',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  for(const material of [{attachments},{history:[{role:'user' as const,text:'Напиши конспект',attachments}]}]){
+   const response=await engine.run({...base,...material});
+   const input=JSON.parse(response.text);
+   assert.equal(input.filter((item:any)=>item.type==='image').length,101);
+   assert.ok(input.some((item:any)=>item.text?.includes('Complete lecture text')));
+   const labels=input.filter((item:any)=>item.text?.startsWith('Image ')).map((item:any)=>item.text);
+   assert.equal(labels.length,101);
+   assert.match(labels[0],/page-1\.png/);
+   assert.match(labels.at(-1),/page-101\.png/);
+  }
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
 test('resumed native dialogs retain old images and interrupted dialogs rebuild them as images',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
@@ -46,7 +65,7 @@ test('resumed native dialogs retain old images and interrupted dialogs rebuild t
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
-test('invalid, oversized or unsupported prepared images fail explicitly before a task is persisted',async()=>{
+test('invalid and oversized inputs fail before allocation and unsupported images return an explicit error',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
  let persisted=false;
@@ -56,8 +75,9 @@ test('invalid, oversized or unsupported prepared images fail explicitly before a
    await assert.rejects(engine.run({...base,attachments:[{name:'invalid',text:'',images:[{name:'x',...image} as any]}]}),(error:Error)=>error.name==='AttachmentError'&&!error.message.includes('SECRET'));
   }
   await assert.rejects(engine.run({...base,attachments:[{name:'big.txt',text:'x'.repeat(500001),images:[]}]}),(error:Error)=>error.name==='AttachmentError'&&/Разделите/.test(error.message));
-  await assert.rejects(engine.run({...base,model:'text-only',attachments:[{name:'scan',text:'',images:[{name:'x.png',mime:'image/png',base64:png}]}]}),(error:Error)=>error.name==='AttachmentError'&&/изображени/.test(error.message));
   assert.equal(persisted,false);
+  await assert.rejects(engine.run({...base,model:'text-only',attachments:[{name:'scan',text:'',images:[{name:'x.png',mime:'image/png',base64:png}]}]}),(error:Error)=>error.name==='AttachmentError'&&/изображени/.test(error.message));
+  assert.equal(persisted,true); // The allocation is tracked for cleanup even if model validation fails.
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
@@ -419,6 +439,37 @@ test('an app-server frame above the bounded native media budget fails safely',as
  try {
   await assert.rejects(engine.run({userId:1,text:'native-image:oversized-frame',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}}),/^Error: Codex request failed$/);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('native contexts reject reuse from another topic of the same user and bind legacy context only once',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-topics-'));
+ const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
+ let engine=new CodexEngine(options);
+ const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const work=await engine.run({...base,topicId:11,text:'remember:WORK'});
+  const study=await engine.run({...base,topicId:12,text:'remember:STUDY'});
+  await assert.rejects(engine.run({...base,topicId:12,threadId:work.threadId,text:'recall'}),/unavailable/);
+  const legacy=await engine.run({...base,text:'remember:LEGACY'});
+  await engine.bindLegacyThread(legacy.threadId,{userId:1,topicId:13});
+  await engine.bindLegacyThread(legacy.threadId,{userId:1,topicId:13});
+  await assert.rejects(engine.bindLegacyThread(legacy.threadId,{userId:1,topicId:14}),/unavailable/);
+  await assert.rejects(engine.bindLegacyThread(legacy.threadId,{userId:2,topicId:13}),/unavailable/);
+  await engine.close();engine=new CodexEngine(options);
+  assert.equal((await engine.run({...base,topicId:11,threadId:work.threadId,text:'recall'})).text,'WORK');
+  assert.equal((await engine.run({...base,topicId:12,threadId:study.threadId,text:'recall'})).text,'STUDY');
+  assert.equal((await engine.run({...base,topicId:13,threadId:legacy.threadId,text:'recall'})).text,'LEGACY');
+ } finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('cancelled thread allocation creates no native files after its cleanup has completed',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-allocation-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ let allocated='';
+ try {
+  await assert.rejects(engine.run({userId:1,topicId:11,text:'remember:SECRET',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:id=>{allocated=id;throw new Error('allocation cancelled');}}));
+  await assert.rejects(readFile(join(runtimeDir,'codex','dialogs',allocated,'state.json')),{code:'ENOENT'});
+ } finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
 for(const scenario of ['complete','partial','legacy','missing-first'])test('document tool exports completed files through persistence: '+scenario,{skip:!process.env.VERFIX_TEST_FILES},async()=>{

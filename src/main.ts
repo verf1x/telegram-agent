@@ -66,6 +66,7 @@ async function main(): Promise<void> {
     await chmod(initial.config.databasePath,0o600);
     engine = new CodexEngine({runtimeDir:initial.config.runtimeDir});
     const telegram = new TelegramApi(initial.config.botToken);
+    await telegram.requireTopics(stop.signal);
     const attachments = new SandboxedAttachmentReader();
     bot = createBot({config,store,engine,telegram,attachments});
     if (stop.signal.aborted) return;
@@ -113,6 +114,6 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   // Startup failures contain only our own safe diagnostics or validated config errors.
-  console.error(error instanceof Error && /^(Ошибка конфигурации:|Бот уже запущен|Не удалось (запустить flock|получить блокировку))/.test(error.message) ? error.message : 'Не удалось запустить бота. Проверьте конфигурацию, права и зависимости.');
+  console.error(error instanceof Error && /^(Включите Threaded Mode|Ошибка конфигурации:|Бот уже запущен|Не удалось (запустить flock|получить блокировку))/.test(error.message) ? error.message : 'Не удалось запустить бота. Проверьте конфигурацию, права и зависимости.');
   process.exitCode = 1;
 });
