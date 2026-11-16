@@ -48,6 +48,15 @@ export interface DialogueState extends DialogueAddress {
     failures?: number;
   };
 }
+/** Never retain JSON.parse's cause: Node may print the entire private input. */
+export class StoredDialogueError extends Error {
+  constructor() { super("Не удалось прочитать сохранённое состояние диалога. Данные сохранены."); this.name = "StoredDialogueError"; }
+}
+function parseState(value: string): DialogueState {
+  try { return JSON.parse(value) as DialogueState; }
+  catch { throw new StoredDialogueError(); }
+}
+
 export class SqliteStore {
   private readonly db: DatabaseSync;
   constructor(path: string) {
@@ -92,7 +101,7 @@ export class SqliteStore {
     const row = this.db
       .prepare("SELECT state FROM dialogues WHERE user_id=? AND topic_id=?")
       .get(address.userId, address.topicId ?? 0) as {state: string} | undefined;
-    return row ? JSON.parse(row.state) as DialogueState : {...address, history: []};
+    return row ? parseState(row.state) : {...address, history: []};
   }
   /** Atomically adopt the old snapshot; never overwrite an existing topic. */
   moveLegacy(userId: number, topicId: number): boolean {
@@ -100,7 +109,7 @@ export class SqliteStore {
     try {
       const row = this.db.prepare("SELECT state FROM dialogues WHERE user_id=? AND topic_id=0").get(userId) as {state:string} | undefined;
       if (row) {
-        const state = JSON.parse(row.state) as DialogueState;
+        const state = parseState(row.state);
         state.topicId = topicId;
         delete state.migration;
         if (state.threadId) state.legacyBinding = true;
@@ -121,7 +130,7 @@ export class SqliteStore {
       this.db
         .prepare("SELECT state FROM dialogues ORDER BY user_id,topic_id")
         .all() as Array<{ state: string }>
-    ).map((x) => JSON.parse(x.state) as DialogueState);
+    ).map((x) => parseState(x.state));
   }
   put(state: DialogueState): void {
     this.db

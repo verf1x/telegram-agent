@@ -45,6 +45,8 @@ export class BotController implements Bot {
   private readonly unsubscribe: () => void;
   private readonly retryTimer: ReturnType<typeof setInterval>;
   private closed = false;
+  private backgroundErrorReported = false;
+  private pendingReload: ConfigSnapshot | undefined;
   private readonly pickerRevision = new Map<string, number>();
   private readonly picker = new Map<
     string,
@@ -52,7 +54,7 @@ export class BotController implements Bot {
   >();
   constructor(deps: Dependencies) {
     this.deps = deps;
-    this.unsubscribe = deps.config.watch((snapshot) => this.reloaded(snapshot));
+    this.unsubscribe = deps.config.watch((snapshot) => { this.pendingReload = snapshot; this.resume(); });
     this.retryTimer = setInterval(() => this.resume(), 250);
     this.retryTimer.unref();
   }
@@ -285,7 +287,7 @@ export class BotController implements Bot {
     const done = new Promise<void>((r) => { resolve = r; });
     const timer = setTimeout(() => {
       this.albums.delete(dialogueKey(address));
-      try {
+      try { this.background(() => {
         const snapshot = this.deps.config.snapshot();
         const state = this.deps.store.get(address);
         if (!snapshot.valid || !this.allowed(userId, snapshot.config) || !state.pending) return;
@@ -297,12 +299,14 @@ export class BotController implements Bot {
           return;
         }
         const text = state.pending.captions.join("\n\n");
-        state.pending.captions = [];
-        delete state.pending.readyAt;
-        this.deps.store.put(state);
         if (text.trim()) this.dispatch(state, text, snapshot.config);
-        else this.control(() => this.safeText(address, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
-      } finally { resolve(); }
+        else {
+          state.pending.captions = [];
+          delete state.pending.readyAt;
+          this.deps.store.put(state);
+          this.control(() => this.safeText(address, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
+        }
+      }); } finally { resolve(); }
     }, Math.max(0, readyAt - Date.now()));
     this.albums.set(dialogueKey(address), { timer, done, resolve });
   }
@@ -936,7 +940,7 @@ export class BotController implements Bot {
     for (const state of this.deps.store.all())
       if (this.allowed(state.userId, snapshot.config) && state.pending?.readyAt && !this.albums.has(dialogueKey(state)))
         this.scheduleAlbum(state, state.pending.readyAt);
-    this.resume();
+    this.resumeSaved();
   }
   private startLegacyMigrations(userId?: number): void {
     const snapshot = this.deps.config.snapshot();
@@ -988,7 +992,26 @@ export class BotController implements Bot {
       await this.safeText(address, "Прежний контекст сохранён, но перенос ещё не завершён. Повторите после перезапуска бота.");
     }
   }
+  private background(work: () => void): void {
+    try { work(); this.backgroundErrorReported = false; }
+    catch {
+      // Retry reload effects too (access revocation and pending albums).
+      this.pendingReload = this.deps.config.snapshot();
+      // Storage errors must neither kill the timer nor expose private state.
+      if (!this.backgroundErrorReported) console.error("Не удалось восстановить фоновые операции. Данные сохранены; повторим попытку.");
+      this.backgroundErrorReported = true;
+    }
+  }
   private resume(): void {
+    if (this.closed) return;
+    this.background(() => {
+      const snapshot = this.pendingReload;
+      this.pendingReload = undefined;
+      if (snapshot) this.reloaded(snapshot);
+      else this.resumeSaved();
+    });
+  }
+  private resumeSaved(): void {
     if (this.closed || !this.deps.config.snapshot().valid) return;
     for (const state of this.deps.store.all())
       if (state.topicId && !this.jobs.has(dialogueKey(state))) {
@@ -1069,7 +1092,9 @@ export class BotController implements Bot {
   }
   async shutdown(): Promise<void> {
     this.closed = true;
-    for (const state of this.deps.store.all()) this.cancelAlbum(state);
+    // Shutdown must work even when a saved snapshot cannot be read.
+    for (const album of this.albums.values()) { clearTimeout(album.timer); album.resolve(); }
+    this.albums.clear();
     clearInterval(this.retryTimer);
     this.unsubscribe();
     this.controlAbort.abort(new Error("Bot shutting down"));
