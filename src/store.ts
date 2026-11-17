@@ -48,6 +48,20 @@ export interface DialogueState extends DialogueAddress {
     failures?: number;
   };
 }
+
+export interface BroadcastState {
+  id: string;
+  owner: DialogueAddress;
+  text: string;
+  recipients: Array<{
+    userId: number;
+    status: "pending" | "sending" | "sent" | "skipped" | "failed" | "unknown";
+    retries?: number;
+  }>;
+  retryAt?: number;
+  reportRetries?: number;
+}
+
 /** Never retain JSON.parse's cause: Node may print the entire private input. */
 export class StoredDialogueError extends Error {
   constructor() { super("Не удалось прочитать сохранённое состояние диалога. Данные сохранены."); this.name = "StoredDialogueError"; }
@@ -67,6 +81,7 @@ export class SqliteStore {
     this.db.exec(
       "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; CREATE TABLE IF NOT EXISTS dialogues (user_id INTEGER NOT NULL, topic_id INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, PRIMARY KEY(user_id,topic_id)); CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     );
+    this.db.exec("CREATE TABLE IF NOT EXISTS broadcasts (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, state TEXT NOT NULL)");
     const fileColumns = this.db.prepare("PRAGMA table_info(dialogue_files)").all() as Array<{name:string}>;
     if (!fileColumns.some(column=>column.name==="topic_id")) this.db.exec("ALTER TABLE dialogue_files ADD COLUMN topic_id INTEGER NOT NULL DEFAULT 0");
     this.db.exec("CREATE INDEX IF NOT EXISTS files_dialogue ON dialogue_files(user_id,topic_id)");
@@ -139,16 +154,31 @@ export class SqliteStore {
       )
       .run(state.userId, state.topicId ?? 0, JSON.stringify(state));
   }
-  accept(updateId: number, state?: DialogueState): void {
+  accept(updateId: number, state?: DialogueState | BroadcastState): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (state) this.put(state);
+      if (state && "recipients" in state) this.putBroadcast(state);
+      else if (state) this.put(state);
       this.setOffset(updateId + 1);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+  nextBroadcast(ownerId: number): BroadcastState | undefined {
+    const row = this.db.prepare("SELECT state FROM broadcasts WHERE owner_id=? ORDER BY rowid LIMIT 1")
+      .get(ownerId) as {state: string} | undefined;
+    if (!row) return undefined;
+    try { return JSON.parse(row.state) as BroadcastState; }
+    catch { throw new Error("Не удалось прочитать сохранённую рассылку."); }
+  }
+  putBroadcast(state: BroadcastState): void {
+    this.db.prepare("INSERT INTO broadcasts(id,owner_id,state) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state")
+      .run(state.id, state.owner.userId, JSON.stringify(state));
+  }
+  removeBroadcast(id: string): void {
+    this.db.prepare("DELETE FROM broadcasts WHERE id=?").run(id);
   }
   listFiles(user: number | DialogueAddress): DialogueFile[] {
     const address = typeof user === "number" ? {userId:user} : user;

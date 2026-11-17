@@ -8,6 +8,7 @@ import { SqliteStore } from "../src/store.ts";
 import { AttachmentError, ImageGenerationError, ModelSelectionError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
+import { TelegramError } from "../src/telegram/transport.ts";
 import type {
   AttachmentReader,
   ModelEngine,
@@ -1396,4 +1397,182 @@ test('reset cancels late file exports and clears only the running topic',async t
  await assert.rejects(lateExport());
  assert.equal(f.store.listFiles({userId:2,topicId:10}).length,0);
  assert.equal(f.store.listFiles(other).length,1);
+});
+
+function broadcastCommand(f: ReturnType<typeof fixture>, userId: number, text: string, topicId: number | null = 10) {
+  const update = f.update(userId, text);
+  if (topicId === null) delete update.message!.message_thread_id;
+  else update.message!.message_thread_id = topicId;
+  return update;
+}
+
+function pressBroadcast(f: ReturnType<typeof fixture>, userId: number, data: string, topicId: number | null = 10) {
+  const update = broadcastCommand(f, userId, "", topicId);
+  return f.bot.handleUpdate({ update_id: update.update_id, callback_query: {
+    id: `broadcast-${update.update_id}`, from: { id: userId }, message: update.message!, data,
+  } });
+}
+
+async function changeBroadcastAccess(f: ReturnType<typeof fixture>, allowed: string) {
+  const reloaded = new Promise<void>(resolve => {
+    const stop = f.config.watch(() => { stop(); resolve(); });
+  });
+  // FileConfigSource's interval is unref'ed, so keep the test alive until reload.
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    writeFileSync(f.env, f.configText(allowed));
+    await reloaded;
+  } finally { clearTimeout(keepAlive); }
+}
+
+test("broadcast requires an owner confirmation for the newest unexpired preview in its original chat", async t => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const answers: Array<string | undefined> = [];
+  f.telegram.answerCallback = async (_id, answer) => { answers.push(answer); };
+
+  await f.bot.handleUpdate(broadcastCommand(f, 2, "/broadcast чужой текст"));
+  await f.bot.handleUpdate(broadcastCommand(f, 1, "/broadcast\n  ", null));
+  await f.bot.drain();
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0]!.text, /Использование/);
+
+  await f.bot.handleUpdate(broadcastCommand(f, 1, "/broadcast Первый"));
+  const first = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0];
+  await pressBroadcast(f, 2, first[0].callback_data);
+  await pressBroadcast(f, 1, first[0].callback_data, 11);
+  await pressBroadcast(f, 1, first[1].callback_data);
+  await pressBroadcast(f, 1, first[0].callback_data);
+  assert.equal(answers.filter(answer => answer === "Рассылка отменена.").length, 1);
+
+  await f.bot.handleUpdate(broadcastCommand(f, 1, "/broadcast Заменить"));
+  const superseded = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await f.bot.handleUpdate(broadcastCommand(f, 1, "/broadcast Устареет", null));
+  const expired = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await pressBroadcast(f, 1, superseded);
+  now += 300_000;
+  await pressBroadcast(f, 1, expired, null);
+
+  const text = "Строка 1\n\nСтрока 2  ";
+  await f.bot.handleUpdate(broadcastCommand(f, 1, `/broadcast ${text}`, null));
+  const preview = f.sent.at(-1)!;
+  assert.equal(preview.text, `Получателей: 1\n\n${text}`);
+  assert.equal(preview.options.message_thread_id, undefined);
+  const confirmation = preview.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await pressBroadcast(f, 1, confirmation, null);
+  await pressBroadcast(f, 1, confirmation, null);
+  await f.bot.drain();
+  const deliveries = f.sent.filter(message => message.chatId === 2);
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0]!.text, text);
+  assert.equal(deliveries[0]!.options?.message_thread_id, undefined);
+  assert.match(f.sent.at(-1)!.text, /Доставлено: 1/);
+  assert.equal(answers.filter(answer => answer === "Рассылка запущена.").length, 1);
+  assert.equal(f.requests.length, 0);
+  assert.deepEqual(f.store.all(), []);
+});
+
+test("broadcast rechecks access, continues after a refusal or timeout and leaves active dialogue work alone", async t => {
+  const f = fixture(t);
+  await changeBroadcastAccess(f, "1,2,3,4,5,7,7");
+  const topic = { userId: 5, topicId: 10 };
+  f.store.put({ ...topic, history: [{ role: "user", text: "existing context" }] });
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const engine = f.engine.run;
+  f.engine.run = async request => {
+    started.resolve();
+    await release.promise;
+    return engine(request);
+  };
+  const reported = Promise.withResolvers<void>();
+  const attempts: number[] = [];
+  const send = f.telegram.sendText;
+  f.telegram.sendText = async (userId, text, options) => {
+    if (userId !== 1) {
+      attempts.push(userId);
+      assert.equal(options?.message_thread_id, undefined);
+      if (userId === 2) throw new TelegramError(403, "blocked");
+      if (userId === 4) throw new TelegramError(0, "response lost");
+    }
+    const result = await send(userId, text, options);
+    if (text.startsWith("Рассылка завершена")) reported.resolve();
+    return result;
+  };
+
+  await f.bot.handleUpdate(f.update(5, "active task"));
+  await started.promise;
+  try {
+    const previous = f.store.get(topic);
+    await f.bot.handleUpdate(f.update(1, "/broadcast Объявление\nВторая строка"));
+    assert.match(f.sent.at(-1)!.text, /Получателей: 5/);
+    const confirmation = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+    await changeBroadcastAccess(f, "1,2,4,5,6,7,7");
+    await pressBroadcast(f, 1, confirmation);
+    await reported.promise;
+
+    assert.deepEqual(attempts, [2, 4, 5, 7]);
+    assert.deepEqual(f.sent.filter(message => message.chatId !== 1).map(message => [message.chatId, message.text]), [
+      [5, "Объявление\nВторая строка"], [7, "Объявление\nВторая строка"],
+    ]);
+    assert.match(f.sent.at(-1)!.text, /Доставлено: 2\nПропущено: 1\nНе доставлено: 1\nДоставка неизвестна: 1/);
+    assert.equal(f.sent.at(-1)!.options.message_thread_id, 10);
+    assert.deepEqual(f.store.get(topic), previous);
+  } finally { release.resolve(); }
+  await f.bot.drain();
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.sent.at(-1)!.text, "answer active task");
+  assert.equal(f.sent.at(-1)!.options.message_thread_id, 10);
+});
+
+test("broadcast keeps retry_after across reopen, rechecks revoked access and skips previously confirmed deliveries", async t => {
+  const f = fixture(t);
+  await changeBroadcastAccess(f, "2,3,4,5");
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const attempts: number[] = [];
+  const send = f.telegram.sendText;
+  f.telegram.sendText = async (userId, text, options) => {
+    if (userId !== 1) {
+      attempts.push(userId);
+      if (userId === 3 && attempts.filter(id => id === 3).length === 1)
+        throw new TelegramError(429, "flood control", 2);
+    }
+    return send(userId, text, options);
+  };
+
+  await f.bot.handleUpdate(f.update(1, "/broadcast Продолжение"));
+  const confirmation = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await pressBroadcast(f, 1, confirmation);
+  await f.bot.drain();
+  assert.deepEqual(attempts, [2, 3]);
+  const saved = f.store.nextBroadcast(1)!;
+  assert.equal(saved.retryAt, now + 2000);
+  // Model a crash after a send began and before Telegram's result was recorded.
+  saved.recipients.find(recipient => recipient.userId === 4)!.status = "sending";
+  f.store.putBroadcast(saved);
+
+  await changeBroadcastAccess(f, "2,3,4");
+  now += 1999;
+  await f.reopen();
+  await f.bot.drain();
+  assert.deepEqual(attempts, [2, 3]);
+  now += 1;
+  const reported = Promise.withResolvers<void>();
+  const retrySend = f.telegram.sendText;
+  f.telegram.sendText = async (...args) => {
+    const result = await retrySend(...args);
+    if (args[1].startsWith("Рассылка завершена")) reported.resolve();
+    return result;
+  };
+  await f.bot.recover();
+  await reported.promise;
+  await f.bot.drain();
+  assert.deepEqual(attempts, [2, 3, 3]);
+  assert.match(f.sent.at(-1)!.text, /Доставлено: 2\nПропущено: 1\nНе доставлено: 0\nДоставка неизвестна: 1/);
+  assert.equal(f.store.nextBroadcast(1), undefined);
+  await f.reopen();
+  await f.bot.drain();
+  assert.deepEqual(attempts, [2, 3, 3]);
 });

@@ -22,6 +22,7 @@ import {
   ResponseFileError,
   isUserFacingRequestError,
 } from "./contracts.ts";
+import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./broadcast.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
@@ -44,6 +45,7 @@ export class BotController implements Bot {
   private readonly jobs = new Map<string, Promise<void>>();
   private readonly controlJobs = new Set<Promise<void>>();
   private readonly controlAbort = new AbortController();
+  private readonly broadcasts: BroadcastController;
   private readonly topicControls = new Map<string, AbortController>();
   private readonly preparing = new Set<string>();
   private readonly controllers = new Map<string, AbortController>();
@@ -61,6 +63,7 @@ export class BotController implements Bot {
   >();
   constructor(deps: Dependencies) {
     this.deps = deps;
+    this.broadcasts = new BroadcastController({ ...deps, signal: this.controlAbort.signal });
     this.unsubscribe = deps.config.watch((snapshot) => { this.pendingReload = snapshot; this.resume(); });
     this.retryTimer = setInterval(() => this.resume(), 250);
     this.retryTimer.unref();
@@ -120,6 +123,12 @@ export class BotController implements Bot {
       return;
     }
     if (callback) {
+      const data = callback.data;
+      if (data?.startsWith(BROADCAST_CALLBACK)) {
+        const answer = this.broadcasts.confirm(address, config.ownerId, data, update.update_id);
+        if (answer) this.control(() => this.deps.telegram.answerCallback(callback.id, answer, this.controlAbort.signal));
+        return;
+      }
       if (callback.data?.startsWith("delete:")) {
         this.deleteCallback(address, callback.id, callback.data, update.update_id);
         return;
@@ -129,7 +138,14 @@ export class BotController implements Bot {
       this.control(() => this.modelCallback(address, callback.id, callback.data, config));
       return;
     }
-    if (!callback && message.forum_topic_edited) {
+    const broadcast = BROADCAST_COMMAND.exec(message.text ?? "");
+    if (broadcast) {
+      this.deps.store.accept(update.update_id);
+      const text = message.text?.slice(broadcast[0].length + 1) ?? "";
+      this.control(() => this.broadcasts.preview(address, config, text));
+      return;
+    }
+    if (message.forum_topic_edited) {
       this.deps.store.accept(update.update_id);
       return;
     }
@@ -649,7 +665,7 @@ export class BotController implements Bot {
           address,
           OPEN_TOPIC + " Создание и переименование доступны в интерфейсе Telegram. /delete — удалить текущую тему и данные после подтверждения; штатное удаление темы не гарантирует немедленную очистку данных бота. Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. Для получения документа попросите PDF, Word, Excel, презентацию или другой файл; до 10 файлов по 50 МБ. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
             (id === config.ownerId
-              ? " /users — список доступа; /model — выбор модели."
+              ? " /users — список доступа; /model — выбор модели; /broadcast <текст> — объявление одобренным пользователям."
               : ""),
         );
         break;
@@ -1015,6 +1031,7 @@ export class BotController implements Bot {
   }
   private resume(): void {
     if (this.closed) return;
+    this.broadcasts.resume();
     this.background(() => {
       const snapshot = this.pendingReload;
       this.pendingReload = undefined;
@@ -1040,6 +1057,10 @@ export class BotController implements Bot {
     for (const update of updates) {
       if (update.update_id < this.deps.store.offset) continue;
       if (update.message?.forum_topic_created) { await this.handleUpdate(update); continue; }
+      if (BROADCAST_COMMAND.test(update.message?.text ?? "")) {
+        this.deps.store.accept(update.update_id);
+        continue;
+      }
       const snapshot = this.deps.config.snapshot(),
         message = update.message,
         from = message?.from;
@@ -1068,7 +1089,7 @@ export class BotController implements Bot {
       } else this.deps.store.accept(update.update_id);
     }
     this.resume();
-    await this.drain();
+    await this.drainDialogues();
   }
   async recover(): Promise<void> {
     for (const state of this.deps.store.all()) {
@@ -1095,11 +1116,15 @@ export class BotController implements Bot {
     }
     this.startLegacyMigrations();
     this.reloaded(this.deps.config.snapshot());
-    await this.drain();
+    this.broadcasts.resume();
+    await this.drainDialogues();
   }
-  async drain(): Promise<void> {
+  private async drainDialogues(): Promise<void> {
     while (this.jobs.size || this.controlJobs.size || this.albums.size)
       await Promise.all([...this.jobs.values(), ...this.controlJobs, ...[...this.albums.values()].map((a) => a.done)]);
+  }
+  async drain(): Promise<void> {
+    await Promise.all([this.drainDialogues(), this.broadcasts.drain()]);
   }
   async shutdown(): Promise<void> {
     this.closed = true;
