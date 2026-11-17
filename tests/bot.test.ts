@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileConfigSource } from "../src/config.ts";
 import { SqliteStore } from "../src/store.ts";
-import { AttachmentError, ImageGenerationError } from "../src/contracts.ts";
+import { AttachmentError, ImageGenerationError, ModelSelectionError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
 import type {
@@ -64,7 +64,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
       };
     },
     listModels: async () => [
-      { id: "gpt-6.1-sol", supportedEfforts: ["medium", "high"] },
+      { id: "gpt-6.2-sol", supportedEfforts: ["medium", "high"] },
     ],
     deleteThread: async () => {},
     bindLegacyThread: async () => {},
@@ -133,8 +133,49 @@ test("approved users receive independent answers and their dialogue survives SQL
   await f.bot.handleUpdate(f.update(2, "continue"));
   await f.bot.drain();
   assert.equal(f.requests.at(-1).threadId, "thread-2");
-  assert.equal(f.requests[0].model, "gpt-6.1-sol");
+  assert.equal(f.requests[0].model, "gpt-6.2-sol");
+  assert.equal(f.requests.at(-1).model, "gpt-6.2-sol");
   assert.equal(f.requests[0].effort, "medium");
+});
+
+test("an unavailable model error reaches the approved user and their completed thread remains usable", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "first answer"));
+  await f.bot.drain();
+  const run = f.engine.run;
+  const message = "Модель этого диалога недоступна для учётной записи Codex.";
+  f.engine.run = async () => { throw new ModelSelectionError(message); };
+
+  await f.bot.handleUpdate(f.update(2, "unavailable"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.chatId, 2);
+  assert.equal(f.sent.at(-1)!.options.message_thread_id, 10);
+  assert.equal(f.sent.at(-1)!.text, message);
+
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId, "thread-2");
+  assert.equal(f.sent.at(-1)!.text, "answer continue");
+});
+
+test("a request timing out before Codex opens the thread preserves the completed dialogue", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "first answer"));
+  await f.bot.drain();
+  const run = f.engine.run;
+  writeFileSync(f.env, f.configText("2", "REQUEST_TIMEOUT_MS=20"));
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  f.engine.run = async () => new Promise(() => {});
+
+  await f.bot.handleUpdate(f.update(2, "catalog waits"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /Время обработки/);
+
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId, "thread-2");
 });
 
 test("an approved user receives a safe image generation limit error and can explicitly retry", async (t) => {
@@ -185,7 +226,7 @@ test("an ordinary approved user receives generated images in order in their exis
     { chatId: 2, part: { kind: "image", name: "second.png", mime: "image/png", base64: generatedPng.toString("base64") } },
   ]);
   assert.equal(f.requests.at(-1).threadId, "thread-2");
-  assert.equal(f.requests.at(-1).model, "gpt-6.1-sol");
+  assert.equal(f.requests.at(-1).model, "gpt-6.2-sol");
   assert.equal(f.requests.at(-1).effort, "medium");
 });
 
@@ -245,7 +286,7 @@ test("a pending owner model catalog does not block another user's accepted updat
   f.engine.listModels = async () => {
     catalogs++;
     await catalog;
-    return [{ id: "gpt-6.1-sol", supportedEfforts: ["medium"] }];
+    return [{ id: "gpt-6.2-sol", supportedEfforts: ["medium"] }];
   };
   const command = f.update(1, "/model");
   const following = f.update(2, "independent");
@@ -274,7 +315,7 @@ test("reset invalidates a model callback whose catalog finishes after the reset"
   const catalog = new Promise<void>((resolve) => (release = resolve));
   f.engine.listModels = async () => {
     await catalog;
-    return [{ id: "gpt-6.1-sol", supportedEfforts: ["medium", "high"] }];
+    return [{ id: "gpt-6.2-sol", supportedEfforts: ["medium", "high"] }];
   };
   await f.bot.handleUpdate({
     ...f.update(1, ""),
@@ -459,11 +500,12 @@ test("saved generated images resume in order after SQLite reopen without resendi
 
 test("owner picker binds model identity when catalog order changes and survives reset/restart", async (t) => {
   const f = fixture(t);
-  const a = { id: "model-a", supportedEfforts: ["medium", "high"] },
-    b = { id: "model-b", supportedEfforts: ["low"] };
+  const a = { id: "gpt-6.2-sol", supportedEfforts: ["medium", "high"] },
+    b = { id: "gpt-6.1-sol", supportedEfforts: ["low"] };
   f.engine.listModels = async () => [a, b];
   await f.bot.handleUpdate(f.update(1, "/model"));
   await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /gpt-6\.2-sol, рассуждение: medium/);
   const modelData =
     f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
   f.engine.listModels = async () => [b, a];
@@ -478,7 +520,7 @@ test("owner picker binds model identity when catalog order changes and survives 
   });
   await f.bot.handleUpdate(callback(modelData));
   await f.bot.drain();
-  assert.match(f.sent.at(-1)!.text, /model-a/);
+  assert.match(f.sent.at(-1)!.text, /gpt-6\.2-sol/);
   const effortData =
     f.sent.at(-1)!.options.reply_markup.inline_keyboard[1][0].callback_data;
   await f.bot.handleUpdate(callback(effortData));
@@ -488,7 +530,7 @@ test("owner picker binds model identity when catalog order changes and survives 
   await f.reopen();
   await f.bot.handleUpdate(f.update(1, "question"));
   await f.bot.drain();
-  assert.equal(f.requests.at(-1).model, "model-a");
+  assert.equal(f.requests.at(-1).model, "gpt-6.2-sol");
   assert.equal(f.requests.at(-1).effort, "high");
 });
 
@@ -1152,7 +1194,7 @@ test('pending files, albums and fresh model defaults are scoped to topics',async
   await f.bot.handleUpdate(file);await f.bot.drain();
   const state=f.store.get(1,11);state.selection={model:'chosen-model',effort:'high'};f.store.put(state);
   await f.bot.handleUpdate(topic('study',12));await f.bot.drain();
-  assert.equal(f.requests.at(-1).model,'gpt-6.1-sol');
+  assert.equal(f.requests.at(-1).model,'gpt-6.2-sol');
   assert.equal(f.requests.at(-1).attachments,undefined);
   await f.bot.handleUpdate(topic('work',11));await f.bot.drain();
   assert.equal(f.requests.at(-1).model,'chosen-model');

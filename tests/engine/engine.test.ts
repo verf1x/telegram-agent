@@ -76,7 +76,7 @@ test('invalid and oversized inputs fail before allocation and unsupported images
   }
   await assert.rejects(engine.run({...base,attachments:[{name:'big.txt',text:'x'.repeat(500001),images:[]}]}),(error:Error)=>error.name==='AttachmentError'&&/Разделите/.test(error.message));
   assert.equal(persisted,false);
-  await assert.rejects(engine.run({...base,model:'text-only',attachments:[{name:'scan',text:'',images:[{name:'x.png',mime:'image/png',base64:png}]}]}),(error:Error)=>error.name==='AttachmentError'&&/изображени/.test(error.message));
+  await assert.rejects(engine.run({...base,model:'text-only',attachments:[{name:'scan',text:'',images:[{name:'x.png',mime:'image/png',base64:png}]}]}),(error:Error)=>error.name==='ModelSelectionError'&&/изображени/.test(error.message));
   assert.equal(persisted,true); // The allocation is tracked for cleanup even if model validation fails.
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
@@ -104,8 +104,51 @@ test('oversized rebuilt input fails safely without persisting or silently trunca
 test('catalog preserves supported model and reasoning levels',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
- try { assert.deepEqual(await engine.listModels(),[{id:'gpt-6.1-sol',displayName:'Sol',supportedEfforts:['medium'],defaultEffort:'low'}]); }
+ try { assert.deepEqual(await engine.listModels(),[
+  {id:'gpt-6.2-sol',displayName:'GPT-6.2-Sol',supportedEfforts:['low','medium'],defaultEffort:'low'},
+  {id:'gpt-6.1-sol',displayName:'Sol',supportedEfforts:['medium'],defaultEffort:'low'},
+  {id:'text-only',displayName:'Text Only',supportedEfforts:['medium'],defaultEffort:'medium'},
+ ]); }
  finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('a missing model or unsupported effort rejects the request and preserves the completed native dialogue',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={userId:1,model:'gpt-6.2-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const first=await engine.run({...base,text:'remember:MODEL_CHECK'});
+  const followUp={...base,threadId:first.threadId,text:'recall'};
+  await assert.rejects(engine.run({...followUp,model:'missing-model'}),/Модель этого диалога недоступна/);
+  await assert.rejects(engine.run({...followUp,effort:'high'}),/Уровень рассуждения недоступен/);
+  const result=await engine.run(followUp);
+  assert.equal(result.text,'MODEL_CHECK');
+  assert.equal(result.threadId,first.threadId);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('a transient catalog failure can be retried in the same native dialogue',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={userId:1,model:'gpt-6.2-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const first=await engine.run({...base,text:'remember:CATALOG_TRANSIENT'});
+  const followUp={...base,threadId:first.threadId,text:'recall'};
+  await assert.rejects(engine.run(followUp),
+   (error:Error)=>/Каталог моделей Codex сейчас недоступен/.test(error.message)&&!error.message.includes('PRIVATE'));
+  const result=await engine.run(followUp);
+  assert.equal(result.text,'CATALOG_TRANSIENT');
+  assert.equal(result.threadId,first.threadId);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('a model rejected by inference produces a safe availability error',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ try {
+  await assert.rejects(engine.run({userId:1,model:'gpt-6.2-sol',effort:'medium',text:'model-not-found',signal:new AbortController().signal,onThread:()=>{}}),
+   (error:Error)=>/Модель этого диалога недоступна/.test(error.message)&&!error.message.includes('PRIVATE'));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
 test('a dialog persists its thread before returning only the final answer',async()=>{

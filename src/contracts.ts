@@ -147,6 +147,20 @@ export interface GeneratedImage {
   mime: string;
 }
 
+export const DEFAULT_MODEL_SELECTION = { model: "gpt-6.2-sol", effort: "medium" } as const;
+
+/** Only fixed, application-owned messages may be exposed to Telegram. */
+export class ModelSelectionError extends Error {
+  constructor(message: string) { super(message); this.name = "ModelSelectionError"; }
+}
+
+export function isUserFacingRequestError(error: unknown) {
+  return error instanceof AttachmentError ||
+    error instanceof ImageGenerationError ||
+    error instanceof ModelSelectionError ||
+    error instanceof ResponseFileError;
+}
+
 export interface ModelSelection {
   model: string;
   effort: string;
@@ -214,8 +228,8 @@ export interface BotConfig {
   dialogueFileBytes?: number;
   pollTimeoutSeconds: number;
   configReloadIntervalMs: number;
-  defaultModel: "gpt-6.1-sol";
-  defaultEffort: "medium";
+  defaultModel: typeof DEFAULT_MODEL_SELECTION.model;
+  defaultEffort: typeof DEFAULT_MODEL_SELECTION.effort;
 }
 
 /** Invalid snapshots pause new work and delivery. lastValid permits owner diagnostics. */

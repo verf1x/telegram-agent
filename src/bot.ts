@@ -14,7 +14,14 @@ import type {
   TelegramTransport,
   TelegramUpdate,
 } from "./contracts.ts";
-import { dialogueKey, ATTACHMENT_LIMITS, AttachmentError, ImageGenerationError, ResponseFileError } from "./contracts.ts";
+import {
+  dialogueKey,
+  ATTACHMENT_LIMITS,
+  AttachmentError,
+  ModelSelectionError,
+  ResponseFileError,
+  isUserFacingRequestError,
+} from "./contracts.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
@@ -470,25 +477,29 @@ export class BotController implements Bot {
       if (this.closed) return;
       const current = this.deps.store.get(address);
       if (current.request?.id !== request.id) return;
-      const poisoned = engineStarted ? current.request?.threadId ?? current.threadId : undefined;
+      // A rejected or timed-out preflight leaves the completed native thread usable.
+      const rejectedBeforeTurn = current.request.threadId === undefined &&
+        (error instanceof ModelSelectionError || controller.signal.aborted);
+      const retireThread = engineStarted && !rejectedBeforeTurn;
+      const poisoned = retireThread ? current.request.threadId ?? current.threadId : undefined;
       const revoked = current.request?.revoked;
       const fileIds = current.request?.fileIds ?? [];
       delete current.request;
-      if (engineStarted) delete current.threadId;
+      if (retireThread) delete current.threadId;
       if (poisoned) current.retiredThreadIds = [...new Set([...(current.retiredThreadIds ?? []), poisoned])];
-      if (!revoked)
+      if (!revoked) {
+        const message = isUserFacingRequestError(error) ? error.message : controller.signal.aborted
+          ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
+          : "Не удалось обработать запрос. Пожалуйста, повторите позже.";
+        const prefix = fileIds.length ? "Готова только часть задания; созданные файлы приложены. " : "";
         current.delivery = {
           parts: [
-            {
-              kind: "text",
-              text: (fileIds.length ? "Готова только часть задания; созданные файлы приложены. " : "") + (error instanceof AttachmentError || error instanceof ImageGenerationError || error instanceof ResponseFileError ? error.message : controller.signal.aborted
-                ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
-                : "Не удалось обработать запрос. Пожалуйста, повторите позже."),
-            },
+            { kind: "text", text: prefix + message },
             ...fileIds.map(id=>({kind:"file" as const,id})),
           ],
           next: 0,
         };
+      }
       this.deps.store.put(current);
       if (poisoned)
         void this.deps.engine.deleteThread(poisoned).catch(() => {});
@@ -687,7 +698,7 @@ export class BotController implements Bot {
             await this.safeText(address, BUSY);
             break;
           }
-          await this.showModels(address);
+          await this.showModels(address, config);
         }
         break;
       default:
@@ -824,15 +835,15 @@ export class BotController implements Bot {
     this.bumpPicker(address);
     this.clearPicker(address);
   }
-  private async showModels(address: DialogueAddress): Promise<void> {
+  private async showModels(address: DialogueAddress, config: BotConfig): Promise<void> {
     const userId = address.userId;
     const signal = this.topicSignal(address);
     const revision = this.pickerRevision.get(dialogueKey(address));
     try {
       const models = await this.models(),
         selection = this.deps.store.get(address).selection ?? {
-          model: "gpt-6.1-sol",
-          effort: "medium",
+          model: config.defaultModel,
+          effort: config.defaultEffort,
         };
       if (revision !== this.pickerRevision.get(dialogueKey(address)) || !this.ownerIdle(address)) return;
       this.clearPicker(address);

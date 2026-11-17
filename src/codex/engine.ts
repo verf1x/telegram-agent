@@ -3,7 +3,16 @@ import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { DialogueAddress, ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment } from '../contracts.ts';
-import { AttachmentError,ATTACHMENT_LIMITS,ImageGenerationError,GENERATED_IMAGE_LIMITS,ResponseFileError,RESPONSE_FILE_LIMITS } from '../contracts.ts';
+import {
+  AttachmentError,
+  ATTACHMENT_LIMITS,
+  ImageGenerationError,
+  GENERATED_IMAGE_LIMITS,
+  ModelSelectionError,
+  ResponseFileError,
+  RESPONSE_FILE_LIMITS,
+  isUserFacingRequestError,
+} from '../contracts.ts';
 import { compute } from '../compute/compute.ts';
 import { Rpc } from './rpc.ts';
 import { IsolatedWorkspace } from '../files/workspace.ts';
@@ -64,6 +73,32 @@ function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
   if(Buffer.byteLength(JSON.stringify(input))>23*1024*1024)throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');
   return input;
 }
+interface CatalogModel {
+  model: string;
+  displayName: string;
+  supportedReasoningEfforts: Array<{reasoningEffort: string}>;
+  defaultReasoningEffort: string;
+  inputModalities: string[];
+}
+
+async function readModelCatalog(rpc: Rpc, includeHidden: boolean): Promise<CatalogModel[]> {
+  const models: CatalogModel[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    const page: {data: CatalogModel[]; nextCursor: string | null} =
+      await rpc.request('model/list', {cursor, limit: 100, includeHidden});
+    models.push(...page.data);
+    cursor = page.nextCursor;
+    if (models.length > 1000 || seen.size >= 1000 || (cursor && seen.has(cursor)))
+      throw new Error('Invalid Codex model catalog');
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return models;
+}
+
+const modelUnavailable = 'Модель этого диалога недоступна для учётной записи Codex.';
+
 export class CodexEngine implements ModelEngine {
   private root:string;
   private command:string;
@@ -112,14 +147,12 @@ export class CodexEngine implements ModelEngine {
     const {rpc}=await this.worker(join(this.root,'catalog'),signal);
     const cancel=()=>rpc.stop();signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
     try{
-      const all:ModelInfo[]=[];let cursor:string|null=null;
-      do{
-        const page=await rpc.request('model/list',{cursor,limit:100,includeHidden:false});
-        for(const m of page.data)all.push({id:m.model,displayName:m.displayName,supportedEfforts:m.supportedReasoningEfforts.map((x:any)=>x.reasoningEffort),defaultEffort:m.defaultReasoningEffort});
-        cursor=page.nextCursor;
-        if(all.length>1000)throw new Error('Codex catalog too large');
-      }while(cursor);
-      return all;
+      return (await readModelCatalog(rpc, false)).map(model => ({
+        id: model.model,
+        displayName: model.displayName,
+        supportedEfforts: model.supportedReasoningEfforts.map(option => option.reasoningEffort),
+        defaultEffort: model.defaultReasoningEffort,
+      }));
     }finally{signal?.removeEventListener('abort',cancel);rpc.stop();this.workers.delete(rpc);}
   }
   async health(signal?:AbortSignal):Promise<EngineHealth>{
@@ -158,24 +191,28 @@ export class CodexEngine implements ModelEngine {
     const materializedImages=new Map<string,string>();
     const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
     try{
-      // A durable owner must know the allocation before any new native files exist.
-      // Existing contexts are marked interrupted before a potentially cancelled resume.
-      if(state)await this.save(dir,{...state,status:'running'});
-      await request.onThread(id);
-      if(abort.signal.aborted)throw new Error('Request cancelled');
+      // A durable owner must know a new allocation before any files are created.
+      if (!state) await request.onThread(id);
+      if (abort.signal.aborted) throw new Error('Request cancelled');
       await mkdir(dir,{recursive:true,mode:0o700});
       ({rpc}=await this.worker(dir,abort.signal));const connection=rpc;
-      if(abort.signal.aborted)throw new Error('Request cancelled');
-      if(input.some(item=>item.type==='image')){
-        let cursor:string|null=null,matched=false,seen=0;
-        do{
-          const page=await rpc.request('model/list',{cursor,limit:100,includeHidden:false});
-          const model=page.data.find((model:any)=>model.model===request.model);
-          if(model){matched=Array.isArray(model.inputModalities)&&model.inputModalities.includes('image');break;}
-          seen+=page.data.length;if(seen>1000)break;cursor=page.nextCursor;
-        }while(cursor);
-        if(!matched)throw new AttachmentError('Выбранная модель недоступна или не поддерживает изображения. Выберите модель с поддержкой изображений.');
+      if (abort.signal.aborted) throw new Error('Request cancelled');
+      // Existing selections may still be usable after being hidden from the picker.
+      const catalog = await readModelCatalog(rpc, true).catch(() => {
+        throw new ModelSelectionError('Каталог моделей Codex сейчас недоступен. Повторите запрос позже.');
+      });
+      const model = catalog.find(model => model.model === request.model);
+      if (!model) throw new ModelSelectionError(modelUnavailable);
+      if (!model.supportedReasoningEfforts.some(option => option.reasoningEffort === request.effort))
+        throw new ModelSelectionError('Уровень рассуждения недоступен для модели этого диалога в Codex.');
+      if (input.some(item => item.type === 'image') && !model.inputModalities?.includes('image'))
+        throw new ModelSelectionError('Модель этого диалога не поддерживает изображения во входных данных.');
+      // Report ownership before marking an existing thread as interrupted.
+      if (state) {
+        await request.onThread(id);
+        await this.save(dir, {...state, status: 'running'});
       }
+      if (abort.signal.aborted) throw new Error('Request cancelled');
       const cwd=join(dir,'empty');
       const developerInstructions='Respond to the user in ordinary Markdown. Cite web sources as descriptive Markdown links to public URLs; internal citation tokens do not render in Telegram. Use the native tools.image_gen__imagegen tool for artwork, illustrations, posters and image editing. Use isolated_compute Python for numerical calculations and scientific plots, never as a substitute for native artwork. Image generation uses the current ChatGPT authorization and its model/account limits; if the native tool is unavailable, explain that limitation. Never ask for an API key or silently switch billing routes. For image editing use num_last_images_to_include for images in this conversation only; never use local reference paths. Computations use isolated_compute only. Generated PNG attachments are already delivered with your answer; do not link local paths.';
       const fileInstructions=' For creating/editing documents use isolated_workspace with a shell command in /work; it can run programs and install packages (pip --target /work/packages) and access public HTTP(S) via the configured proxy. Available: Python, python-docx, openpyxl, python-pptx, reportlab, pypdf, matplotlib, LibreOffice, curl. Use /work for all working files. Call export_files with paths under /work to attach completed files; files are persisted immediately and delivered even if later work fails. Explicit file requests require actual export, never just a local link or a different format. Preserve editable text/cells/slides and searchable PDF text; preserve supported formatting when editing uploads and explain unavoidable losses. Inspect source files when necessary. Do not draw artwork with code; use native image generation. Generated native images and scientific plots from this turn are copied to /work/materials before workspace commands. Files available in this dialogue (quoted metadata): '+JSON.stringify(workspace.materials)+'. Existing threads may expose only isolated_compute: in that case pass JSON in its code string, either {"command":"shell command"} to use the workspace or {"files":[{"path":"/work/report.pdf","name":"report.pdf","mime":"application/pdf"}]} to export. Normal Python code still uses the restricted numerical sandbox. Limits: 10 exported files per task, 50 MB each; if one fails, explain partial completion and do not silently substitute formats.';
@@ -183,6 +220,7 @@ export class CodexEngine implements ModelEngine {
       const thread=state?.nativeId
         ?await rpc.request('thread/resume',{...scope,threadId:state.nativeId,excludeTurns:true,developerInstructions:developerInstructions+fileInstructions})
         :await rpc.request('thread/start',{...scope,allowProviderModelFallback:false,ephemeral:false,environments:[],developerInstructions:developerInstructions+fileInstructions,dynamicTools:[{type:'function',name:'isolated_compute',description:'Execute Python calculations in a temporary isolated environment with numpy, sympy, matplotlib and Pillow. Write PNG images to the prepared files /work/result.png, /work/image-2.png through image-4.png to attach them. Eight existing scratch files /work/scratch-0.txt through scratch-7.txt can hold temporary data; creating other files/directories is denied. No network, host files or subprocesses. The code receives no prior files.',inputSchema:{type:'object',properties:{code:{type:'string'}},required:['code'],additionalProperties:false}},{type:'function',name:'isolated_workspace',description:'Run a shell command in the isolated document workspace. No host files. Programs, package installation and public internet via HTTP(S) proxy are available. Files in /work survive tool calls during this task; export completed results with export_files.',inputSchema:{type:'object',properties:{command:{type:'string'}},required:['command'],additionalProperties:false}},{type:'function',name:'export_files',description:'Persist and attach completed files from /work to the current Telegram dialogue. Accepts arbitrary formats, up to 10 files per task, 50 MB each. Paths and symlinks cannot escape /work.',inputSchema:{type:'object',properties:{files:{type:'array',items:{type:'object',properties:{path:{type:'string'},name:{type:'string'},mime:{type:'string'}},required:['path','name','mime'],additionalProperties:false},maxItems:10}},required:['files'],additionalProperties:false}}]});
+      if (thread.model !== request.model) throw new ModelSelectionError(modelUnavailable);
       const nativeId=thread.thread.id as string;
       await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'running'});
       if(abort.signal.aborted)throw new Error('Request cancelled');
@@ -286,7 +324,9 @@ export class CodexEngine implements ModelEngine {
           if(f.params.turn.status!=='completed'){
             const error=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
             if(f.params.turn.status!=='failed'||(!fileIds.length&&![...nativeImages.values()].some(image=>!!image))){
-              fail(fileError??nativeError??(nativeImages.size?error:new Error('Codex request failed')));return;
+              const modelError = f.params.turn.error?.codexErrorInfo === 'modelNotFound'
+                ? new ModelSelectionError(modelUnavailable) : undefined;
+              fail(fileError??nativeError??modelError??(nativeImages.size?error:new Error('Codex request failed')));return;
             }
             if(fileIds.length)fileError??=new ResponseFileError('Не удалось завершить всё задание. Готовые файлы сохранены.');else nativeError??=error;
           }
@@ -316,7 +356,10 @@ export class CodexEngine implements ModelEngine {
       if(turn.status==='completed')await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images,fileIds};
-    }catch(error){if(!abort.signal.aborted&&(error instanceof AttachmentError||error instanceof ImageGenerationError||error instanceof ResponseFileError))throw error;throw new Error(abort.signal.aborted?'Request cancelled':'Codex request failed');}
+    } catch (error) {
+      if (!abort.signal.aborted && isUserFacingRequestError(error)) throw error;
+      throw new Error(abort.signal.aborted ? 'Request cancelled' : 'Codex request failed');
+    }
     finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);await workspace.close();this.active.delete(id);markDone();}
   }
   /** Only the migration path may assign an unscoped legacy thread to a topic. */

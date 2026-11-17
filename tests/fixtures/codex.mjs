@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import {crc32} from 'node:zlib';
-import {readFileSync,writeFileSync} from 'node:fs';
+import {existsSync,readFileSync,unlinkSync,writeFileSync} from 'node:fs';
 const memory=process.env.CODEX_HOME+'/fake-memory';
+const catalogError=process.env.CODEX_HOME+'/fake-catalog-error';
 let toolTurn,threadParams,threadMethod,fileScenario,fileStep=0;
 const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
 const chunk=(kind,data)=>{const bytes=Buffer.alloc(data.length+12);bytes.writeUInt32BE(data.length);bytes.write(kind,4);data.copy(bytes,8);bytes.writeUInt32BE(crc32(bytes.subarray(4,-4)),bytes.length-4);return bytes;};
@@ -16,12 +17,18 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  if(x.id===999&&(x.result||x.error)){send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:x.result?.contentItems[0].text??'Tool denied'}]}}});return;} if(x.id===undefined)return;
  if(x.method==='initialize')send({id:x.id,result:{}});
- else if(x.method==='model/list')send({id:x.id,result:{data:[{model:'gpt-6.1-sol',displayName:'Sol',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']}],nextCursor:null}});
+ else if(x.method==='model/list'&&existsSync(catalogError)){
+  unlinkSync(catalogError);send({id:x.id,error:{code:-32603,message:'PRIVATE'}});
+ }
+ else if(x.method==='model/list')send({id:x.id,result:{data:[{model:'gpt-6.2-sol',displayName:'GPT-6.2-Sol',supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']},{model:'gpt-6.1-sol',displayName:'Sol',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']},{model:'text-only',displayName:'Text Only',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'medium',inputModalities:['text']}],nextCursor:null}});
  else if(x.method==='account/read')send({id:x.id,result:{account:{type:'chatgpt'}}});
- else if(x.method==='thread/start'||x.method==='thread/resume'){threadParams=x.params;threadMethod=x.method;send({id:x.id,result:{thread:{id:x.params.threadId??'native-thread'}}});}
+ else if(x.method==='thread/start'||x.method==='thread/resume'){threadParams=x.params;threadMethod=x.method;send({id:x.id,result:{model:x.params.model,thread:{id:x.params.threadId??'native-thread'}}});}
  else if(x.method==='turn/start'){
   send({id:x.id,result:{turn:{id:'turn-1'}}});
   const text=x.params.input[0].text;
+  if(text==='model-not-found'){
+   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'failed',items:[],error:{message:'PRIVATE',codexErrorInfo:'modelNotFound'}}}});return;
+  }
   if(x.params.input.some(item=>item.type==='text'&&item.text==='inspect-input')){
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify(x.params.input)}]}}});return;
   }
@@ -85,6 +92,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   }
   if(text==='wait')return;
   if(text.startsWith('remember:')||text==='recall'){
+   if(text==='remember:CATALOG_TRANSIENT')writeFileSync(catalogError,'1');
    if(text.startsWith('remember:'))writeFileSync(memory,text.slice(9));
    let answer='empty';try{answer=readFileSync(memory,'utf8');}catch{}
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:answer}]}}});return;

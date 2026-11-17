@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { DEFAULT_MODEL_SELECTION } from "./contracts.ts";
 import type { BotConfig, ConfigSnapshot, ConfigSource } from "./contracts.ts";
 
 /** Reads only the explicit private configuration file, never the parent process environment. */
@@ -98,8 +99,8 @@ export class FileConfigSource implements ConfigSource {
       dialogueFileBytes: positive("DIALOGUE_FILE_BYTES", 500_000_000),
       pollTimeoutSeconds: positive("POLL_TIMEOUT_SECONDS", 30, 50),
       configReloadIntervalMs: positive("CONFIG_RELOAD_INTERVAL_MS", 500),
-      defaultModel: "gpt-6.1-sol",
-      defaultEffort: "medium",
+      defaultModel: DEFAULT_MODEL_SELECTION.model,
+      defaultEffort: DEFAULT_MODEL_SELECTION.effort,
     };
     this.lastContents = contents;
     return config;

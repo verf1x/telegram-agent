@@ -67,7 +67,7 @@ test('a malformed snapshot in background delivery does not terminate the bot pro
  import {SqliteStore} from './src/store.ts';
  import {createBot} from './src/bot.ts';
  const path=process.argv[1],mode=process.argv[2];const store=new SqliteStore(path);
- const config={ownerId:1,allowedUserIds:[2],maxConcurrentRequests:4,requestTimeoutMs:2000,defaultModel:'gpt-6.1-sol',defaultEffort:'medium'};let listener,parts=0,texts=0,tasks=0;
+ const config={ownerId:1,allowedUserIds:[2],maxConcurrentRequests:4,requestTimeoutMs:2000,defaultModel:'gpt-6.2-sol',defaultEffort:'medium'};let listener,parts=0,texts=0,tasks=0;
  const bot=createBot({store,config:{snapshot:()=>({valid:true,config}),watch:callback=>{listener=callback;return ()=>{};}},telegram:{sendPart:async()=>{parts++;return 1;},sendText:async()=>{texts++;return 1;},typing:async()=>{}},engine:{run:async request=>{if(request.text!=='saved album task')throw new Error('Album task changed');tasks++;return {text:'done',threadId:'recovered-thread',images:[]};}}});
  if(mode==='album'||mode==='album-dispatch'){
   store.put({userId:2,topicId:10,history:[],pending:{refs:[],captions:mode==='album-dispatch'?['saved album task']:[],readyAt:Date.now()+75}});
