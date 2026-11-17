@@ -4,6 +4,7 @@ import { mkdtemp,rm,readFile,writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { CodexEngine } from '../../src/codex/engine.ts';
+import { RequestStopped, type ModelProgress } from '../../src/contracts.ts';
 
 const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhH8AAAAASUVORK5CYII=';
 test('prepared documents and images reach native input in attachment order with their complete text',async()=>{
@@ -55,7 +56,8 @@ test('resumed native dialogs retain old images and interrupted dialogs rebuild t
   const resumed=JSON.parse((await engine.run({...base,threadId:first.threadId,text:'inspect-input',history})).text);
   assert.deepEqual(resumed,[{type:'text',text:'inspect-input',text_elements:[]}]);
   const abort=new AbortController();
-  await assert.rejects(engine.run({...base,threadId:first.threadId,text:'wait',signal:abort.signal,onThread:()=>abort.abort()}),/cancelled/);
+  await assert.rejects(engine.run({...base,threadId:first.threadId,text:'wait',
+   signal:AbortSignal.any([abort.signal,AbortSignal.timeout(5000)]),onProgress:()=>abort.abort()}),/cancelled/);
   const rebuilt=await engine.run({...base,threadId:first.threadId,text:'inspect-input',history});
   assert.notEqual(rebuilt.threadId,first.threadId);
   const input=JSON.parse(rebuilt.text);
@@ -617,3 +619,37 @@ test('engine startup collects document staging left by an interrupted previous p
   await assert.rejects(stat(directory));
  } finally {await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
+test('Codex streams only public answer fragments from the active turn', async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), 'verfix-engine-test-'));
+  const engine = new CodexEngine({runtimeDir, codexCommand: resolve('tests/fixtures/codex.mjs')});
+  const events: ModelProgress[] = [];
+  try {
+    const result = await engine.run({userId: 1, topicId: 7, text: 'stream:complete',
+      model: 'gpt-6.2-sol', effort: 'medium', signal: AbortSignal.timeout(5000),
+      onThread: () => {}, onProgress: event => events.push(event)});
+    assert.deepEqual(events, [{kind: 'text', delta: 'Hello '}, {kind: 'text', delta: 'world'}]);
+    assert.equal(result.text, 'Hello world');
+  } finally { await engine.close(); await rm(runtimeDir, {recursive: true, force: true}); }
+});
+
+for (const history of ['paginated', 'legacy'] as const) {
+  test(`stop preserves previous native context with ${history} Codex history`, {timeout: 8000}, async () => {
+    const runtimeDir = await mkdtemp(join(tmpdir(), 'verfix-engine-test-'));
+    const engine = new CodexEngine({runtimeDir, codexCommand: resolve('tests/fixtures/codex.mjs')});
+    const base = {userId: 1, topicId: 7, model: 'gpt-6.2-sol', effort: 'medium', onThread: () => {}};
+    try {
+      const previous = await engine.run({...base, requestId: 'previous', text: 'remember:PREVIOUS ART', signal: AbortSignal.timeout(2000)});
+      const stop = new AbortController();
+      const stopped = await engine.run({...base, requestId: 'stopped', threadId: previous.threadId,
+        text: history === 'legacy' ? 'stream:stop-legacy' : 'stream:stop',
+        signal: AbortSignal.any([stop.signal, AbortSignal.timeout(4000)]),
+        onProgress(event) { if (event.kind === 'text') stop.abort(new RequestStopped()); },
+      }).catch(error => error as Error);
+      assert.match((stopped as Error).message, /cancelled/);
+      assert.equal(await engine.restoreStoppedThread(previous.threadId, 'stopped', base), true);
+      const followUp = await engine.run({...base, text: 'recall', threadId: previous.threadId, signal: AbortSignal.timeout(2000)});
+      assert.equal(followUp.text, 'PREVIOUS ART');
+      assert.equal(followUp.threadId, previous.threadId);
+    } finally { await engine.close(); await rm(runtimeDir, {recursive: true, force: true}); }
+  });
+}

@@ -118,6 +118,280 @@ function fixture(t: any, attachments?: AttachmentReader) {
   };
 }
 
+test("one live draft grows in its topic before the formatted answer is delivered", async (t) => {
+  const f = fixture(t);
+  const drafts: Array<{id: number; topic: number; text: string}> = [];
+  const streamed = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  t.after(() => finish.resolve());
+  f.telegram.sendDraft = async (_chat, id, text, topic) => {
+    drafts.push({id, topic, text});
+    if (text === "Вычислим сумму") streamed.resolve();
+  };
+  f.engine.run = async (r) => {
+    r.onProgress?.({kind: "text", delta: "Вычислим "});
+    r.onProgress?.({kind: "text", delta: "сумму"});
+    await finish.promise;
+    return {text: "Вычислим сумму $1+2$", threadId: "thread-2", images: []};
+  };
+  await f.bot.handleUpdate(f.update(2, "show how"));
+  try {
+    await Promise.race([streamed.promise, new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("live text was never shown")), 2500).unref();
+    })]);
+    assert.equal(f.sent.length, 0);
+    assert.deepEqual(drafts.map(draft => [draft.id, draft.topic, draft.text]), [
+      [drafts[0]!.id, 10, "Готовлю ответ…"],
+      [drafts[0]!.id, 10, "Вычислим сумму"],
+    ]);
+  } finally { finish.resolve(); }
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(message => [message.options.message_thread_id, message.text]), [[10, "Вычислим сумму $1+2$"]]);
+});
+
+test("topic notices restore the same Stop control when Telegram clears the visible draft", {timeout: 5000}, async (t) => {
+  const f = fixture(t);
+  const visible = Promise.withResolvers<void>();
+  const restored = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  t.after(() => finish.resolve());
+  const drafts: number[] = [];
+  f.telegram.sendDraft = async (_chat, id) => {
+    drafts.push(id);
+    if (drafts.length === 1) visible.resolve();
+    else restored.resolve();
+  };
+  f.engine.run = async () => {
+    await finish.promise;
+    return {text: "Done", threadId: "thread-2", images: []};
+  };
+  await f.bot.handleUpdate(f.update(2, "long task"));
+  await visible.promise;
+  await f.bot.handleUpdate(f.update(2, "another task"));
+  await restored.promise;
+  assert.deepEqual(drafts, [drafts[0], drafts[0]]);
+  assert.match(f.sent[0]!.text, /ещё обрабатывается/);
+  finish.resolve();
+  await f.bot.drain();
+});
+
+test("a long live draft keeps showing new text within Telegram's limit", {timeout: 5000}, async (t) => {
+  const f = fixture(t);
+  const visible = Promise.withResolvers<string>();
+  const finish = Promise.withResolvers<void>();
+  t.after(() => finish.resolve());
+  const long = "Opening\n" + "😀".repeat(2500) + "\nLatest line";
+  f.telegram.sendDraft = async (_chat, _id, text) => {
+    if (text.endsWith("Latest line")) visible.resolve(text);
+  };
+  f.engine.run = async request => {
+    request.onProgress?.({kind: "text", delta: long});
+    await finish.promise;
+    return {text: long, threadId: "thread-2", images: []};
+  };
+  await f.bot.handleUpdate(f.update(2, "long answer"));
+  const preview = await visible.promise;
+  assert.ok(preview.length <= 4096);
+  assert.ok(long.endsWith(preview));
+  assert.equal(preview, preview.toWellFormed());
+  finish.resolve();
+  await f.bot.drain();
+  assert.equal(f.sent.map(message => message.text).join(""), long);
+});
+
+test("Stop during PDF preparation preserves the source for the next task", {timeout: 5000}, async (t) => {
+  const reading = Promise.withResolvers<number>();
+  let prepares = 0;
+  let preparationSignal: AbortSignal | undefined;
+  const f = fixture(t, {prepare: async (files, signal) => {
+    if (++prepares === 1) {
+      preparationSignal = signal;
+      await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), {once: true}));
+    }
+    return files.map(file => ({name: file.name, text: "saved source", images: []}));
+  }});
+  let downloads = 0;
+  f.telegram.downloadFile = async () => { downloads++; return Buffer.from("PDF source"); };
+  f.telegram.sendDraft = async (_chat, id, text) => { if (text === "Читаю PDF…") reading.resolve(id); };
+  const task = f.update(2, "");
+  delete task.message!.text;
+  task.message!.caption = "stop while reading";
+  task.message!.document = {file_id: "source", file_name: "lecture.pdf", mime_type: "application/pdf"};
+  await f.bot.handleUpdate(task);
+  await f.bot.handleUpdate({update_id: f.update(2, "").update_id, stopped_message_generation: {
+    chat: {id: 2, type: "private"}, message_thread_id: 10, draft_id: await reading.promise,
+  }});
+  await f.bot.drain();
+  assert.equal(preparationSignal?.aborted, true);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.sent.length, 0);
+  await f.bot.handleUpdate(f.update(2, "use the saved PDF"));
+  await f.bot.drain();
+  assert.equal(downloads, 1);
+  assert.equal(f.requests[0].attachments[0].text, "saved source");
+  assert.equal(f.sent.at(-1)!.text, "answer use the saved PDF");
+});
+
+test("a stopped turn keeps earlier context and saved files while late results and stops are ignored", {timeout: 7000}, async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "previous answer"));
+  await f.bot.drain();
+  f.sent.length = 0;
+  const oldDraft = Promise.withResolvers<number>();
+  const saved = Promise.withResolvers<void>();
+  const releaseOld = Promise.withResolvers<void>();
+  const nextDraft = Promise.withResolvers<number>();
+  const releaseNew = Promise.withResolvers<void>();
+  t.after(() => { releaseOld.resolve(); releaseNew.resolve(); });
+  let activeDraft = oldDraft;
+  f.telegram.sendDraft = async (_chat, id, _text, topic) => { if (topic === 10) activeDraft.resolve(id); };
+  f.engine.restoreStoppedThread = async () => true;
+  let oldSignal: AbortSignal | undefined;
+  let newSignal: AbortSignal | undefined;
+  f.engine.run = async (request) => {
+    f.requests.push(request);
+    const id = `thread-${request.userId}`;
+    await request.onThread(id);
+    if (request.text === "cancel me") {
+      oldSignal = request.signal;
+      await request.onFile!({name: "saved.csv", mime: "text/csv", bytes: Buffer.from("saved before stop")});
+      saved.resolve();
+      await releaseOld.promise;
+      request.onProgress?.({kind: "text", delta: "late fragment"});
+      await assert.rejects(request.onFile!({name: "late.csv", mime: "text/csv", bytes: Buffer.from("late")}));
+    }
+    if (request.text === "new task") {
+      newSignal = request.signal;
+      await releaseNew.promise;
+    }
+    return {text: `answer ${request.text}`, threadId: id, images: []};
+  };
+  const stop = (draft: number, topic: number) => f.bot.handleUpdate({
+    update_id: f.update(2, "").update_id,
+    stopped_message_generation: {chat: {id: 2, type: "private"}, message_thread_id: topic, draft_id: draft},
+  });
+  await f.bot.handleUpdate(f.update(2, "cancel me"));
+  await saved.promise;
+  const stale = await oldDraft.promise;
+  await stop(stale, 10);
+  await f.bot.drain();
+  assert.equal(oldSignal?.aborted, true);
+  assert.equal(f.sent.length, 0);
+  activeDraft = nextDraft;
+  await f.bot.handleUpdate(f.update(2, "new task"));
+  const neighbour = f.update(2, "neighbour");
+  neighbour.message!.message_thread_id = 11;
+  await f.bot.handleUpdate(neighbour);
+  const current = await nextDraft.promise;
+  assert.notEqual(current, stale);
+  await stop(stale, 10);
+  await stop(current, 11);
+  assert.equal(newSignal?.aborted, false);
+  releaseOld.resolve();
+  releaseNew.resolve();
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(message => [message.options.message_thread_id, message.text]).sort(), [
+    [10, "answer new task"], [11, "answer neighbour"],
+  ]);
+  const followUp = f.requests.find(request => request.text === "new task");
+  assert.equal(followUp.threadId, "thread-2");
+  assert.deepEqual(followUp.history.map((message: {text:string}) => message.text), ["previous answer", "answer previous answer"]);
+  assert.deepEqual(followUp.files.map((file: {name:string}) => file.name), ["saved.csv"]);
+});
+
+test("unsupported drafts use a temporary Stop button that is removed after cancellation", {timeout: 5000}, async (t) => {
+  const f = fixture(t);
+  f.telegram.sendDraft = async () => { throw new TelegramError(404, "unsupported"); };
+  const button = Promise.withResolvers<string>();
+  const removed: number[] = [];
+  const callback: string[] = [];
+  f.telegram.sendText = async (_chat, _text, options) => {
+    assert.equal(options?.message_thread_id, 10);
+    const stop = options?.reply_markup?.inline_keyboard[0]?.[0];
+    assert.equal(stop?.text, "Стоп");
+    button.resolve(stop!.callback_data);
+    return 365;
+  };
+  f.telegram.deleteMessage = async (_chat, id) => { removed.push(id); };
+  f.telegram.answerCallback = async (id) => { callback.push(id); };
+  f.engine.run = async request => {
+    f.requests.push(request);
+    await new Promise<void>(resolve => request.signal.addEventListener("abort", () => resolve(), {once: true}));
+    return {text: "discarded", threadId: "cancelled", images: []};
+  };
+  await f.bot.handleUpdate(f.update(2, "start"));
+  const update = f.update(2, "");
+  await f.bot.handleUpdate({update_id: update.update_id, callback_query: {
+    id: "button-365", from: {id: 2}, message: update.message!, data: await button.promise,
+  }});
+  await f.bot.drain();
+  assert.equal(f.requests[0].signal.aborted, true);
+  assert.deepEqual(callback, ["button-365"]);
+  assert.deepEqual(removed, [365]);
+  assert.deepEqual(f.sent, []);
+});
+
+test("a throttled draft leaves final delivery recoverable after restart", async (t) => {
+  const f = fixture(t);
+  let previews = 0;
+  f.telegram.sendDraft = async () => { previews++; throw new TelegramError(429, "slow down", 20); };
+  const original = f.telegram.sendPart;
+  f.telegram.sendPart = async () => { throw new TelegramError(503, "offline"); };
+  await f.bot.handleUpdate(f.update(2, "persist this"));
+  await f.bot.drain();
+  assert.equal(previews, 1);
+  assert.deepEqual(f.sent, []);
+  f.telegram.sendPart = original;
+  await f.reopen();
+  await new Promise(resolve => setTimeout(resolve, 1300));
+  await f.bot.drain();
+  assert.equal(previews, 1);
+  assert.equal(f.requests.length, 1);
+  assert.deepEqual(f.sent.map(message => [message.options.message_thread_id, message.text]), [[10, "answer persist this"]]);
+});
+
+test("a Stop racing with final delivery leaves the completed answer and file intact", {timeout: 5000}, async (t) => {
+  const f = fixture(t);
+  const draft = Promise.withResolvers<number>();
+  const sending = Promise.withResolvers<void>();
+  const deliver = Promise.withResolvers<void>();
+  const files: string[] = [];
+  t.after(() => deliver.resolve());
+  f.telegram.sendDraft = async (_chat, id) => { draft.resolve(id); };
+  f.telegram.sendFile = async (_chat, file, options) => {
+    assert.equal(options?.message_thread_id, 10);
+    files.push(file.name);
+    return 50;
+  };
+  const original = f.telegram.sendPart;
+  f.telegram.sendPart = async (...args) => {
+    sending.resolve();
+    await deliver.promise;
+    return original(...args);
+  };
+  f.engine.run = async request => {
+    f.requests.push(request);
+    if (request.text === "make the file") {
+      await request.onFile!({name: "result.csv", mime: "text/csv", bytes: Buffer.from("ready")});
+      return {text: "Готовый ответ", threadId: "thread-2", images: []};
+    }
+    return {text: "Продолжаю", threadId: "thread-2", images: []};
+  };
+  await f.bot.handleUpdate(f.update(2, "make the file"));
+  await sending.promise;
+  await f.bot.handleUpdate({update_id: f.update(2, "").update_id, stopped_message_generation: {
+    chat: {id: 2, type: "private"}, message_thread_id: 10, draft_id: await draft.promise,
+  }});
+  deliver.resolve();
+  await f.bot.drain();
+  assert.deepEqual(f.sent.map(message => message.text), ["Готовый ответ"]);
+  assert.deepEqual(files, ["result.csv"]);
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests.at(-1).threadId, "thread-2");
+  assert.equal(f.requests.at(-1).history.at(-1).text, "Готовый ответ");
+});
+
 test("approved users receive independent answers and their dialogue survives SQLite reopen", async (t) => {
   const f = fixture(t);
   await f.bot.handleUpdate(f.update(99, "secret"));

@@ -24,10 +24,13 @@ import {
   ModelContextError,
   ModelSelectionError,
   ResponseFileError,
+  RequestStopped,
   isUserFacingRequestError,
 } from "./contracts.ts";
 import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./broadcast.ts";
 import { formatAnswer, formatText } from "./telegram/format.ts";
+import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
+import { TelegramError } from "./telegram/transport.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
@@ -54,6 +57,9 @@ export class BotController implements Bot {
   private readonly topicControls = new Map<string, AbortController>();
   private readonly preparing = new Set<string>();
   private readonly controllers = new Map<string, AbortController>();
+  private readonly previews = new Map<string, RequestPreview>();
+  private readonly draftRateLimit = new DraftRateLimit();
+  private readonly previewCleanups = new Set<string>();
   private readonly albums = new Map<string, { timer: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void }>();
   private readonly offlineNotified = new Set<string>();
   private readonly unsubscribe: () => void;
@@ -90,6 +96,16 @@ export class BotController implements Bot {
     if (this.closed || update.update_id < this.deps.store.offset) return;
     const snapshot = this.deps.config.snapshot();
     const config = snapshot.valid ? snapshot.config : snapshot.lastValid;
+    const stopped = update.stopped_message_generation;
+    if (stopped) {
+      const address = {userId: stopped.chat.id, topicId: stopped.message_thread_id};
+      const preview = this.previews.get(dialogueKey(address));
+      if (snapshot.valid && stopped.chat.type === "private" && address.topicId &&
+          this.allowed(address.userId, snapshot.config) && preview?.draftId === stopped.draft_id)
+        this.stopRequest(address, preview.requestId, update.update_id);
+      else this.deps.store.accept(update.update_id);
+      return;
+    }
     const callback = update.callback_query;
     const message = callback?.message ?? update.message;
     const from = callback?.from ?? message?.from;
@@ -129,6 +145,11 @@ export class BotController implements Bot {
     }
     if (callback) {
       const data = callback.data;
+      if (data?.startsWith(STOP_CALLBACK)) {
+        const stopped = this.stopRequest(address, data.slice(STOP_CALLBACK.length), update.update_id);
+        this.control(() => this.deps.telegram.answerCallback(callback.id, stopped ? "Задание остановлено" : "Задание уже завершилось", this.controlAbort.signal));
+        return;
+      }
       if (data?.startsWith(BROADCAST_CALLBACK)) {
         const answer = this.broadcasts.confirm(address, config.ownerId, data, update.update_id);
         if (answer) this.control(() => this.deps.telegram.answerCallback(callback.id, answer, this.controlAbort.signal));
@@ -356,24 +377,82 @@ export class BotController implements Bot {
       });
     this.jobs.set(dialogueKey(address), task);
   }
+  private stopRequest(address: DialogueAddress, requestId: string, updateId: number): boolean {
+    const key = dialogueKey(address);
+    const state = this.deps.store.get(address);
+    const controller = this.controllers.get(key);
+    if (this.previews.get(key)?.requestId !== requestId || state.request?.id !== requestId ||
+        state.request.stopped || state.request.revoked || !controller || controller.signal.aborted) {
+      this.deps.store.accept(updateId);
+      return false;
+    }
+    state.request.stopped = true;
+    this.deps.store.accept(updateId, state);
+    controller.abort(new RequestStopped());
+    return true;
+  }
+
+  private async finishStopped(address: DialogueAddress, requestId: string): Promise<void> {
+    const state = this.deps.store.get(address);
+    if (state.request?.id !== requestId || !state.request.stopped) return;
+    const threadId = state.request.threadId;
+    const restored = threadId && threadId === state.threadId &&
+      await this.deps.engine.restoreStoppedThread?.(threadId, requestId, address).catch(() => false);
+    const current = this.deps.store.get(address);
+    if (current.request?.id !== requestId || !current.request.stopped) return;
+    delete current.request;
+    if (threadId && !restored) {
+      if (current.threadId === threadId) delete current.threadId;
+      current.retiredThreadIds = [...new Set([...(current.retiredThreadIds ?? []), threadId])];
+    }
+    this.deps.store.put(current);
+    if (threadId && !restored) void this.cleanRetiredThreads(address).catch(() => {});
+  }
+
+  private async cleanPreviews(address: DialogueAddress): Promise<void> {
+    const telegram = this.deps.telegram;
+    if (!telegram.deleteMessage) return;
+    const entries = this.deps.store.get(address).previewCleanup ?? [];
+    for (const {id, retryAt} of entries) {
+      if (this.closed || (retryAt && retryAt > Date.now())) continue;
+      let retryIn = 0;
+      try { await telegram.deleteMessage(address.userId, id, this.controlAbort.signal); }
+      catch (error) {
+        if (error instanceof TelegramError) retryIn = error.permanent ? 0 : (error.retryAfter ?? 5) * 1000;
+        else retryIn = 5000;
+      }
+      if (this.closed) return;
+      const state = this.deps.store.get(address);
+      const entry = state.previewCleanup?.find(message => message.id === id);
+      if (!entry) continue;
+      if (retryIn) entry.retryAt = Date.now() + retryIn;
+      else state.previewCleanup = state.previewCleanup!.filter(message => message.id !== id);
+      if (!state.previewCleanup?.length) delete state.previewCleanup;
+      this.deps.store.put(state);
+    }
+  }
+
   private async process(address: DialogueAddress, config: BotConfig): Promise<void> {
     const userId = address.userId;
+    const key = dialogueKey(address);
     let state = this.deps.store.get(address);
     const request = state.request;
     if (!request) return;
     const controller = new AbortController();
-    this.controllers.set(dialogueKey(address), controller);
+    this.controllers.set(key, controller);
     const timer = setTimeout(
       () => controller.abort(new Error("Request timed out")),
       config.requestTimeoutMs,
     );
-    const typing = setInterval(() => {
+    let preview: RequestPreview | undefined;
+    const sendTyping = () => {
       const s = this.deps.config.snapshot();
       if (s.valid && this.allowed(userId, s.config))
         void this.deps.telegram
           .typing(userId, controller.signal, address.topicId)
           .catch(() => {});
-    }, 4000);
+    };
+    let typing: ReturnType<typeof setInterval> | undefined;
     const selection = (userId === config.ownerId
       ? state.selection
       : undefined) ?? {
@@ -383,7 +462,27 @@ export class BotController implements Bot {
     let engineStarted = false;
     try {
       this.ensureActive(address, request.id, controller.signal);
-      void this.deps.telegram.typing(userId, controller.signal, address.topicId).catch(() => {});
+      if (address.topicId && this.deps.telegram.sendDraft) {
+        const live = new RequestPreview({telegram: this.deps.telegram, chatId: userId, topicId: address.topicId,
+          draftId: this.deps.store.nextDraftId(), requestId: request.id, rateLimit: this.draftRateLimit,
+          signal: controller.signal,
+          isAllowed: () => {
+            const snapshot = this.deps.config.snapshot();
+            return snapshot.valid && this.allowed(userId, snapshot.config);
+          },
+          rememberFallback: (id) => {
+            const current = this.deps.store.get(address);
+            (current.previewCleanup ??= []).push({id});
+            this.deps.store.put(current);
+          },
+        });
+        preview = live;
+        this.previews.set(key, live);
+        live.stage(request.attachments?.length ? "Загружаю вложения…" : "Готовлю ответ…");
+      } else {
+        sendTyping();
+        typing = setInterval(sendTyping, 4000);
+      }
       let attachments: PreparedAttachment[] | undefined;
       const materials: MaterialReference[] = [];
       if (request.attachments?.length) {
@@ -414,6 +513,7 @@ export class BotController implements Bot {
         }
         this.ensureActive(address, request.id, controller.signal);
         try {
+          preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF…" : "Читаю вложения…");
           attachments = await this.abortable(this.deps.attachments.prepare(files, controller.signal), controller.signal);
         } catch (error) {
           if (!(error instanceof AttachmentError) || !error.message.includes("Экспортируйте его в PDF")) throw error;
@@ -439,12 +539,16 @@ export class BotController implements Bot {
       };
       const start = state.contextPressure ? state.history.length : recentHistoryStart(state.history, incoming);
       if (start > 0) {
+        preview?.stage("Обновляю контекст диалога…");
         const retainFrom = state.contextPressure ? start : recentHistoryStart(state.history, incoming, 0.5);
         state = await this.compactHistory(state, retainFrom, request.id, selection, controller.signal);
       }
       this.ensureActive(address, request.id, controller.signal);
+      preview?.stage("Готовлю ответ…");
       engineStarted = true;
+      const live = preview;
       const run = () => this.abortable(this.deps.engine.run({
+          requestId: request.id,
           userId,
           topicId: address.topicId,
           text: request.text,
@@ -454,6 +558,7 @@ export class BotController implements Bot {
           history: state.history,
           ...(state.summary ? {summary: state.summary} : {}),
           files: this.deps.store.listFiles(address),
+          ...(live ? {onProgress: (progress) => live.progress(progress)} : {}),
           readFile: (id) => this.deps.store.readFile(address,id),
           onFile: async (file) => {
             this.ensureActive(address,request.id,controller.signal);
@@ -480,12 +585,15 @@ export class BotController implements Bot {
         const attempted = this.deps.store.get(address);
         if (attempted.request?.fileIds?.length) throw error;
         // The provider can exceed the estimate inside a turn. Retry once with the summary alone.
+        preview?.stage("Обновляю контекст диалога…");
         state = await this.compactHistory(attempted, attempted.history.length, request.id, selection, controller.signal);
         this.ensureActive(address, request.id, controller.signal);
+        preview?.stage("Готовлю ответ…");
         response = await run();
       }
       const current = this.deps.store.get(address);
       if (current.request?.id !== request.id) return;
+      if (current.request.stopped) throw new RequestStopped();
       current.threadId = response.threadId;
       if (response.contextPressure) current.contextPressure = true;
       if (attachments) delete current.pending;
@@ -522,6 +630,10 @@ export class BotController implements Bot {
       if (this.closed) return;
       const current = this.deps.store.get(address);
       if (current.request?.id !== request.id) return;
+      if (current.request.stopped) {
+        await this.finishStopped(address, request.id);
+        return;
+      }
       // A rejected or timed-out preflight leaves the completed native thread usable.
       const rejectedBeforeTurn = current.request.threadId === undefined &&
         (error instanceof ModelSelectionError || controller.signal.aborted);
@@ -552,7 +664,9 @@ export class BotController implements Bot {
       this.preparing.delete(dialogueKey(address));
       clearTimeout(timer);
       clearInterval(typing);
-      this.controllers.delete(dialogueKey(address));
+      this.controllers.delete(key);
+      await preview?.close();
+      this.previews.delete(key);
     }
     if (!this.closed) await this.deliver(address);
   }
@@ -606,7 +720,7 @@ export class BotController implements Bot {
     signal.throwIfAborted();
     const snapshot = this.deps.config.snapshot();
     const request = this.deps.store.get(address).request;
-    if (!snapshot.valid || !this.allowed(userId, snapshot.config) || request?.id !== requestId || request.revoked)
+    if (!snapshot.valid || !this.allowed(userId, snapshot.config) || request?.id !== requestId || request.revoked || request.stopped)
       throw new AttachmentError("Обработка приостановлена. Повторите текст задания позже; материалы сохранены.");
   }
   private abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -721,8 +835,10 @@ export class BotController implements Bot {
       (!snapshot.valid && !(diagnostic && userId === config.ownerId))
     )
       return;
+    const preview = this.previews.get(dialogueKey(address));
     try {
       await this.deps.telegram.sendText(userId, text, { signal: this.topicSignal(address), message_thread_id: address.topicId });
+      preview?.refresh();
     } catch {}
   }
   private async command(
@@ -797,6 +913,7 @@ export class BotController implements Bot {
   }
   private async confirmDelete(state: DialogueState, token: string): Promise<void> {
     if (this.deps.store.get(state).deleteConfirmation?.token !== token) return;
+    const preview = this.previews.get(dialogueKey(state));
     try {
       await this.deps.telegram.sendText(state.userId,
         "Удалить эту тему со всеми сообщениями, контекстом и материалами? Это действие необратимо.", {
@@ -806,6 +923,7 @@ export class BotController implements Bot {
             {text: "Отмена", callback_data: `delete:no:${token}`},
           ]]},
         });
+      preview?.refresh();
     } catch {}
   }
   private deleteCallback(address: DialogueAddress, callbackId: string, data: string, updateId: number): void {
@@ -852,6 +970,7 @@ export class BotController implements Bot {
       userId: state.userId, topicId: state.topicId, history: [],
       ...(state.username ? {username: state.username} : {}),
       ...(state.selection ? {selection: state.selection} : {}),
+      ...(state.previewCleanup ? {previewCleanup: state.previewCleanup} : {}),
       ...(deleting ? {deleting: {id: randomUUID(), threadIds}} : {reset: {id: randomUUID(), threadIds}}),
     };
     // Durable cancellation precedes abort: every late callback sees the tombstone.
@@ -1117,7 +1236,16 @@ export class BotController implements Bot {
   }
   private resumeSaved(): void {
     if (this.closed || !this.deps.config.snapshot().valid) return;
-    for (const state of this.deps.store.all())
+    for (const state of this.deps.store.all()) {
+      const key = dialogueKey(state);
+      if (this.deps.telegram.deleteMessage && !this.previews.has(key) && !this.previewCleanups.has(key) &&
+          state.previewCleanup?.some(entry => !entry.retryAt || entry.retryAt <= Date.now())) {
+        this.previewCleanups.add(key);
+        this.control(async () => {
+          try { await this.cleanPreviews(state); }
+          finally { this.previewCleanups.delete(key); }
+        });
+      }
       if (state.topicId && !this.jobs.has(dialogueKey(state))) {
         if (state.legacyBinding) {
           if (!state.bindingRetryAt || state.bindingRetryAt <= Date.now()) this.launch(state, () => this.bindLegacy(state));
@@ -1128,6 +1256,7 @@ export class BotController implements Bot {
         else if (state.delivery && (!state.delivery.retryAt || state.delivery.retryAt <= Date.now()))
           this.launch(state, () => this.deliver(state));
       }
+    }
   }
   async discardOfflineUpdates(updates: TelegramUpdate[]): Promise<void> {
     for (const update of updates) {
@@ -1177,6 +1306,10 @@ export class BotController implements Bot {
         this.deps.store.put(state);
       }
       if (state.request) {
+        if (state.request.stopped) {
+          await this.finishStopped(state, state.request.id);
+          continue;
+        }
         const threadId = state.request.threadId ?? state.threadId,
           revoked = state.request.revoked;
         const fileIds = state.request.fileIds ?? [];

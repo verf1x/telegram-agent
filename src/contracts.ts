@@ -106,6 +106,11 @@ export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  stopped_message_generation?: {
+    chat: TelegramMessage["chat"];
+    message_thread_id?: number;
+    draft_id: number;
+  };
 }
 
 export interface InlineKeyboard {
@@ -139,6 +144,8 @@ export interface TelegramTransport {
     signal?: AbortSignal;
   }): Promise<TelegramUpdate[]>;
   sendText(chatId: ChatId, text: string, options?: SendOptions): Promise<number>;
+  sendDraft?(chatId: ChatId, draftId: number, text: string, topicId: number, signal?: AbortSignal): Promise<void>;
+  deleteMessage?(chatId: ChatId, messageId: number, signal?: AbortSignal): Promise<void>;
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
   typing(chatId: ChatId, signal?: AbortSignal, topicId?: number | undefined): Promise<void>;
   createTopic(chatId: ChatId, name: string, signal?: AbortSignal): Promise<number>;
@@ -200,6 +207,7 @@ export interface EngineHealth {
 }
 
 export interface ModelRequest extends ModelSelection {
+  requestId?: string;
   userId: UserId;
   topicId?: number | undefined;
   threadId?: string;
@@ -211,9 +219,18 @@ export interface ModelRequest extends ModelSelection {
   readFile?: (id: string) => Uint8Array;
   /** Persist each completed file before the agent continues or the request ends. */
   onFile?: (file: GeneratedFile) => Promise<DialogueFile>;
+  onProgress?: (progress: ModelProgress) => void;
   signal: AbortSignal;
   /** Await persistence of the thread before continuing the request. */
   onThread: (threadId: string) => void | Promise<void>;
+}
+
+export type ModelProgress =
+  | { kind: "text"; delta: string }
+  | { kind: "stage"; stage: "responding" | "computing" | "documents" | "images" | "searching" };
+
+export class RequestStopped extends Error {
+  constructor() { super("User stopped the task"); }
 }
 
 export interface ModelResponse {
@@ -226,6 +243,7 @@ export interface ModelResponse {
 
 export interface ModelEngine {
   run(request: ModelRequest): Promise<ModelResponse>;
+  restoreStoppedThread?(threadId: string, requestId: string, address: DialogueAddress): Promise<boolean>;
   summarize(request: SummaryRequest): Promise<string>;
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   deleteThread(threadId: string): Promise<void>;

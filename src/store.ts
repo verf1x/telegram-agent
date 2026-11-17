@@ -34,6 +34,7 @@ export interface DialogueState extends DialogueAddress {
   };
   selection?: ModelSelection;
   lastResponse?: string;
+  previewCleanup?: Array<{id: number; retryAt?: number}>;
   request?: {
     id: string;
     text: string;
@@ -41,6 +42,7 @@ export interface DialogueState extends DialogueAddress {
     started: number;
     attachments?: AttachmentRef[];
     revoked?: boolean;
+    stopped?: boolean;
     fileIds?: string[];
   };
   reset?: { id?: string; threadIds: string[]; retryAt?: number };
@@ -107,6 +109,12 @@ export class SqliteStore {
           .get() as { value: string } | undefined
       )?.value ?? 0,
     );
+  }
+  nextDraftId(): number {
+    const row = this.db.prepare(`INSERT INTO metadata (key, value) VALUES ('draft_id', '1')
+      ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) % 2147483647 + 1
+      RETURNING CAST(value AS INTEGER) AS id`).get() as {id: number};
+    return row.id;
   }
   setOffset(offset: number): void {
     this.db
@@ -228,7 +236,7 @@ export class SqliteStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const state = requestId === undefined ? undefined : this.get(address);
-      if (state && (!state.request || state.request.id !== requestId || state.request.revoked)) throw new ResponseFileError("Задание больше недоступно.");
+      if (state && (!state.request || state.request.id !== requestId || state.request.revoked || state.request.stopped)) throw new ResponseFileError("Задание больше недоступно.");
       if (state && (state.request!.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files) throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
       const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=? AND prepared=0").get(address.userId,address.topicId??0) as {size:number}).size;
       if (used + result.size > quota) throw new ResponseFileError("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new.");

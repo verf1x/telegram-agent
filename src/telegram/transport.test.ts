@@ -164,17 +164,32 @@ test('long answers preserve every code, table and formula character in order', a
   } finally { await remote.close(); }
 });
 
-test('polling carries durable offset, permits callbacks, and supports cancellation', async () => {
+test('polling carries durable offset, accepts native draft stops, and supports cancellation', async () => {
   const remote = await server((method, body) => {
     assert.equal(method,'getUpdates');
-    assert.deepEqual(JSON.parse(body),{offset:71,timeout:20,allowed_updates:['message','callback_query']});
-    return {ok:true,result:[{update_id:71,message:{message_id:1,date:123,chat:{id:7,type:'private'},text:'hi'}}]};
+    assert.deepEqual(JSON.parse(body),{offset:71,timeout:20,allowed_updates:['message','callback_query','stopped_message_generation']});
+    return {ok:true,result:[{update_id:71,stopped_message_generation:{chat:{id:7,type:'private'},message_thread_id:9,draft_id:42}}]};
   });
   try {
-    assert.equal((await remote.api.getUpdates({offset:71,timeout:20}))[0]?.update_id,71);
+    assert.equal((await remote.api.getUpdates({offset:71,timeout:20}))[0]?.stopped_message_generation?.draft_id,42);
     const controller = new AbortController();
     controller.abort(new Error('secret 123:secret'));
     await assert.rejects(remote.api.getUpdates({offset:71,timeout:20,signal:controller.signal}), (error: any) => error.name === 'AbortError' && !String(error).includes('secret'));
+  } finally { await remote.close(); }
+});
+
+test('drafts stream to a single stoppable preview in the requested topic', async () => {
+  const seen: Array<[string,unknown]> = [];
+  const remote = await server((method,body) => { seen.push([method,JSON.parse(body)]); return {ok:true,result:true}; });
+  try {
+    await remote.api.sendDraft(7,42,'Читаю PDF',9);
+    await remote.api.sendDraft(7,42,'Ответ 😀',9);
+    await remote.api.deleteMessage(7,51);
+    assert.deepEqual(seen,[
+      ['sendMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,text:'Читаю PDF',can_stop:true}],
+      ['sendMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,text:'Ответ 😀',can_stop:true}],
+      ['deleteMessage',{chat_id:7,message_id:51}],
+    ]);
   } finally { await remote.close(); }
 });
 

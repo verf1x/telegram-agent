@@ -6,6 +6,8 @@ const memory=process.env.CODEX_HOME+'/fake-memory';
 const catalogError=process.env.CODEX_HOME+'/fake-catalog-error';
 let toolTurn,threadParams,threadMethod,fileScenario,fileStep=0,modelInstructions,inspectMaterial;
 const instructions=process.env.CODEX_HOME+'/fake-instructions';
+const stoppedMemory=process.env.CODEX_HOME+'/fake-stopped-memory';
+const legacyHistory=process.env.CODEX_HOME+'/fake-legacy-history';
 const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
 const chunk=(kind,data)=>{const bytes=Buffer.alloc(data.length+12);bytes.writeUInt32BE(data.length);bytes.write(kind,4);data.copy(bytes,8);bytes.writeUInt32BE(crc32(bytes.subarray(4,-4)),bytes.length-4);return bytes;};
 const paddedPng=size=>{const png=readFileSync(new URL('./attachments/tiny.png',import.meta.url));return Buffer.concat([png.subarray(0,-12),chunk('vpAg',Buffer.alloc(size-png.length-12)),png.subarray(-12)]);};
@@ -39,8 +41,29 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   modelInstructions=item.content.map(c=>c.text).join('\n');writeFileSync(instructions,modelInstructions);
   send({id:x.id,result:{}});
  }
+ else if(x.method==='turn/interrupt'){
+  send({id:x.id,result:{}});
+  send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:x.params.turnId,status:'interrupted',items:[]}}});
+ }
+ else if(x.method==='thread/revert' || x.method==='thread/fork'){
+  if((x.method==='thread/revert' && (existsSync(legacyHistory) || x.params.beforeTurnId!=='turn-stop')) ||
+     (x.method==='thread/fork' && x.params.lastTurnId!=='turn-1')) {
+   send({id:x.id,error:{code:-32602,message:'Unavailable history operation'}});return;
+  }
+  writeFileSync(memory,readFileSync(stoppedMemory));
+  send({id:x.id,result:{thread:{id:x.method==='thread/fork'?'native-fork':x.params.threadId}}});
+ }
  else if(x.method==='turn/start'){
   const text=x.params.input[0].text;
+  if(text==='stream:stop' || text==='stream:stop-legacy'){
+   writeFileSync(stoppedMemory,readFileSync(memory));
+   writeFileSync(memory,'interrupted output');
+   if(text.endsWith('legacy'))writeFileSync(legacyHistory,'1');
+   send({id:x.id,result:{turn:{id:'turn-stop'}}});
+   send({method:'item/started',params:{threadId:x.params.threadId,turnId:'turn-stop',item:{id:'unfinished',type:'agentMessage',phase:'final_answer',text:''}}});
+   send({method:'item/agentMessage/delta',params:{threadId:x.params.threadId,turnId:'turn-stop',itemId:'unfinished',delta:'Starting to answer'}});
+   return;
+  }
   send({id:x.id,result:{turn:{id:'turn-1'}}});
   if(threadParams.ephemeral){
    const data=JSON.parse(text);
@@ -51,6 +74,18 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   if(material){
    toolTurn=x.params.threadId;inspectMaterial=true;
    send({id:998,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'material-1',tool:'dialogue_materials',arguments:{id:material.text.slice('read-material:'.length)}}});return;
+  }
+  if(text==='stream:complete'){
+   const event=(method,details)=>send({method,params:{threadId:x.params.threadId,turnId:'turn-1',...details}});
+   event('item/started',{item:{id:'comment',type:'agentMessage',phase:'commentary',text:''}});
+   event('item/agentMessage/delta',{itemId:'comment',delta:'PRIVATE COMMENTARY'});
+   event('item/reasoning/textDelta',{itemId:'reason',delta:'PRIVATE REASONING'});
+   event('item/started',{item:{id:'a',type:'agentMessage',phase:'final_answer',text:''}});
+   event('item/agentMessage/delta',{itemId:'a',turnId:'previous-turn',delta:'PRIVATE OLD TURN'});
+   event('item/agentMessage/delta',{itemId:'a',threadId:'unrelated',delta:'PRIVATE OTHER TOPIC'});
+   event('item/agentMessage/delta',{itemId:'a',delta:'Hello '});
+   event('item/agentMessage/delta',{itemId:'a',delta:'world'});
+   event('turn/completed',{turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'Hello world'}]}});return;
   }
   if(text==='model-not-found'){
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'failed',items:[],error:{message:'PRIVATE',codexErrorInfo:'modelNotFound'}}}});return;
@@ -123,7 +158,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    if(scenario==='policy')items=[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify({config:readFileSync(process.env.CODEX_HOME+'/config.toml','utf8'),threadParams,threadMethod,modelInstructions,turnParams:x.params})}];
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:['failed-turn','completed-failed-turn'].includes(scenario)?'failed':'completed',items}}});return;
   }
-  if(text==='wait')return;
+  if(text==='wait'){
+   send({method:'item/started',params:{threadId:x.params.threadId,turnId:'turn-1',item:{id:'waiting',type:'agentMessage',phase:'final_answer',text:''}}});
+   send({method:'item/agentMessage/delta',params:{threadId:x.params.threadId,turnId:'turn-1',itemId:'waiting',delta:'Starting'}});
+   return;
+  }
   if(text.startsWith('remember:')||text==='recall'){
    if(text==='remember:CATALOG_TRANSIENT')writeFileSync(catalogError,'1');
    if(text.startsWith('remember:'))writeFileSync(memory,text.slice(9));

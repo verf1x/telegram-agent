@@ -2,7 +2,7 @@ import { mkdir,writeFile,readFile,chmod,rm,rename,readdir } from 'node:fs/promis
 import { join,resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import type { DialogueAddress, ModelEngine,ModelInfo,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment,SummaryRequest } from '../contracts.ts';
+import type { DialogueAddress, ModelEngine,ModelInfo,ModelProgress,ModelRequest,ModelResponse,EngineHealth,GeneratedImage,PreparedAttachment,SummaryRequest } from '../contracts.ts';
 import {
   AttachmentError,
   ATTACHMENT_LIMITS,
@@ -10,6 +10,7 @@ import {
   GENERATED_IMAGE_LIMITS,
   ModelContextError,
   ModelSelectionError,
+  RequestStopped,
   ResponseFileError,
   RESPONSE_FILE_LIMITS,
   isUserFacingRequestError,
@@ -23,6 +24,13 @@ import { recentHistoryStart, SUMMARY_BYTES } from '../dialogue-context.ts';
 
 export interface CodexEngineOptions {runtimeDir:string;pythonPath?:string;codexCommand?:string;}
 type UserInput = {type:'text';text:string;text_elements:[]} | {type:'image';url:string};
+interface ThreadCheckpoint extends DialogueAddress {
+  nativeId: string;
+  status: 'running' | 'completed';
+  requestId?: string | undefined;
+  turnId?: string;
+  previousTurnId?: string | undefined;
+}
 
 function validateAttachments(attachments:PreparedAttachment[]){
   const tooLarge=()=>{throw new AttachmentError('Слишком много материалов для одного задания. Разделите материалы на части.');};
@@ -232,10 +240,10 @@ export class CodexEngine implements ModelEngine {
     if(this.closed||request.signal.aborted)throw new Error('Request cancelled');
     let id=request.threadId??randomUUID(),dir=this.threadDir(id);
     if(this.active.has(id))throw new Error('Dialog busy');
-    let state:any;
+    let state:ThreadCheckpoint | undefined;
     if(request.threadId){
       try{state=JSON.parse(await readFile(join(dir,'state.json'),'utf8'));}catch{throw new Error('Dialog unavailable');}
-      if(state.userId!==request.userId || state.topicId!==request.topicId)throw new Error('Dialog unavailable');
+      if(!state || state.userId!==request.userId || state.topicId!==request.topicId)throw new Error('Dialog unavailable');
       if(state.status!=='completed'){
         await this.deleteThread(id);id=randomUUID();dir=this.threadDir(id);state=undefined;
       }
@@ -244,7 +252,7 @@ export class CodexEngine implements ModelEngine {
     const abort=new AbortController();let markDone:()=>void=()=>{};
     if(request.signal.aborted)throw new Error('Request cancelled');
     const done=new Promise<void>(resolve=>{markDone=resolve;});this.active.set(id,{abort,done});
-    const cancel=()=>abort.abort();request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
+    const cancel=()=>abort.abort(request.signal.reason);request.signal.addEventListener('abort',cancel,{once:true});if(request.signal.aborted)cancel();
     let rpc:Rpc|undefined;
     const computations=new Set<Promise<void>>();
     const workspace=new IsolatedWorkspace(request.files??[],request.readFile??(()=>{throw new Error('File unavailable');}),join(dir,'workspaces'));
@@ -254,7 +262,13 @@ export class CodexEngine implements ModelEngine {
     const fileIds:string[]=[];
     let fileError:ResponseFileError|undefined;
     const materializedImages=new Map<string,string>();
-    const stopWorker=()=>rpc?.stop();abort.signal.addEventListener('abort',stopWorker,{once:true});
+    let interrupt: (() => void) | undefined;
+    let stopDeadline: ReturnType<typeof setTimeout> | undefined;
+    const stopWorker=()=>{
+      if(abort.signal.reason instanceof RequestStopped && interrupt) interrupt();
+      else rpc?.stop();
+    };
+    abort.signal.addEventListener('abort',stopWorker,{once:true});
     try{
       // A durable owner must know a new allocation before any files are created.
       if (!state) await request.onThread(id);
@@ -275,7 +289,6 @@ export class CodexEngine implements ModelEngine {
       // Report ownership before marking an existing thread as interrupted.
       if (state) {
         await request.onThread(id);
-        await this.save(dir, {...state, status: 'running'});
       }
       if (abort.signal.aborted) throw new Error('Request cancelled');
       const cwd=join(dir,'empty');
@@ -291,11 +304,17 @@ export class CodexEngine implements ModelEngine {
       // Resume keeps the original model-visible developer message. Append the
       // current capabilities and material paths explicitly so pre-document
       // threads can use the isolated_compute JSON adapter without a reset.
-      // Resume retains the original developer message, so add the current material inventory.
       if(state?.nativeId)await rpc.request('thread/inject_items',{threadId:nativeId,items:[{type:'message',role:'developer',content:[{type:'input_text',text:developerInstructions+fileInstructions}]}]});
-      await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'running'});
+      const checkpoint:ThreadCheckpoint = {userId:request.userId,topicId:request.topicId,nativeId,
+        status:'running',requestId:request.requestId,previousTurnId:state?.turnId};
+      await this.save(dir,checkpoint);
       if(abort.signal.aborted)throw new Error('Request cancelled');
       const events:any[]=[];let turnId:string|undefined;const items=new Map<string,string>();
+      const streamedItems = new Set<string>();
+      const report = (progress: ModelProgress) => {
+        if (abort.signal.aborted) return;
+        try { request.onProgress?.(progress); } catch { /* The preview is independent of Codex. */ }
+      };
       let contextPressure=false;
       const images:GeneratedImage[]=[];let imageBytes=0;
       const nativeImages=new Map<string,GeneratedImage|undefined>();let nativeBytes=0,nativeError:ImageGenerationError|undefined;
@@ -304,8 +323,13 @@ export class CodexEngine implements ModelEngine {
       const completed=new Promise<any>((resolve,reject)=>{finish=resolve;fail=reject;});
       // The completion promise may reject while awaiting the turn/start RPC.
       void completed.catch(()=>{});
-      const stop=()=>{fail(new Error('Request cancelled'));connection.stop();};
-      abort.signal.addEventListener('abort',stop,{once:true});
+      let interruptSent = false;
+      interrupt = () => {
+        stopDeadline ??= setTimeout(() => connection.stop(), 4000);
+        if (interruptSent || !turnId) return;
+        interruptSent = true;
+        void connection.request('turn/interrupt', {threadId: nativeId, turnId}, 3500).catch(() => {});
+      };
       connection.onClose=()=>fail(new Error('Codex unavailable'));
       const handleTool=async(f:any)=>{
         const p=f.params;
@@ -322,6 +346,7 @@ export class CodexEngine implements ModelEngine {
           }
           if(tool==='isolated_workspace'){
             if(typeof args.command!=='string')throw new Error('Invalid command');
+            report({kind:'stage',stage:'documents'});
             for(const [index,image] of images.entries()) {
               const key='calculation-'+index;
               if(!materializedImages.has(key))materializedImages.set(key,await workspace.addImage(image,abort.signal));
@@ -333,6 +358,7 @@ export class CodexEngine implements ModelEngine {
           }
           if(tool==='export_files'){
             if(!Array.isArray(args.files)||!args.files.length||args.files.length>10)throw new ResponseFileError('Укажите от 1 до 10 файлов для отправки.');
+            report({kind:'stage',stage:'documents'});
             const saved=[];const failed=[];
             for(const item of args.files){
               if(abort.signal.aborted)throw new Error('Cancelled');
@@ -351,6 +377,7 @@ export class CodexEngine implements ModelEngine {
             return;
           }
           if(tool==='dialogue_materials'){
+            report({kind:'stage',stage:'documents'});
             const contentItems = [];
             if(typeof args.id==='string'){
               const file = materials.find(material=>material.id===args.id);
@@ -381,6 +408,7 @@ export class CodexEngine implements ModelEngine {
             return;
           }
           if(typeof args.code!=='string')throw new Error('Invalid calculation');
+          report({kind:'stage',stage:'computing'});
           const result=await compute(args.code,this.pythonPath,abort.signal);
           const bytes=result.images.reduce((sum,image)=>sum+image.bytes.length,0);
           if(images.length+result.images.length>4||imageBytes+bytes>6*1024*1024)throw new Error();
@@ -391,7 +419,7 @@ export class CodexEngine implements ModelEngine {
         }catch(error){
           if(p.tool!=='dialogue_materials' && (p.tool!=='isolated_compute'||error instanceof ResponseFileError))fileError??=error instanceof ResponseFileError?error:new ResponseFileError('Не удалось завершить работу с файлами. Готовая часть сохранена.');
           if(connection.alive&&!abort.signal.aborted)connection.send({id:f.id,result:{contentItems:[{type:'inputText',text:isUserFacingRequestError(error)?(error as Error).message:'Tool unavailable or resource limit exceeded'}],success:false}});
-        }finally{computing=false;}
+        }finally{computing=false;report({kind:'stage',stage:'responding'});}
       };
       const recordImage=(item:any,completedItem:boolean)=>{
         try{
@@ -415,6 +443,11 @@ export class CodexEngine implements ModelEngine {
         if(item?.type==='agentMessage'&&(item.phase===null||item.phase==='final_answer'))items.set(item.id,item.text);
       };
       const consume=(f:any)=>{
+        if(abort.signal.aborted){
+          if(f.method==='turn/completed'&&f.params?.threadId===nativeId&&f.params.turn?.id===turnId)
+            finish(f.params.turn);
+          return;
+        }
         if(f.id!==undefined){const task=handleTool(f);computations.add(task);void task.finally(()=>computations.delete(task));return;}
         if(f.params?.threadId!==nativeId)return;
         if(!turnId){events.push(f);return;}
@@ -423,9 +456,26 @@ export class CodexEngine implements ModelEngine {
           const usage=f.params.tokenUsage;
           if(usage?.modelContextWindow>0&&usage.last?.totalTokens>=usage.modelContextWindow*0.5)contextPressure=true;
         }
-        if(f.method==='item/started'&&f.params.turnId===turnId&&f.params.item?.type==='imageGeneration')recordImage(f.params.item,false);
-        if(f.method==='item/completed'&&f.params.turnId===turnId)recordItem(f.params.item);
+        if(f.method==='item/started'&&f.params.turnId===turnId){
+          const item=f.params.item;
+          if(item?.type==='agentMessage'&&item.phase==='final_answer'&&typeof item.id==='string')streamedItems.add(item.id);
+          if(item?.type==='imageGeneration'){
+            recordImage(item,false);
+            report({kind:'stage',stage:'images'});
+          }
+          if(item?.type==='webSearch')report({kind:'stage',stage:'searching'});
+        }
+        if(f.method==='item/agentMessage/delta'&&f.params.turnId===turnId&&
+          streamedItems.has(f.params.itemId)&&typeof f.params.delta==='string'&&f.params.delta)
+          report({kind:'text',delta:f.params.delta});
+        if(f.method==='item/completed'&&f.params.turnId===turnId){
+          const item=f.params.item;
+          streamedItems.delete(item?.id);
+          recordItem(item);
+          if(item?.type==='webSearch'||item?.type==='imageGeneration')report({kind:'stage',stage:'responding'});
+        }
         if(f.method==='turn/completed'&&f.params.turn.id===turnId){
+          streamedItems.clear();
           for(const item of f.params.turn.items??[])recordItem(item);
           if(f.params.turn.status!=='completed'){
             const error=new ImageGenerationError('Не удалось завершить генерацию изображения в Codex. Попробуйте повторить запрос.');
@@ -450,24 +500,92 @@ export class CodexEngine implements ModelEngine {
       };
       const started=await rpc.request('turn/start',{...scope,threadId:nativeId,input,effort:request.effort,environments:[]});
       turnId=started.turn.id;
+      if(typeof turnId!=='string'||!turnId)throw new Error('Missing Codex turn identifier');
+      if(abort.signal.reason instanceof RequestStopped)interrupt();
       for(const event of events)consume(event);
+      await this.save(dir,{...checkpoint,turnId});
       const turn=await completed;
       await Promise.allSettled(computations);
-      abort.signal.removeEventListener('abort',stop);
       if(abort.signal.aborted)throw new Error('Request cancelled');
       let answer=[...items.values()].join('\n\n').trim()||(fileIds.length?'Файлы готовы.':nativeImages.size?'Изображения готовы.':'');if(!answer)throw new Error('Codex returned an empty answer');
       if(fileError)answer+='\n\n'+fileError.message;
       if(nativeError)answer+='\n\nГотова только часть изображений. '+nativeError.message;
       // A failed turn may have usable images, but must not be resumed as a
       // completed conversation. The existing rebuild path handles the next request.
-      if(turn.status==='completed')await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'completed'});
+      if(turn.status==='completed')await this.save(dir,{...checkpoint,turnId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
       return {text:answer,threadId:id,images,fileIds,...(contextPressure?{contextPressure:true}:{})};
     } catch (error) {
       if (!abort.signal.aborted && isUserFacingRequestError(error)) throw error;
       throw new Error(abort.signal.aborted ? 'Request cancelled' : 'Codex request failed');
     }
-    finally{abort.signal.removeEventListener('abort',stopWorker);request.signal.removeEventListener('abort',cancel);rpc?.stop();if(rpc)this.workers.delete(rpc);await Promise.allSettled(computations);await workspace.close();this.active.delete(id);markDone();}
+    finally {
+      clearTimeout(stopDeadline);
+      abort.signal.removeEventListener('abort',stopWorker);
+      request.signal.removeEventListener('abort',cancel);
+      rpc?.stop();
+      if (rpc) this.workers.delete(rpc);
+      try {
+        await Promise.allSettled(computations);
+        await workspace.close();
+      } finally {
+        this.active.delete(id);
+        markDone();
+      }
+    }
+  }
+
+  async restoreStoppedThread(threadId:string, requestId:string, address:DialogueAddress):Promise<boolean>{
+    await this.active.get(threadId)?.done;
+    const dir = this.threadDir(threadId);
+    const state = JSON.parse(await readFile(join(dir,'state.json'),'utf8')) as ThreadCheckpoint;
+    if (state.userId !== address.userId || state.topicId !== address.topicId) return false;
+    if (state.requestId !== requestId) return state.status === 'completed';
+    let rpc: Rpc | undefined;
+    try {
+      const worker = await this.worker(dir);
+      rpc = worker.rpc;
+      const scope = {permissions:'bot',approvalPolicy:'never',cwd:worker.cwd,runtimeWorkspaceRoots:[worker.cwd]};
+      const options = {...scope, threadId: state.nativeId, excludeTurns: true};
+      await rpc.request('thread/resume', options, 5000);
+      let turnId = state.turnId;
+      let previous = state.previousTurnId;
+      if (!turnId || !previous) {
+        const recent = await this.recentTurns(rpc, state.nativeId);
+        if (!turnId) {
+          // Only infer a turn that immediately follows a known completed checkpoint.
+          if (!previous || (recent[0] !== previous && recent[1] !== previous)) return false;
+          if (recent[0] !== previous) turnId = recent[0];
+        }
+        const index = turnId ? recent.indexOf(turnId) : -1;
+        previous ??= index >= 0 ? recent[index+1] : undefined;
+      }
+      let nativeId = state.nativeId;
+      if (turnId) {
+        try { await rpc.request('thread/revert', {threadId:nativeId,beforeTurnId:turnId}, 5000); }
+        catch {
+          // Fork at the last accepted turn when the older history format cannot revert.
+          if (!previous) return false;
+          const fork = await rpc.request('thread/fork', {...options,lastTurnId:previous}, 5000);
+          if (typeof fork.thread?.id !== 'string' || !fork.thread.id || fork.thread.id === nativeId) return false;
+          nativeId = fork.thread.id;
+        }
+      }
+      await this.save(dir,{userId:address.userId,topicId:address.topicId,nativeId,status:'completed',
+        ...(previous ? {turnId:previous} : {})});
+      return true;
+    } catch { return false; }
+    finally { if (rpc) { rpc.stop(); this.workers.delete(rpc); } }
+  }
+
+  private async recentTurns(rpc:Rpc, threadId:string):Promise<string[]>{
+    try {
+      const page = await rpc.request('thread/turns/list', {threadId,limit:3,sortDirection:'desc'}, 3500);
+      return (page.data ?? []).map((turn:{id:string})=>turn.id);
+    } catch {
+      const {thread} = await rpc.request('thread/read', {threadId,includeTurns:true}, 3500);
+      return (thread.turns ?? []).slice(-3).reverse().map((turn:{id:string})=>turn.id);
+    }
   }
   /** Only the migration path may assign an unscoped legacy thread to a topic. */
   async bindLegacyThread(threadId:string,address:DialogueAddress):Promise<void>{

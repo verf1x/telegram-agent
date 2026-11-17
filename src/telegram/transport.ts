@@ -59,7 +59,14 @@ export class TelegramApi implements TelegramTransport {
       throw new Error('Включите Threaded Mode и управление темами пользователями в BotFather.');
   }
   getUpdates(options: {offset?:number;timeout:number;signal?:AbortSignal}): Promise<TelegramUpdate[]> {
-    return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','callback_query']},options.signal,(options.timeout + 15) * 1000);
+    return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','callback_query','stopped_message_generation']},options.signal,(options.timeout + 15) * 1000);
+  }
+  async sendDraft(chatId: ChatId, draftId: number, text: string, topicId: number, signal?: AbortSignal): Promise<void> {
+    const accepted = await this.#call<boolean>('sendMessageDraft',{chat_id:chatId,message_thread_id:topicId,draft_id:draftId,text,can_stop:true},signal,2500);
+    if (accepted !== true) throw new TelegramError(0,'draft was not accepted');
+  }
+  async deleteMessage(chatId: ChatId, messageId: number, signal?: AbortSignal): Promise<void> {
+    await this.#call('deleteMessage',{chat_id:chatId,message_id:messageId},signal,2500);
   }
   async downloadFile(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
     const limit = Math.min(maxBytes,ATTACHMENT_LIMITS.fileBytes);
