@@ -4,6 +4,7 @@ import type { DialogueFile, GeneratedFile } from "./contracts.ts";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { ArchivedMaterial } from "./dialogue-context.ts";
 import type {
   AttachmentRef,
   DialogueAddress,
@@ -22,6 +23,8 @@ export interface DialogueState extends DialogueAddress {
   /** Retain cleanup ownership even when best-effort deletion after a failure fails. */
   retiredThreadIds?: string[];
   history: ConversationMessage[];
+  summary?: string;
+  contextPressure?: boolean;
   pending?: {
     refs: AttachmentRef[];
     captions: string[];
@@ -84,6 +87,7 @@ export class SqliteStore {
     this.db.exec("CREATE TABLE IF NOT EXISTS broadcasts (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, state TEXT NOT NULL)");
     const fileColumns = this.db.prepare("PRAGMA table_info(dialogue_files)").all() as Array<{name:string}>;
     if (!fileColumns.some(column=>column.name==="topic_id")) this.db.exec("ALTER TABLE dialogue_files ADD COLUMN topic_id INTEGER NOT NULL DEFAULT 0");
+    if (!fileColumns.some(column=>column.name==="prepared")) this.db.exec("ALTER TABLE dialogue_files ADD COLUMN prepared INTEGER NOT NULL DEFAULT 0");
     this.db.exec("CREATE INDEX IF NOT EXISTS files_dialogue ON dialogue_files(user_id,topic_id)");
     const columns = this.db.prepare("PRAGMA table_info(dialogues)").all() as Array<{name: string}>;
     if (!columns.some((column) => column.name === "topic_id")) {
@@ -154,6 +158,21 @@ export class SqliteStore {
       )
       .run(state.userId, state.topicId ?? 0, JSON.stringify(state));
   }
+  putCompacted(state: DialogueState, archived: ArchivedMaterial[]): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const insert = this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes,prepared) VALUES(?,?,?,?,?,?,?,1)");
+      for (const {id, name, attachment} of archived) {
+        const bytes = Buffer.from(JSON.stringify(attachment));
+        insert.run(id,state.userId,state.topicId??0,name,"application/json",bytes.length,bytes);
+      }
+      this.put(state);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
   accept(updateId: number, state?: DialogueState | BroadcastState): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -182,7 +201,9 @@ export class SqliteStore {
   }
   listFiles(user: number | DialogueAddress): DialogueFile[] {
     const address = typeof user === "number" ? {userId:user} : user;
-    return this.db.prepare("SELECT id,name,mime,size FROM dialogue_files WHERE user_id=? AND topic_id=? ORDER BY rowid").all(address.userId,address.topicId??0) as unknown as DialogueFile[];
+    const files = this.db.prepare("SELECT id,name,mime,size,prepared FROM dialogue_files WHERE user_id=? AND topic_id=? ORDER BY rowid")
+      .all(address.userId,address.topicId??0) as unknown as Array<Omit<DialogueFile, "prepared"> & {prepared: number}>;
+    return files.map(({prepared, ...file}) => prepared ? {...file, prepared: true} : file);
   }
   readFile(user: number | DialogueAddress, id: string): Uint8Array {
     const address = typeof user === "number" ? {userId:user} : user;
@@ -209,7 +230,7 @@ export class SqliteStore {
       const state = requestId === undefined ? undefined : this.get(address);
       if (state && (!state.request || state.request.id !== requestId || state.request.revoked)) throw new ResponseFileError("Задание больше недоступно.");
       if (state && (state.request!.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files) throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
-      const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=?").get(address.userId,address.topicId??0) as {size:number}).size;
+      const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=? AND prepared=0").get(address.userId,address.topicId??0) as {size:number}).size;
       if (used + result.size > quota) throw new ResponseFileError("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new.");
       this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes) VALUES(?,?,?,?,?,?,?)").run(result.id,address.userId,address.topicId??0,name,mime,result.size,file.bytes);
       if (state) { (state.request!.fileIds ??= []).push(result.id); this.put(state); }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,rm,readFile } from 'node:fs/promises';
+import { mkdtemp,rm,readFile,writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { CodexEngine } from '../../src/codex/engine.ts';
@@ -86,18 +86,74 @@ test('full multimodal rebuild and large echoed user input fit bounded app-server
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
  const image=(size:number)=>{const bytes=Buffer.alloc(size);Buffer.from(png,'base64').copy(bytes);return {name:'page.png',mime:'image/png' as const,base64:bytes.toString('base64')};};
  try {
-  const result=await engine.run({userId:1,text:'accept-large-input',history:[{role:'user',text:'prior task',attachments:[{name:'old.pdf',text:'all old text',images:[image(3000000)]}]},{role:'assistant',text:'h'.repeat(6100000)+'HISTORY-END'}],attachments:[{name:'current.pdf',text:'all current text',images:[image(2000000)]}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  const result=await engine.run({userId:1,text:'accept-large-input',history:[{role:'user',text:'prior task',attachments:[{name:'old.pdf',text:'all old text',images:[image(2_900_000)]}]},{role:'assistant',text:'h'.repeat(30_000)+'HISTORY-END'}],attachments:[{name:'current.pdf',text:'all current text',images:[image(5_800_000)]}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
   assert.equal(result.text,'native images: 2; history tail: true');
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
-test('oversized rebuilt input fails safely without persisting or silently truncating the task',async()=>{
+test('oversized current input fails safely without persisting or silently truncating the task',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
  let persisted=false;
  try {
-  await assert.rejects(engine.run({userId:1,text:'inspect-input',history:[{role:'assistant',text:'h'.repeat(24*1024*1024)}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{persisted=true;}}),(error:Error)=>error.name==='AttachmentError'&&/Разделите/.test(error.message));
+  await assert.rejects(engine.run({userId:1,text:'h'.repeat(24*1024*1024),model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{persisted=true;}}),(error:Error)=>error.name==='AttachmentError'&&/разделите/.test(error.message));
   assert.equal(persisted,false);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('summarization uses an ephemeral tool-free turn and the next thread gets its bounded context',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const model={model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal};
+ try {
+  const summary=await engine.summarize({...model,summary:'Keep the invoice date',text:'The newer copy is authoritative'});
+  assert.deepEqual(JSON.parse(summary),{
+   data:{previousSummary:'Keep the invoice date',completedMessages:'The newer copy is authoritative'},
+   dynamicTools:[],permissions:'bot',
+  });
+  const result=await engine.run({...model,userId:1,text:'inspect-input',summary,history:[
+   {role:'user',text:'x'.repeat(75_000)},
+   {role:'assistant',text:'Old, already summarized answer'},
+   {role:'user',text:'Use the updated date'},
+   {role:'assistant',text:'Understood'},
+  ],onThread:()=>{}});
+  const input=JSON.parse(result.text);
+  assert.ok(input.some((item:any)=>item.text?.includes('Keep the invoice date')));
+  assert.ok(input.some((item:any)=>item.text?.includes('Use the updated date')));
+  assert.ok(!input.some((item:any)=>item.text?.includes('Old, already summarized answer')));
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('model context pressure is reported separately from the transport limit',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const base={model:'gpt-6.1-sol',effort:'medium',userId:1,signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const response=await engine.run({...base,text:'context-window-pressure'});
+  assert.equal(response.contextPressure,true);
+  assert.equal(response.text,'Answered within model window');
+  await assert.rejects(engine.run({...base,text:'context-window-exceeded'}),/окно контекста модели/);
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('the material tool returns a saved scan as native images and denies IDs outside the dialogue',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
+ const attachment={name:'legacy-scan.pdf',text:'Old scan contents',images:[{name:'page.png',mime:'image/png',base64:png}]};
+ const bytes=Buffer.from(JSON.stringify(attachment));
+ const id='11111111-1111-4111-8111-111111111111';
+ const file={id,name:attachment.name,prepared:true as const,mime:'application/json',size:bytes.length};
+ let reads=0;
+ const base={userId:1,topicId:12,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{},
+  text:'read-material:'+id,readFile:(requested:string)=>{reads++;assert.equal(requested,id);return bytes;}};
+ try {
+  const response=JSON.parse((await engine.run({...base,files:[file]})).text);
+  assert.equal(response.success,true);
+  assert.ok(response.contentItems.some((item:any)=>item.type==='inputImage'&&item.imageUrl==='data:image/png;base64,'+png));
+  assert.ok(response.contentItems.some((item:any)=>item.text?.includes('Old scan contents')));
+  const denied=JSON.parse((await engine.run({...base,topicId:13,files:[]})).text);
+  assert.equal(denied.success,false);
+  assert.equal(reads,1);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
@@ -337,7 +393,28 @@ test('new and restarted dialogs enable native artwork while retaining the isolat
    assert.match(report.threadParams.developerInstructions,/image_gen__imagegen/);
    assert.match(report.threadParams.developerInstructions,/num_last_images_to_include/);
    assert.match(report.threadParams.developerInstructions,/API key/);
+   if(index===0)assert.deepEqual(report.threadParams.dynamicTools.map((tool:any)=>tool.name),['isolated_compute','isolated_workspace','export_files','dialogue_materials']);
   }
+ }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
+});
+
+test('resumed native threads can find current materials using the legacy tool',async()=>{
+ const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
+ const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
+ let engine=new CodexEngine(options);
+ const base={userId:1,topicId:7,text:'native-image:policy',model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
+ try {
+  const first=await engine.run(base);
+  await engine.close();
+  await writeFile(join(runtimeDir,'codex','dialogs',first.threadId,'home','fake-instructions'),'Only numerical Python calculations are available.');
+  engine=new CodexEngine(options);
+  const files=[{id:'11111111-1111-4111-8111-111111111111',name:'saved.pdf',mime:'application/pdf',size:42}];
+  const resumed=await engine.run({...base,threadId:first.threadId,files});
+  assert.equal(resumed.threadId,first.threadId);
+  const report=JSON.parse(resumed.text);
+  assert.match(report.modelInstructions,/dialogue_materials/);
+  assert.match(report.modelInstructions,/saved\.pdf/);
+  assert.match(report.modelInstructions,/\/work\/materials\/11111111-1111-4111-8111-111111111111\.pdf/);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 

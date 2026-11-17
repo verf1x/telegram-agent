@@ -3,6 +3,7 @@ import type {
   AttachmentReader,
   DialogueAddress,
   AttachmentRef,
+  MaterialReference,
   PreparedAttachment,
   Bot,
   BotConfig,
@@ -10,6 +11,8 @@ import type {
   ConfigSnapshot,
   ModelEngine,
   ModelInfo,
+  ModelSelection,
+  ModelResponse,
   OutgoingPart,
   TelegramTransport,
   TelegramUpdate,
@@ -18,6 +21,7 @@ import {
   dialogueKey,
   ATTACHMENT_LIMITS,
   AttachmentError,
+  ModelContextError,
   ModelSelectionError,
   ResponseFileError,
   isUserFacingRequestError,
@@ -26,6 +30,7 @@ import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./br
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
+import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 interface Dependencies {
   config: ConfigSource;
   store: SqliteStore;
@@ -353,8 +358,8 @@ export class BotController implements Bot {
   }
   private async process(address: DialogueAddress, config: BotConfig): Promise<void> {
     const userId = address.userId;
-    const state = this.deps.store.get(address),
-      request = state.request;
+    let state = this.deps.store.get(address);
+    const request = state.request;
     if (!request) return;
     const controller = new AbortController();
     this.controllers.set(dialogueKey(address), controller);
@@ -380,6 +385,7 @@ export class BotController implements Bot {
       this.ensureActive(address, request.id, controller.signal);
       void this.deps.telegram.typing(userId, controller.signal, address.topicId).catch(() => {});
       let attachments: PreparedAttachment[] | undefined;
+      const materials: MaterialReference[] = [];
       if (request.attachments?.length) {
         this.preparing.add(dialogueKey(address));
         if (!this.deps.attachments || !this.deps.telegram.downloadFile)
@@ -395,7 +401,7 @@ export class BotController implements Bot {
           total += bytes.byteLength;
           const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
           if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes || total + remaining > ATTACHMENT_LIMITS.batchBytes)
-            throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы или используйте /new.");
+            throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы на несколько заданий.");
           files.push({ name: ref.name, mime: ref.mime, bytes });
           const current = this.deps.store.get(address);
           if (current.pending && !current.pending.savedFiles?.[ref.fileId]) {
@@ -403,6 +409,8 @@ export class BotController implements Bot {
             (current.pending.savedFiles ??= {})[ref.fileId] = saved.id;
             this.deps.store.put(current);
           }
+          const materialId = current.pending?.savedFiles?.[ref.fileId];
+          if (materialId) materials.push({id: materialId, name: ref.name});
         }
         this.ensureActive(address, request.id, controller.signal);
         try {
@@ -416,28 +424,35 @@ export class BotController implements Bot {
         this.ensureActive(address, request.id, controller.signal);
         if (attachments.length !== files.length)
           throw new AttachmentError("Не удалось подготовить все материалы. Файлы сохранены; повторите текст задания или используйте /new.");
-        const context = [...state.history.flatMap((m) => m.attachments ?? []), ...attachments];
-        if (Buffer.byteLength(JSON.stringify(context)) > ATTACHMENT_LIMITS.dialogueBytes)
-          throw new AttachmentError("Материалы заняли весь контекст диалога. Начните новый диалог через /new и разделите материалы.");
         const images = attachments.flatMap((a) => a.images);
         if (images.reduce((n, i) => n + Buffer.byteLength(i.base64, "base64"), 0) > ATTACHMENT_LIMITS.imageBytes)
-          throw new AttachmentError("Слишком большой объём изображений во вложениях. Разделите материалы или очистите диалог через /new.");
+          throw new AttachmentError("Слишком большой объём изображений во вложениях текущего задания. Разделите материалы на несколько заданий.");
         if (attachments.reduce((n, a) => n + Buffer.byteLength(a.text), 0) > ATTACHMENT_LIMITS.textBytes)
-          throw new AttachmentError("Слишком много текста во вложениях. Разделите материалы или очистите диалог через /new.");
+          throw new AttachmentError("Слишком много текста во вложениях текущего задания. Разделите материалы на несколько заданий.");
       }
       this.preparing.delete(dialogueKey(address));
       this.ensureActive(address, request.id, controller.signal);
+      const incoming = {
+        role: "user" as const, text: request.text,
+        ...(attachments ? {attachments} : {}),
+        ...(materials.length ? {materials} : {}),
+      };
+      const start = state.contextPressure ? state.history.length : recentHistoryStart(state.history, incoming);
+      if (start > 0) {
+        const retainFrom = state.contextPressure ? start : recentHistoryStart(state.history, incoming, 0.5);
+        state = await this.compactHistory(state, retainFrom, request.id, selection, controller.signal);
+      }
+      this.ensureActive(address, request.id, controller.signal);
       engineStarted = true;
-      const response = await Promise.race([
-        this.deps.engine.run({
+      const run = () => this.abortable(this.deps.engine.run({
           userId,
           topicId: address.topicId,
           text: request.text,
           ...(attachments ? { attachments } : {}),
           ...selection,
-          ...(state.threadId
-            ? { threadId: state.threadId }
-            : { history: state.history }),
+          ...(state.threadId ? {threadId: state.threadId} : {}),
+          history: state.history,
+          ...(state.summary ? {summary: state.summary} : {}),
           files: this.deps.store.listFiles(address),
           readFile: (id) => this.deps.store.readFile(address,id),
           onFile: async (file) => {
@@ -446,6 +461,7 @@ export class BotController implements Bot {
           },
           signal: controller.signal,
           onThread: (id) => {
+            this.ensureActive(address, request.id, controller.signal);
             const current = this.deps.store.get(address);
             if (current.request?.id === request.id) {
               current.request.threadId = id;
@@ -455,34 +471,47 @@ export class BotController implements Bot {
               throw new Error("Dialogue allocation cancelled");
             }
           },
-        }),
-        new Promise<never>((_, reject) =>
-          controller.signal.addEventListener(
-            "abort",
-            () => reject(controller.signal.reason),
-            { once: true },
-          ),
-        ),
-      ]);
+        }), controller.signal);
+      let response: ModelResponse;
+      try {
+        response = await run();
+      } catch (error) {
+        if (!(error instanceof ModelContextError) || (!state.threadId && !state.history.length)) throw error;
+        const attempted = this.deps.store.get(address);
+        if (attempted.request?.fileIds?.length) throw error;
+        // The provider can exceed the estimate inside a turn. Retry once with the summary alone.
+        state = await this.compactHistory(attempted, attempted.history.length, request.id, selection, controller.signal);
+        this.ensureActive(address, request.id, controller.signal);
+        response = await run();
+      }
       const current = this.deps.store.get(address);
       if (current.request?.id !== request.id) return;
       current.threadId = response.threadId;
-      current.history.push(
-        { role: "user", text: request.text, ...(attachments ? { attachments } : {}) },
-        { role: "assistant", text: response.text },
-      );
+      if (response.contextPressure) current.contextPressure = true;
       if (attachments) delete current.pending;
       const fileIds = current.request.fileIds ?? [];
+      const savedIds = new Set(fileIds);
+      const resultFiles: MaterialReference[] = fileIds.length
+        ? this.deps.store.listFiles(address).filter(file => savedIds.has(file.id)).map(({id, name}) => ({id, name}))
+        : [];
       const readyImages = [];
       let imageWarning = "";
       for (const image of response.images) {
-        try { this.deps.store.saveFile(address,image,config.dialogueFileBytes); readyImages.push(image); }
+        try {
+          const {id, name} = this.deps.store.saveFile(address,image,config.dialogueFileBytes);
+          resultFiles.push({id, name});
+          readyImages.push(image);
+        }
         catch (error) {
           if (!(error instanceof ResponseFileError)) throw error;
           imageWarning = "\n\nГотова только часть изображений. " + error.message;
         }
       }
       const answer = {...response,text:response.text+imageWarning,images:readyImages};
+      current.history.push(incoming, {
+        role: "assistant", text: response.text,
+        ...(resultFiles.length ? {materials: resultFiles} : {}),
+      });
       current.lastResponse = answer.text;
       const revoked = current.request.revoked;
       delete current.request;
@@ -518,7 +547,7 @@ export class BotController implements Bot {
       }
       this.deps.store.put(current);
       if (poisoned)
-        void this.deps.engine.deleteThread(poisoned).catch(() => {});
+        await this.cleanRetiredThreads(address);
     } finally {
       this.preparing.delete(dialogueKey(address));
       clearTimeout(timer);
@@ -526,6 +555,51 @@ export class BotController implements Bot {
       this.controllers.delete(dialogueKey(address));
     }
     if (!this.closed) await this.deliver(address);
+  }
+  private async compactHistory(
+    state: DialogueState, retainFrom: number, requestId: string, selection: ModelSelection, signal: AbortSignal,
+  ): Promise<DialogueState> {
+    this.ensureActive(state, requestId, signal);
+    const {archived, batches} = compactionInput(state.history.slice(0, retainFrom));
+    let summary = state.summary;
+    for (const text of batches) {
+      try {
+        summary = (await this.abortable(this.deps.engine.summarize({
+          ...selection, text, ...(summary ? {summary} : {}), signal,
+        }), signal)).trim();
+        if (!summary || Buffer.byteLength(summary) > SUMMARY_BYTES) throw new Error("Invalid summary");
+      } catch (error) {
+        if (signal.aborted || error instanceof ModelSelectionError) throw error;
+        throw new AttachmentError("Не удалось обновить сводку диалога. История и материалы сохранены. Повторите задание позже.");
+      }
+      this.ensureActive(state, requestId, signal);
+    }
+    // Preserve pending files and the request's cleanup record across the model call.
+    const current = this.deps.store.get(state);
+    if (summary) current.summary = summary;
+    current.history = current.history.slice(retainFrom);
+    delete current.contextPressure;
+    const retired = new Set(current.retiredThreadIds);
+    if (current.threadId) retired.add(current.threadId);
+    if (current.request?.threadId) {
+      retired.add(current.request.threadId);
+      delete current.request.threadId;
+    }
+    if (retired.size) current.retiredThreadIds = [...retired];
+    delete current.threadId;
+    this.deps.store.putCompacted(current, archived);
+    await this.cleanRetiredThreads(current);
+    return this.deps.store.get(state);
+  }
+  private async cleanRetiredThreads(address: DialogueAddress): Promise<void> {
+    for (const id of this.deps.store.get(address).retiredThreadIds ?? []) {
+      try { await this.deps.engine.deleteThread(id); } catch { continue; }
+      const current = this.deps.store.get(address);
+      if (!current.retiredThreadIds?.includes(id)) continue;
+      current.retiredThreadIds = current.retiredThreadIds.filter(threadId => threadId !== id);
+      if (!current.retiredThreadIds.length) delete current.retiredThreadIds;
+      this.deps.store.put(current);
+    }
   }
   private ensureActive(address: DialogueAddress, requestId: string, signal: AbortSignal): void {
     const userId = address.userId;
@@ -811,6 +885,8 @@ export class BotController implements Bot {
     delete state.threadId;
     delete state.retiredThreadIds;
     delete state.lastResponse;
+    delete state.summary;
+    delete state.contextPressure;
     state.history = [];
     delete state.pending;
     state.delivery = {
@@ -1110,9 +1186,8 @@ export class BotController implements Bot {
         if (!revoked)
           state.delivery = { parts: [{ kind: "text", text: REPEAT },...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
         this.deps.store.put(state);
-        if (threadId)
-          void this.deps.engine.deleteThread(threadId).catch(() => {});
       }
+      if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
     }
     this.startLegacyMigrations();
     this.reloaded(this.deps.config.snapshot());

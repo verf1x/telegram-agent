@@ -39,11 +39,11 @@ export class IsolatedWorkspace {
   private egressClose?:()=>Promise<void>;
   private ready?:Promise<void>;
   private closed=false;
-  readonly materials:Array<DialogueFile & {path:string}>;
+  readonly materials:Array<DialogueFile & {path?:string}>;
   private readonly readFile:(id:string)=>Uint8Array;
   private readonly stagingRoot:string;
   constructor(files:DialogueFile[],readFile:(id:string)=>Uint8Array,stagingRoot=tmpdir()) {
-    this.materials=files.map(file=>({...file,path:'/work/materials/'+file.id+(/\.[a-z0-9]{1,12}$/i.exec(file.name)?.[0].toLowerCase()??'')}));
+    this.materials=files.map(file=>file.prepared?file:{...file,path:'/work/materials/'+file.id+(/\.[a-z0-9]{1,12}$/i.exec(file.name)?.[0].toLowerCase()??'')});
     this.readFile=readFile;this.stagingRoot=stagingRoot;
   }
   private async docker(args:string[],signal:AbortSignal|undefined,maxBytes=131072,input?:Uint8Array):Promise<{code:number;bytes:Buffer}> {
@@ -67,6 +67,7 @@ export class IsolatedWorkspace {
     this.directory=await mkdtemp(join(this.stagingRoot,'verfix-workspace-'));
     const materials=join(this.directory,'materials');await mkdir(materials,{mode:0o755});await chmod(materials,0o755);
     for(const file of this.materials){
+      if(!file.path)continue;
       if(!/^[a-f0-9-]{36}$/.test(file.id))throw new Error('Invalid material');
       const name=file.path.split('/').at(-1)!;
       await writeFile(join(materials,name),this.readFile(file.id),{mode:0o444});await chmod(join(materials,name),0o444);

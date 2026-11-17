@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileConfigSource } from "../src/config.ts";
 import { SqliteStore } from "../src/store.ts";
-import { AttachmentError, ImageGenerationError, ModelSelectionError } from "../src/contracts.ts";
+import { AttachmentError, ImageGenerationError, ModelContextError, ModelSelectionError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
 import { TelegramError } from "../src/telegram/transport.ts";
@@ -55,6 +55,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
     answerCallback: async () => {},
   };
   const engine: ModelEngine = {
+    summarize: async ({summary, text}) => summary ?? text.slice(0, 1000),
     run: async (r) => {
       requests.push(r);
       await r.onThread(`thread-${r.userId}`);
@@ -744,21 +745,164 @@ test("prepared images respect the byte budget and many small pages can be retrie
   assert.equal(f.requests[0].attachments[0].images.length, 101);
 });
 
-test("cumulative serialized material context is bounded and /new makes room for a fresh task", async (t) => {
-  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "", images: [{ name: "scan.png", mime: "image/png", base64: Buffer.alloc(3_000_000).toString("base64") }] })) });
-  f.telegram.downloadFile = async () => new Uint8Array(4);
-  for (let i = 0; i < 3; i++) {
+test("large earlier scans do not block new files, and remain readable after compaction and restart", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "", images: [{ name: "scan.png", mime: "image/png", base64: Buffer.alloc(file.name === "0.pdf" || file.name === "1.pdf" ? 4_480_000 : 50_000).toString("base64") }] })) });
+  f.engine.summarize = async ({summary, text}) => summary ?? (text.includes("Compare by invoice date") ? "Compare by invoice date" : "Earlier scans read");
+  f.telegram.downloadFile = async (id) => Buffer.from(id);
+  for (let i = 0; i < 8; i++) {
+    if (i === 2) await f.reopen();
+    if (i === 0) {
+      await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "0.pdf", "Compare by invoice date"));
+      await f.bot.drain();
+      continue;
+    }
     await f.bot.handleUpdate(fileUpdate(f.update(2, ""), `${i}.pdf`, "Read"));
     await f.bot.drain();
   }
-  assert.equal(f.requests.length, 2);
-  assert.match(f.sent.at(-1)!.text, /\/new/);
+  assert.equal(f.requests.length, 8);
+  assert.equal(f.store.get(2, 10).summary, "Compare by invoice date");
+  assert.ok(Buffer.byteLength(JSON.stringify(f.store.get(2, 10).history)) < 4_000_000);
+  const request = f.requests.at(-1);
+  const original = request.files.find((file: any) => file.name === "0.pdf");
+  assert.ok(original);
+  assert.equal(Buffer.from(request.readFile(original.id)).toString(), "0.pdf");
+  assert.equal(Buffer.from(f.requests[2].attachments[0].images[0].base64, "base64").length, 50_000);
+  assert.equal(f.requests[2].summary, "Compare by invoice date");
   await f.bot.handleUpdate(f.update(2, "/new"));
   await f.bot.drain();
-  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "new.pdf", "Read"));
+  assert.equal(f.store.get(2, 10).summary, undefined);
+  assert.deepEqual(f.store.listFiles({userId: 2, topicId: 10}), []);
+});
+
+test("text summaries survive a failed update, multiple compactions, restart and confirmed deletion", async (t) => {
+  const f = fixture(t);
+  const address = {userId: 2, topicId: 10};
+  const original = "Use Samara time in the final report";
+  const clarification = "Record the date as 17 November";
+  const summaries: Array<string | undefined> = [];
+  f.engine.summarize = async ({summary, text}) => {
+    summaries.push(summary);
+    assert.ok(text.length <= 12_000);
+    return summary ?? original;
+  };
+  for (const text of [original, "Two", "Three", "Four", "Five", "Six"]) {
+    await f.bot.handleUpdate(f.update(2, text));
+    await f.bot.drain();
+  }
+  const completed = f.store.get(address);
+  const summarize = f.engine.summarize;
+  f.engine.summarize = async () => { throw new Error("interrupted compaction"); };
+  await f.bot.handleUpdate(f.update(2, "Try to update"));
   await f.bot.drain();
-  assert.equal(f.requests.length, 3);
-  assert.deepEqual(f.requests[2].history, []);
+  assert.match(f.sent.at(-1)!.text, /Не удалось обновить сводку/);
+  assert.deepEqual(f.store.get(address).history, completed.history);
+  assert.equal(f.store.get(address).threadId, completed.threadId);
+
+  f.engine.summarize = summarize;
+  for (const text of ["Seven", "Eight", "Nine", "Ten", "Eleven", clarification]) {
+    await f.bot.handleUpdate(f.update(2, text));
+    await f.bot.drain();
+  }
+  assert.ok(summaries.includes(original));
+  assert.ok(f.store.get(address).history.length <= 14);
+  await f.reopen();
+  const run = f.engine.run;
+  f.engine.run = async () => { throw new Error("interrupted turn"); };
+  await f.bot.handleUpdate(f.update(2, "Interrupt native thread"));
+  await f.bot.drain();
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "What were the instructions?"));
+  await f.bot.drain();
+  const request = f.requests.at(-1);
+  assert.equal(request.threadId, undefined);
+  assert.equal(request.summary, original);
+  assert.ok(request.history.some((message: any) => message.text === clarification));
+
+  await f.bot.handleUpdate(f.update(2, "/delete"));
+  await f.bot.drain();
+  const confirmation = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  const callback = f.update(2, "");
+  await f.bot.handleUpdate({update_id: callback.update_id, callback_query: {
+    id: "confirm-summary-delete", from: {id: 2}, message: callback.message!, data: confirmation,
+  }});
+  await f.bot.drain();
+  assert.equal(f.store.get(address).summary, undefined);
+  assert.deepEqual(f.store.get(address).history, []);
+});
+
+test("a context-window error on a resumed turn retries the same task with a compacted thread", async (t) => {
+  const f = fixture(t);
+  const address = {userId: 2, topicId: 10};
+  await f.bot.handleUpdate(f.update(2, "Use Samara time"));
+  await f.bot.drain();
+  const firstThread = f.store.get(address).threadId;
+  const retired: string[] = [];
+  f.engine.deleteThread = async id => { retired.push(id); };
+  f.engine.summarize = async ({text}) => {
+    assert.match(text, /Use Samara time/);
+    return "Use Samara time";
+  };
+  const run = f.engine.run;
+  let attempts = 0;
+  f.engine.run = async request => {
+    if (++attempts === 1) {
+      assert.equal(request.threadId, firstThread);
+      await request.onThread(firstThread!);
+      throw new ModelContextError();
+    }
+    assert.equal(request.threadId, undefined);
+    assert.deepEqual(request.history, []);
+    assert.equal(request.summary, "Use Samara time");
+    return run(request);
+  };
+  await f.bot.handleUpdate(f.update(2, "What time zone?"));
+  await f.bot.drain();
+  assert.equal(attempts, 2);
+  assert.deepEqual(retired, [firstThread]);
+  assert.equal(f.sent.at(-1)!.text, "answer What time zone?");
+});
+
+test("compacting an existing topic keeps prepared scans and retries an already saved upload", async (t) => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({
+    name: file.name, text: Buffer.from(file.bytes).toString(), images: [],
+  }))});
+  const address = {userId: 2, topicId: 10};
+  const pending = f.store.saveFile(address, {name: "pending.pdf", mime: "application/pdf", bytes: Buffer.from("already uploaded")});
+  let downloads = 0;
+  f.telegram.downloadFile = async () => { downloads++; throw new Error("not needed"); };
+  const attachment = {
+    name: "legacy-scan.pdf", text: "Earlier total",
+    images: [{name: "legacy.png", mime: "image/png" as const, base64: Buffer.alloc(4_480_000).toString("base64")}],
+  };
+  f.store.put({...address, threadId: "old-native", pending: {
+    refs: [{fileId: "telegram-pending", name: pending.name, mime: pending.mime, source: "document"}],
+    captions: [], savedFiles: {"telegram-pending": pending.id},
+  }, history: [
+    {role: "user", text: "Read the old scan", attachments: [attachment]},
+    {role: "assistant", text: "Old scan read"},
+    {role: "user", text: "Read the second scan", attachments: [{...attachment, name: "other.pdf"}]},
+    {role: "assistant", text: "Second scan read"},
+  ]});
+  const retired: string[] = [];
+  f.engine.deleteThread = async id => { retired.push(id); };
+  f.engine.summarize = async ({text}) => {
+    assert.match(text, /legacy-scan\.pdf/);
+    return "Refer to legacy-scan.pdf for the old total.";
+  };
+  await f.bot.handleUpdate(f.update(2, "Compare to the old scan"));
+  await f.bot.drain();
+  const request = f.requests[0];
+  assert.equal(request.threadId, undefined);
+  assert.equal(downloads, 0);
+  assert.equal(request.attachments[0].text, "already uploaded");
+  assert.deepEqual(retired, ["old-native"]);
+  assert.match(request.summary, /legacy-scan\.pdf/);
+  const saved = request.files.find((file: any) => file.name === attachment.name);
+  assert.equal(saved.prepared, true);
+  assert.deepEqual(JSON.parse(Buffer.from(request.readFile(saved.id)).toString()), attachment);
+  assert.deepEqual(f.store.listFiles({userId: 2, topicId: 11}), []);
+  assert.throws(() => f.store.readFile({userId: 2, topicId: 11}, saved.id), /недоступен/);
+  assert.throws(() => f.store.readFile({userId: 1, topicId: 10}, saved.id), /недоступен/);
 });
 
 test("revocation during download cancels the batch before the next file and pending refs remain isolated", async (t) => {
@@ -828,7 +972,9 @@ test("committed images and text survive restart and a failed follow-up rebuilds 
   await f.bot.drain();
   assert.equal(f.requests.at(-1).threadId, undefined);
   assert.deepEqual(f.requests.at(-1).history, [
-    { role: "user", text: "Read", attachments: prepared },
+    { role: "user", text: "Read", attachments: prepared, materials: [
+      {id: f.store.listFiles({userId: 2, topicId: 10})[0]!.id, name: "scan.pdf"},
+    ] },
     { role: "assistant", text: "answer Read" },
   ]);
 });

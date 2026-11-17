@@ -35,7 +35,6 @@ export const ATTACHMENT_LIMITS = {
   batchBytes: 50_000_000,
   imageBytes: 6_000_000,
   textBytes: 500_000,
-  dialogueBytes: 12_000_000,
   albumQuietMs: 1500,
 } as const;
 
@@ -73,6 +72,13 @@ export interface AttachmentReader {
 
 export class AttachmentError extends Error {
   constructor(message: string) { super(message); this.name = "AttachmentError"; }
+}
+
+export class ModelContextError extends AttachmentError {
+  constructor() {
+    super("Задание превышает окно контекста модели. Сократите текст или разделите вложения.");
+    this.name = "ModelContextError";
+  }
 }
 
 export const GENERATED_IMAGE_LIMITS = {
@@ -118,7 +124,8 @@ export interface SendOptions {
 }
 
 export interface GeneratedFile { bytes: Uint8Array; name: string; mime: string; }
-export interface DialogueFile { id: string; name: string; mime: string; size: number; }
+export interface MaterialReference { id: string; name: string; }
+export interface DialogueFile extends MaterialReference { mime: string; size: number; prepared?: true; }
 export const RESPONSE_FILE_LIMITS = { files: 10, fileBytes: 50_000_000, dialogueBytes: 500_000_000 } as const;
 export class ResponseFileError extends Error {
   constructor(message: string) { super(message); this.name = "ResponseFileError"; }
@@ -171,6 +178,13 @@ export interface ConversationMessage {
   role: "user" | "assistant";
   text: string;
   attachments?: PreparedAttachment[];
+  materials?: MaterialReference[];
+}
+
+export interface SummaryRequest extends ModelSelection {
+  summary?: string;
+  text: string;
+  signal: AbortSignal;
 }
 
 export interface ModelInfo {
@@ -191,6 +205,7 @@ export interface ModelRequest extends ModelSelection {
   threadId?: string;
   text: string;
   history?: ConversationMessage[];
+  summary?: string;
   attachments?: PreparedAttachment[];
   files?: DialogueFile[];
   readFile?: (id: string) => Uint8Array;
@@ -206,10 +221,12 @@ export interface ModelResponse {
   threadId: string;
   images: GeneratedImage[];
   fileIds?: string[];
+  contextPressure?: boolean;
 }
 
 export interface ModelEngine {
   run(request: ModelRequest): Promise<ModelResponse>;
+  summarize(request: SummaryRequest): Promise<string>;
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   deleteThread(threadId: string): Promise<void>;
   bindLegacyThread(threadId: string, address: DialogueAddress): Promise<void>;

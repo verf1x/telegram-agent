@@ -4,13 +4,17 @@ import {crc32} from 'node:zlib';
 import {existsSync,readFileSync,unlinkSync,writeFileSync} from 'node:fs';
 const memory=process.env.CODEX_HOME+'/fake-memory';
 const catalogError=process.env.CODEX_HOME+'/fake-catalog-error';
-let toolTurn,threadParams,threadMethod,fileScenario,fileStep=0;
+let toolTurn,threadParams,threadMethod,fileScenario,fileStep=0,modelInstructions,inspectMaterial;
+const instructions=process.env.CODEX_HOME+'/fake-instructions';
 const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
 const chunk=(kind,data)=>{const bytes=Buffer.alloc(data.length+12);bytes.writeUInt32BE(data.length);bytes.write(kind,4);data.copy(bytes,8);bytes.writeUInt32BE(crc32(bytes.subarray(4,-4)),bytes.length-4);return bytes;};
 const paddedPng=size=>{const png=readFileSync(new URL('./attachments/tiny.png',import.meta.url));return Buffer.concat([png.subarray(0,-12),chunk('vpAg',Buffer.alloc(size-png.length-12)),png.subarray(-12)]);};
 const dimensions=(width,height)=>{const png=readFileSync(new URL('./attachments/tiny.png',import.meta.url));png.writeUInt32BE(width,16);png.writeUInt32BE(height,20);png.writeUInt32BE(crc32(png.subarray(12,29)),29);return png;};
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const x=JSON.parse(line);
+ if(inspectMaterial&&x.id===998&&(x.result||x.error)){
+  send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify(x.result??x.error)}]}}});return;
+ }
  if(fileScenario&&x.id===999&&(x.result||x.error)){
   if(fileStep++===0){send({id:999,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'export-1',tool:'export_files',arguments:{files:[...(fileScenario==='missing-first'?[{path:'/work/missing.csv',name:'missing.csv',mime:'text/csv'}]:[]),{path:'/work/result.csv',name:'result.csv',mime:'text/csv'},...(fileScenario==='partial'?[{path:'/work/missing.csv',name:'missing.csv',mime:'text/csv'}]:[])]}}});return;}
   send({method:'turn/completed',params:{threadId:toolTurn,turn:{id:'turn-1',status:fileScenario==='partial'?'failed':'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'Created CSV'}]}}});return;
@@ -22,12 +26,41 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  }
  else if(x.method==='model/list')send({id:x.id,result:{data:[{model:'gpt-6.2-sol',displayName:'GPT-6.2-Sol',supportedReasoningEfforts:[{reasoningEffort:'low'},{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']},{model:'gpt-6.1-sol',displayName:'Sol',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'low',inputModalities:['text','image']},{model:'text-only',displayName:'Text Only',supportedReasoningEfforts:[{reasoningEffort:'medium'}],defaultReasoningEffort:'medium',inputModalities:['text']}],nextCursor:null}});
  else if(x.method==='account/read')send({id:x.id,result:{account:{type:'chatgpt'}}});
- else if(x.method==='thread/start'||x.method==='thread/resume'){threadParams=x.params;threadMethod=x.method;send({id:x.id,result:{model:x.params.model,thread:{id:x.params.threadId??'native-thread'}}});}
+ else if(x.method==='thread/start'||x.method==='thread/resume'){
+  threadParams=x.params;threadMethod=x.method;
+  // Native resume retains the original model-visible instructions even when
+  // developerInstructions is supplied again in the resume request.
+  if(x.method==='thread/start')writeFileSync(instructions,x.params.developerInstructions);
+  modelInstructions=readFileSync(instructions,'utf8');
+  send({id:x.id,result:{model:x.params.model,thread:{id:x.params.threadId??'native-thread'}}});
+ }
+ else if(x.method==='thread/inject_items'){
+  const item=x.params.items.at(-1);
+  modelInstructions=item.content.map(c=>c.text).join('\n');writeFileSync(instructions,modelInstructions);
+  send({id:x.id,result:{}});
+ }
  else if(x.method==='turn/start'){
-  send({id:x.id,result:{turn:{id:'turn-1'}}});
   const text=x.params.input[0].text;
+  send({id:x.id,result:{turn:{id:'turn-1'}}});
+  if(threadParams.ephemeral){
+   const data=JSON.parse(text);
+   const summary=JSON.stringify({data,dynamicTools:threadParams.dynamicTools,permissions:threadParams.permissions});
+   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:summary}]}}});return;
+  }
+  const material=x.params.input.find(item=>item.text?.startsWith('read-material:'));
+  if(material){
+   toolTurn=x.params.threadId;inspectMaterial=true;
+   send({id:998,method:'item/tool/call',params:{threadId:toolTurn,turnId:'turn-1',callId:'material-1',tool:'dialogue_materials',arguments:{id:material.text.slice('read-material:'.length)}}});return;
+  }
   if(text==='model-not-found'){
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'failed',items:[],error:{message:'PRIVATE',codexErrorInfo:'modelNotFound'}}}});return;
+  }
+  if(text==='context-window-exceeded'){
+   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'failed',items:[],error:{codexErrorInfo:'contextWindowExceeded'}}}});return;
+  }
+  if(text==='context-window-pressure'){
+   send({method:'thread/tokenUsage/updated',params:{threadId:x.params.threadId,turnId:'turn-1',tokenUsage:{modelContextWindow:50_000,last:{totalTokens:26_000}}}});
+   send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:'Answered within model window'}]}}});return;
   }
   if(x.params.input.some(item=>item.type==='text'&&item.text==='inspect-input')){
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:'completed',items:[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify(x.params.input)}]}}});return;
@@ -87,7 +120,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     items=sizes.map((size,index)=>({...image('large-'+index),result:paddedPng(size).toString('base64')}));
     if(scenario==='max-budget')items.unshift({id:'user-input',type:'userMessage',content:x.params.input});
    }
-   if(scenario==='policy')items=[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify({config:readFileSync(process.env.CODEX_HOME+'/config.toml','utf8'),threadParams,threadMethod,turnParams:x.params})}];
+   if(scenario==='policy')items=[{id:'a',type:'agentMessage',phase:'final_answer',text:JSON.stringify({config:readFileSync(process.env.CODEX_HOME+'/config.toml','utf8'),threadParams,threadMethod,modelInstructions,turnParams:x.params})}];
    send({method:'turn/completed',params:{threadId:x.params.threadId,turn:{id:'turn-1',status:['failed-turn','completed-failed-turn'].includes(scenario)?'failed':'completed',items}}});return;
   }
   if(text==='wait')return;
