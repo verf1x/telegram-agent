@@ -129,6 +129,11 @@ export interface SendOptions {
   signal?: AbortSignal;
 }
 
+export interface DraftOptions {
+  thinking?: boolean;
+  signal?: AbortSignal;
+}
+
 export interface GeneratedFile { bytes: Uint8Array; name: string; mime: string; }
 export interface MaterialReference { id: string; name: string; }
 export interface DialogueFile extends MaterialReference { mime: string; size: number; prepared?: true; }
@@ -145,7 +150,7 @@ export interface TelegramTransport {
     signal?: AbortSignal;
   }): Promise<TelegramUpdate[]>;
   sendText(chatId: ChatId, text: string, options?: SendOptions): Promise<number>;
-  sendDraft?(chatId: ChatId, draftId: number, text: string, topicId: number, signal?: AbortSignal): Promise<void>;
+  sendDraft?(chatId: ChatId, draftId: number, text: string, topicId: number, options?: DraftOptions): Promise<void>;
   deleteMessage?(chatId: ChatId, messageId: number, signal?: AbortSignal): Promise<void>;
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
   typing(chatId: ChatId, signal?: AbortSignal, topicId?: number | undefined): Promise<void>;

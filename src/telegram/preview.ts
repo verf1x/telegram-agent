@@ -4,11 +4,11 @@ import { TelegramError } from './transport.ts';
 export const STOP_CALLBACK = 'stop:';
 
 const stages = {
-  responding: 'Готовлю ответ…',
-  computing: 'Выполняю вычисления…',
-  documents: 'Работаю с файлами…',
-  images: 'Создаю изображение…',
-  searching: 'Ищу информацию…',
+  responding: 'Готовлю ответ',
+  computing: 'Выполняю вычисления',
+  documents: 'Работаю с файлами',
+  images: 'Создаю изображение',
+  searching: 'Ищу информацию',
 } satisfies Record<Extract<ModelProgress, {kind: 'stage'}>['stage'], string>;
 
 export class DraftRateLimit {
@@ -46,7 +46,7 @@ export class RequestPreview {
   private readonly options: PreviewOptions;
   private text = '';
   private status = '';
-  private published: string | undefined;
+  private published: {text: string; thinking: boolean} | undefined;
   private publishedAt = 0;
   private needsRefresh = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -99,24 +99,28 @@ export class RequestPreview {
     const {chatId, signal, isAllowed, rateLimit} = this.options;
     if (this.closed || signal.aborted || this.inFlight || this.fallback) return;
     if (!isAllowed()) { this.schedule(1000); return; }
-    const text = this.text.trim() ? this.text : this.status;
+    const thinking = !this.text.trim();
+    const text = thinking ? this.status : this.text;
     const refresh = this.publishedAt + 15_000 - Date.now();
-    if (!this.needsRefresh && text === this.published && refresh > 0) { this.schedule(refresh); return; }
+    if (!this.needsRefresh && this.published?.text === text && this.published.thinking === thinking && refresh > 0) {
+      this.schedule(refresh);
+      return;
+    }
     const wait = rateLimit.acquire(chatId);
     if (wait) { this.schedule(wait); return; }
     clearTimeout(this.timer);
     this.needsRefresh = false;
-    this.inFlight = this.publish(text).finally(() => {
+    this.inFlight = this.publish(text, thinking).finally(() => {
       this.inFlight = undefined;
       this.flush();
     });
   }
 
-  private async publish(text: string): Promise<void> {
+  private async publish(text: string, thinking: boolean): Promise<void> {
     const {telegram, chatId, topicId, rateLimit, signal, isAllowed, rememberFallback} = this.options;
     try {
-      await telegram.sendDraft!(chatId, this.draftId, text, topicId);
-      this.published = text;
+      await telegram.sendDraft!(chatId, this.draftId, text, topicId, {thinking});
+      this.published = {text, thinking};
       this.publishedAt = Date.now();
       this.failures = 0;
     } catch (error) {
