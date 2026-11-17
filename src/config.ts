@@ -95,7 +95,7 @@ export class FileConfigSource implements ConfigSource {
       databasePath: resolve(env.DATABASE_PATH || "./runtime/bot.sqlite"),
       runtimeDir: resolve(env.RUNTIME_DIR || "./runtime"),
       maxConcurrentRequests: positive("MAX_CONCURRENT_REQUESTS", 4),
-      requestTimeoutMs: positive("REQUEST_TIMEOUT_MS", 900000),
+      requestTimeoutMs: positive("REQUEST_TIMEOUT_MS", 1_200_000),
       dialogueFileBytes: positive("DIALOGUE_FILE_BYTES", 500_000_000),
       pollTimeoutSeconds: positive("POLL_TIMEOUT_SECONDS", 30, 50),
       configReloadIntervalMs: positive("CONFIG_RELOAD_INTERVAL_MS", 500),

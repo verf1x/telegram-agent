@@ -133,9 +133,28 @@ test('raw upload counts and byte budgets reject before parsing',{skip:!pythonPat
  await assert.rejects(reader.prepare([large],signal),/Разделите/);
  await assert.rejects(reader.prepare(Array(3).fill({...small,bytes:Buffer.alloc(17_000_000)}),signal),/Разделите/);
 });
-test('encrypted members, symlink archives and unreadably tall screenshots ask for correction',{skip:!pythonPath},async()=>{
+test('encrypted members and symlink archives ask for correction',{skip:!pythonPath},async()=>{
  const reader=new SandboxedAttachmentReader({pythonPath});
- for(const name of ['encrypted.docx','symlink.docx','too-tall.png'])await assert.rejects(reader.prepare([await fixture(name,name.endsWith('png')?'image/png':'application/octet-stream')],new AbortController().signal),{name:'AttachmentError'});
+ for(const name of ['encrypted.docx','symlink.docx'])await assert.rejects(reader.prepare([await fixture(name,'application/octet-stream')],new AbortController().signal),{name:'AttachmentError'});
+});
+
+test('elongated screenshots keep the full image in ordered readable strips',{skip:!pythonPath},async()=>{
+ const reader=new SandboxedAttachmentReader({pythonPath});
+ const source=await fixture('too-tall.png','image/png');
+ const original=Buffer.from(source.bytes);
+ const [prepared]=await reader.prepare([source],new AbortController().signal);
+ assert.match(prepared!.text,/фрагментами с перекрытием/);
+ assert.ok(prepared!.images.length>1);
+ let coveredHeight=0;
+ for(const [index,image] of prepared!.images.entries()){
+  assert.equal(image.name,`too-tall.png — ${index+1}.png`);
+  const bytes=Buffer.from(image.base64,'base64');
+  const width=bytes.readUInt32BE(16),height=bytes.readUInt32BE(20);
+  assert.equal(width,original.readUInt32BE(16));
+  assert.ok(height<=width*5);
+  coveredHeight+=height;
+ }
+ assert.ok(coveredHeight>=original.readUInt32BE(20));
 });
 test('cancellation stops parsing promptly and a later task can still be read',{skip:!pythonPath},async()=>{
  const reader=new SandboxedAttachmentReader({pythonPath});const abort=new AbortController();

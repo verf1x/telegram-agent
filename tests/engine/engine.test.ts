@@ -7,12 +7,17 @@ import { CodexEngine } from '../../src/codex/engine.ts';
 import { RequestStopped, type ModelProgress } from '../../src/contracts.ts';
 
 const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jhH8AAAAASUVORK5CYII=';
-test('prepared documents and images reach native input in attachment order with their complete text',async()=>{
+test('native input includes complete prepared material and references to originals in attachment order',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
  try {
   const complete='First page\n'+('полный текст '.repeat(10000))+'\nEND';
-  const response=await engine.run({userId:1,text:'inspect-input',attachments:[{name:'../scan.pdf',text:complete,images:[{name:'page-1.png',mime:'image/png',base64:png}]},{name:'notes.txt',text:'Second document',images:[]}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
+  const id='11111111-1111-4111-8111-111111111111';
+  const response=await engine.run({userId:1,text:'inspect-input',attachments:[
+   {name:'../scan.pdf',text:complete,images:[{name:'page-1.png',mime:'image/png',base64:png}]},
+   {name:'page.html',text:'',images:[],originalFileId:id},
+   {name:'notes.txt',text:'Second document',images:[]},
+  ],files:[{id,name:'page.html',mime:'text/html',size:4}],model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}});
   const input=JSON.parse(response.text);
   assert.deepEqual(input.filter((x:any)=>x.type==='image'),[{type:'image',url:'data:image/png;base64,'+png}]);
   const texts=input.filter((x:any)=>x.type==='text').map((x:any)=>x.text);
@@ -20,7 +25,10 @@ test('prepared documents and images reach native input in attachment order with 
   assert.ok(texts.some((text:string)=>text.includes('../scan.pdf')));
   assert.ok(texts.some((text:string)=>text.includes('Second document')));
   assert.ok(texts.every((text:string)=>!text.includes(png)));
-  assert.ok(input.findIndex((x:any)=>x.type==='image')<input.findIndex((x:any)=>x.text?.includes('Second document')));
+  const originalIndex=input.findIndex((x:any)=>x.text?.includes(id));
+  assert.match(input[originalIndex]?.text??'',/page\.html.*isolated document workspace/);
+  assert.ok(input.findIndex((x:any)=>x.type==='image')<originalIndex);
+  assert.ok(originalIndex<input.findIndex((x:any)=>x.text?.includes('Second document')));
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
@@ -400,7 +408,7 @@ test('native artwork without assistant prose still returns an image and a friend
 });
 
 
-test('new and restarted dialogs enable native artwork while retaining the isolated worker policy',async()=>{
+test('new and restarted dialogs enable artwork and documents while retaining the isolated worker policy',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
  let engine=new CodexEngine(options);
@@ -422,12 +430,15 @@ test('new and restarted dialogs enable native artwork while retaining the isolat
    assert.match(report.threadParams.developerInstructions,/image_gen__imagegen/);
    assert.match(report.threadParams.developerInstructions,/num_last_images_to_include/);
    assert.match(report.threadParams.developerInstructions,/API key/);
+   assert.match(report.threadParams.developerInstructions,/isolated_workspace/);
+   assert.match(report.threadParams.developerInstructions,/export_files/);
+   assert.match(report.threadParams.developerInstructions,/Existing threads may expose only isolated_compute/);
    if(index===0)assert.deepEqual(report.threadParams.dynamicTools.map((tool:any)=>tool.name),['isolated_compute','isolated_workspace','export_files','dialogue_materials']);
   }
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
-test('resumed native threads can find current materials using the legacy tool',async()=>{
+test('resume refreshes model-visible document instructions and current materials in legacy native history',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const options={runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')};
  let engine=new CodexEngine(options);
@@ -441,7 +452,9 @@ test('resumed native threads can find current materials using the legacy tool',a
   const resumed=await engine.run({...base,threadId:first.threadId,files});
   assert.equal(resumed.threadId,first.threadId);
   const report=JSON.parse(resumed.text);
-  assert.match(report.modelInstructions,/dialogue_materials/);
+  assert.match(report.modelInstructions,/isolated_workspace/);
+  assert.match(report.modelInstructions,/export_files/);
+  assert.match(report.modelInstructions,/Existing threads may expose only isolated_compute/);
   assert.match(report.modelInstructions,/saved\.pdf/);
   assert.match(report.modelInstructions,/\/work\/materials\/11111111-1111-4111-8111-111111111111\.pdf/);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}

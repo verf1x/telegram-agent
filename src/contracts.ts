@@ -64,6 +64,8 @@ export interface PreparedAttachment {
   name: string;
   text: string;
   images: InputImage[];
+  /** The original is available in the document workspace when preparation did not produce inline content. */
+  originalFileId?: string;
 }
 
 export interface AttachmentReader {

@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "node --test",
+    "prestart": "npm run build",
     "start": "node --enable-source-maps dist/main.js"
   },
   "devDependencies": {

@@ -995,28 +995,34 @@ test("actual oversized downloads never start partial analysis and pending materi
   assert.equal(f.requests[0].attachments[0].name, "large.txt");
 });
 
-test("prepared text over the batch limit is rejected without silently truncating the document", async (t) => {
-  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "x".repeat(500_001), images: [] })) });
+test("prepared text over the batch budget falls back to the original and keeps earlier prepared text", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "x".repeat(250_001), images: [] })) });
   f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "long.txt", "Summarize"));
   await f.bot.drain();
-  assert.equal(f.requests.length, 0);
-  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
+  assert.equal(f.requests.length, 1);
+  const request = f.requests[0];
+  const original = request.files.find((file: any) => file.name === "long.txt");
+  assert.equal(request.attachments[0].text.length, 250_001);
+  assert.deepEqual(request.attachments[1], {name: "long.txt", text: "", images: [], originalFileId: original.id});
 });
 
-test("prepared images respect the byte budget and many small pages can be retried before model analysis", async (t) => {
+test("oversized prepared images fall back to the original while many small pages still reach the model", async (t) => {
   let images = [{ name: "scan.png", mime: "image/png" as const, base64: Buffer.alloc(6_000_001).toString("base64") }];
   const f = fixture(t, { prepare: async () => [{ name: "scan.pdf", text: "", images }] });
   f.telegram.downloadFile = async () => new Uint8Array(4);
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "scan.pdf", "Read"));
   await f.bot.drain();
-  assert.equal(f.requests.length, 0);
-  assert.match(f.sent.at(-1)!.text, /раздел|\/new/i);
-  images = Array.from({ length: 101 }, (_, i) => ({ name: `page-${i}.png`, mime: "image/png" as const, base64: "AA==" }));
-  await f.bot.handleUpdate(f.update(2, "Retry"));
-  await f.bot.drain();
   assert.equal(f.requests.length, 1);
-  assert.equal(f.requests[0].attachments[0].images.length, 101);
+  assert.deepEqual(f.requests[0].attachments[0], {
+    name: "scan.pdf", text: "", images: [], originalFileId: f.requests[0].files[0].id,
+  });
+  images = Array.from({ length: 101 }, (_, i) => ({ name: `page-${i}.png`, mime: "image/png" as const, base64: "AA==" }));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "scan.pdf", "Read again"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests[1].attachments[0].images.length, 101);
 });
 
 test("large earlier scans do not block new files, and remain readable after compaction and restart", async (t) => {
@@ -1392,32 +1398,42 @@ test("the request deadline also bounds an unresponsive attachment download", asy
   assert.match(f.sent.at(-1)!.text, /Время обработки/i);
 });
 
-test("a reader that omits a failed file cannot start analysis of a partial batch", async (t) => {
-  const f = fixture(t, { prepare: async (files) => [{ name: files[0]!.name, text: "only first file", images: [] }] });
-  f.telegram.downloadFile = async () => new Uint8Array(4);
-  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
-  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt"));
+test("an unreadable HTML file reaches the engine as an original alongside successfully prepared text", {skip: !process.env.VERFIX_TEST_PYTHON}, async (t) => {
+  const f = fixture(t, new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON!}));
+  const html = Buffer.from("<html>\xcf\xf0\xe8\xe2\xe5\xf2</html>", "latin1");
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => {
+    downloads.push(id);
+    return id === "page.html" ? html : Buffer.from("readable notes");
+  };
+  const upload = fileUpdate(f.update(2, ""), "page.html");
+  upload.message!.document!.mime_type = "text/html";
+  upload.message!.document!.file_size = html.length;
+  await f.bot.handleUpdate(upload);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt"));
   await f.bot.handleUpdate(f.update(2, "Compare both"));
   await f.bot.drain();
-  assert.equal(f.requests.length, 0);
-  assert.match(f.sent.at(-1)!.text, /все|материал|повтор/i);
+  assert.equal(f.requests.length, 1);
+  const request = f.requests[0];
+  const original = request.files.find((file: any) => file.name === "page.html");
+  assert.deepEqual(request.attachments, [
+    {name: "page.html", text: "", images: [], originalFileId: original.id},
+    {name: "notes.txt", text: "readable notes", images: []},
+  ]);
+  assert.deepEqual(Buffer.from(request.readFile(original.id)), html);
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.equal(f.requests[1].attachments, undefined);
+  assert.deepEqual(downloads, ["page.html", "notes.txt"]);
 });
 
-test("safe reader and model attachment errors retain the whole batch for an explicit retry", async (t) => {
-  let readerFails = true;
-  const f = fixture(t, { prepare: async (files) => {
-    if (readerFails) throw new AttachmentError("Документ повреждён. Исправьте материалы и повторите задание.");
-    return files.map((file) => ({ name: file.name, text: "ok", images: [] }));
-  } });
+test("a model attachment error retains pending originals for an explicit retry", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
   f.telegram.downloadFile = async () => new Uint8Array(4);
-  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt", "Read"));
-  await f.bot.drain();
-  assert.equal(f.requests.length, 0);
-  assert.match(f.sent.at(-1)!.text, /Документ повреждён/);
-  readerFails = false;
   const original = f.engine.run;
   f.engine.run = async () => { throw new AttachmentError("Выбранная модель не принимает изображения. Выберите другую модель."); };
-  await f.bot.handleUpdate(f.update(2, "Retry"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt", "Read"));
   await f.bot.drain();
   assert.match(f.sent.at(-1)!.text, /не принимает изображения/);
   f.engine.run = original;

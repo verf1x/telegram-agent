@@ -18,6 +18,7 @@ from PIL import Image, ImageOps
 
 MAX_TEXT = 500_000
 MAX_IMAGE_BYTES = 6_000_000
+MAX_SCREENSHOT_STRIPS = 32
 SPLIT = 'Материалы превышают лимит. Разделите их на несколько заданий.'
 INVALID = 'Не удалось прочитать файл. Проверьте формат или разделите материалы.'
 PDF_EXPORT = 'Документ содержит диаграммы, SmartArt или неподдерживаемые рисунки. Экспортируйте его в PDF и отправьте снова.'
@@ -28,8 +29,46 @@ class UnsupportedOffice(Rejected): pass
 images = []
 image_bytes = 0
 
-def add_image(data):
+def screenshot_strips(image):
+    width, height = image.size
+    horizontal = width > height
+    length, breadth = max(width, height), min(width, height)
+    if length <= 5 * breadth:
+        yield image
+        return
+    # Leave room for overlap so words and other details near a cut stay readable.
+    span = 4 * breadth
+    count = (length + span - 1) // span
+    if count > MAX_SCREENSHOT_STRIPS: raise Limit()
+    overlap = breadth // 4
+    for index in range(count):
+        start = max(0, index * length // count - overlap)
+        end = min(length, (index + 1) * length // count + overlap)
+        yield image.crop((start, 0, end, height) if horizontal else (0, start, width, end))
+
+def encode_image(image, source_format):
     global image_bytes
+    image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    # Composite transparent screenshots on white so formula ink stays
+    # legible. PNG preserves screenshot edges; JPEG bounds photographs.
+    if image.mode in ('RGBA', 'LA') or 'transparency' in image.info:
+        rgba = image.convert('RGBA')
+        background = Image.new('RGB', image.size, 'white')
+        background.paste(rgba, mask=rgba.getchannel('A'))
+        image = background
+    if source_format == 'PNG':
+        image.convert('RGB').save(output, format='PNG')
+        mime = 'image/png'
+    else:
+        image.convert('RGB').save(output, format='JPEG', quality=85, optimize=False)
+        mime = 'image/jpeg'
+    result = output.getvalue()
+    image_bytes += len(result)
+    if image_bytes > MAX_IMAGE_BYTES: raise Limit()
+    images.append({'mime': mime, 'base64': base64.b64encode(result).decode('ascii')})
+
+def add_image(data, *, allow_strips=False):
     warnings.simplefilter('error', Image.DecompressionBombWarning)
     Image.MAX_IMAGE_PIXELS = 32_000_000
     with Image.open(io.BytesIO(data)) as source:
@@ -37,26 +76,12 @@ def add_image(data):
             raise Rejected()
         source.load()
         image = ImageOps.exif_transpose(source)
-        if max(image.size)/min(image.size) > 5: raise Limit()
-        image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-        output = io.BytesIO()
-        # Composite transparent screenshots on white so formula ink stays
-        # legible. PNG preserves screenshot edges; JPEG bounds photographs.
-        if image.mode in ('RGBA', 'LA') or 'transparency' in image.info:
-            rgba = image.convert('RGBA')
-            background = Image.new('RGB', image.size, 'white')
-            background.paste(rgba, mask=rgba.getchannel('A'))
-            image = background
-        if source.format == 'PNG':
-            image.convert('RGB').save(output, format='PNG')
-            mime = 'image/png'
+        if allow_strips:
+            for strip in screenshot_strips(image):
+                encode_image(strip, source.format)
         else:
-            image.convert('RGB').save(output, format='JPEG', quality=85, optimize=False)
-            mime = 'image/jpeg'
-        result = output.getvalue()
-    image_bytes += len(result)
-    if image_bytes > MAX_IMAGE_BYTES: raise Limit()
-    images.append({'mime': mime, 'base64': base64.b64encode(result).decode('ascii')})
+            if max(image.size) > 5 * min(image.size): raise Limit()
+            encode_image(image, source.format)
     return '[Image '+str(len(images))+']'
 
 def local(tag):
@@ -356,7 +381,9 @@ class Office:
 
 def read(data, name, mime):
     if data.startswith((b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff')) or (data[:4] == b'RIFF' and data[8:12] == b'WEBP'):
-        add_image(data)
+        add_image(data, allow_strips=True)
+        if len(images) > 1:
+            return 'Изображение передано последовательными фрагментами с перекрытием.'
         return ''
     if data.startswith(b'%PDF-'):
         import pypdfium2 as pdfium

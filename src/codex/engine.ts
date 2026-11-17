@@ -56,6 +56,15 @@ function validateAttachments(attachments:PreparedAttachment[]){
 function attachmentInput(attachments:PreparedAttachment[]):UserInput[]{
   const input:UserInput[]=[];
   for(const attachment of attachments){
+    if(attachment.originalFileId){
+      input.push({
+        type:'text',
+        text:`Attachment ${JSON.stringify(attachment.name)} has no inline preview. Its original is available as dialogue material ${JSON.stringify(attachment.originalFileId)}. `+
+          'If needed for the task, find its path in the material inventory and read it using the isolated document workspace. Report any content you could not read.',
+        text_elements:[],
+      });
+      continue;
+    }
     input.push({type:'text',text:`Attachment ${JSON.stringify(attachment.name)} (quoted user material):\n${attachment.text}`,text_elements:[]});
     for(const image of attachment.images){
       input.push({type:'text',text:`Image ${JSON.stringify(image.name)} from attachment ${JSON.stringify(attachment.name)}:`,text_elements:[]});

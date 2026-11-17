@@ -578,7 +578,7 @@ export class BotController implements Bot {
       const materials: MaterialReference[] = [];
       if (request.attachments?.length) {
         this.preparing.add(dialogueKey(address));
-        if (!this.deps.attachments || !this.deps.telegram.downloadFile)
+        if (!this.deps.telegram.downloadFile)
           throw new AttachmentError("Обработка вложений сейчас недоступна. Повторите задание позже.");
         const files = [];
         let total = 0;
@@ -592,34 +592,47 @@ export class BotController implements Bot {
           const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
           if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes || total + remaining > ATTACHMENT_LIMITS.batchBytes)
             throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы на несколько заданий.");
-          files.push({ name: ref.name, mime: ref.mime, bytes });
           const current = this.deps.store.get(address);
-          if (current.pending && !current.pending.savedFiles?.[ref.fileId]) {
+          let materialId = current.pending?.savedFiles?.[ref.fileId];
+          if (!materialId) {
             const saved = this.deps.store.saveFile(address,{name:ref.name,mime:ref.mime,bytes},config.dialogueFileBytes);
-            (current.pending.savedFiles ??= {})[ref.fileId] = saved.id;
-            this.deps.store.put(current);
+            materialId = saved.id;
+            if (current.pending) {
+              (current.pending.savedFiles ??= {})[ref.fileId] = materialId;
+              this.deps.store.put(current);
+            }
           }
-          const materialId = current.pending?.savedFiles?.[ref.fileId];
-          if (materialId) materials.push({id: materialId, name: ref.name});
+          files.push({name: ref.name, mime: ref.mime, bytes, originalFileId: materialId});
+          materials.push({id: materialId, name: ref.name});
         }
         this.ensureActive(address, request.id, controller.signal);
-        try {
-          preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF…" : "Читаю вложения…");
-          attachments = await this.abortable(this.deps.attachments.prepare(files, controller.signal), controller.signal);
-        } catch (error) {
-          if (!(error instanceof AttachmentError) || !error.message.includes("Экспортируйте его в PDF")) throw error;
-          // Complex Office layouts still have their original bytes available to
-          // document tools. Never present an incomplete extraction as complete.
-          attachments = files.map(file=>({name:file.name,text:"Предварительное чтение оформления недоступно. Исходный файл сохранён в материалах диалога; изучите его инструментами среды документов. Сообщите о потерях оформления, если они неизбежны.",images:[]}));
+        preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF…" : "Читаю вложения…");
+        attachments = [];
+        let textBytes = 0;
+        let imageBytes = 0;
+        for (const file of files) {
+          let prepared: PreparedAttachment | undefined;
+          if (this.deps.attachments) {
+            try {
+              const result = await this.abortable(this.deps.attachments.prepare([file], controller.signal), controller.signal);
+              if (result.length === 1) prepared = result[0];
+            } catch (error) {
+              if (!(error instanceof AttachmentError)) throw error;
+            }
+            this.ensureActive(address, request.id, controller.signal);
+          }
+          if (prepared) {
+            const nextText = textBytes + Buffer.byteLength(prepared.text);
+            const nextImages = prepared.images.reduce((sum, image) => sum + Buffer.byteLength(image.base64, "base64"), imageBytes);
+            if (nextText <= ATTACHMENT_LIMITS.textBytes && nextImages <= ATTACHMENT_LIMITS.imageBytes) {
+              attachments.push(prepared);
+              textBytes = nextText;
+              imageBytes = nextImages;
+              continue;
+            }
+          }
+          attachments.push({name: file.name, text: "", images: [], originalFileId: file.originalFileId});
         }
-        this.ensureActive(address, request.id, controller.signal);
-        if (attachments.length !== files.length)
-          throw new AttachmentError("Не удалось подготовить все материалы. Файлы сохранены; повторите текст задания или используйте /new.");
-        const images = attachments.flatMap((a) => a.images);
-        if (images.reduce((n, i) => n + Buffer.byteLength(i.base64, "base64"), 0) > ATTACHMENT_LIMITS.imageBytes)
-          throw new AttachmentError("Слишком большой объём изображений во вложениях текущего задания. Разделите материалы на несколько заданий.");
-        if (attachments.reduce((n, a) => n + Buffer.byteLength(a.text), 0) > ATTACHMENT_LIMITS.textBytes)
-          throw new AttachmentError("Слишком много текста во вложениях текущего задания. Разделите материалы на несколько заданий.");
       }
       this.preparing.delete(dialogueKey(address));
       this.ensureActive(address, request.id, controller.signal);
