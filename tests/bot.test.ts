@@ -11,6 +11,7 @@ import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
 import { TelegramError } from "../src/telegram/transport.ts";
 import type {
   AttachmentReader,
+  ConfigSnapshot,
   ModelEngine,
   TelegramTransport,
   OutgoingPart,
@@ -19,13 +20,42 @@ import type {
 
 const generatedPng = readFileSync(new URL("./fixtures/attachments/tiny.png", import.meta.url));
 
+test("file configuration applies access changes only when a process starts", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "verfix-config-"));
+  const env = join(dir, ".env");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const initial = "TELEGRAM_BOT_TOKEN=123456:TEST\nOWNER_TELEGRAM_ID=1\nCONFIG_RELOAD_INTERVAL_MS=5\n";
+  writeFileSync(env, initial + "ALLOWED_USER_IDS=2\n");
+  const running = new FileConfigSource(env);
+  writeFileSync(env, initial + "ALLOWED_USER_IDS=3\n");
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.deepEqual(running.snapshot().config.allowedUserIds, [2]);
+  const restarted = new FileConfigSource(env);
+  assert.deepEqual(restarted.snapshot().config.allowedUserIds, [3]);
+});
+
 function fixture(t: any, attachments?: AttachmentReader) {
   const dir = mkdtempSync(join(tmpdir(), "verfix-bot-"));
   const env = join(dir, ".env");
   const configText = (allowed = "2", extra = "") =>
-    `TELEGRAM_BOT_TOKEN=123456:TEST\nOWNER_TELEGRAM_ID=1\nALLOWED_USER_IDS=${allowed}\nDATABASE_PATH=${join(dir, "db.sqlite")}\nRUNTIME_DIR=${dir}\nCONFIG_RELOAD_INTERVAL_MS=20\n${extra}`;
+    `TELEGRAM_BOT_TOKEN=123456:TEST\nOWNER_TELEGRAM_ID=1\nALLOWED_USER_IDS=${allowed}\nDATABASE_PATH=${join(dir, "db.sqlite")}\nRUNTIME_DIR=${dir}\n${extra}`;
   writeFileSync(env, configText());
-  const config = new FileConfigSource(env);
+  let snapshot: ConfigSnapshot = new FileConfigSource(env).snapshot();
+  const listeners = new Set<(value: ConfigSnapshot) => void>();
+  const config = {
+    snapshot: () => snapshot,
+    watch: (listener: (value: ConfigSnapshot) => void) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+  };
+  const writeConfig = (contents: string) => {
+    writeFileSync(env, contents);
+    const lastValid = snapshot.valid ? snapshot.config : snapshot.lastValid;
+    try { snapshot = new FileConfigSource(env).snapshot(); }
+    catch (error) { snapshot = {valid: false, error: (error as Error).message, lastValid}; }
+    for (const listener of listeners) listener(snapshot);
+  };
   let store = new SqliteStore(join(dir, "db.sqlite"));
   const sent: Array<{
     chatId: number;
@@ -78,7 +108,6 @@ function fixture(t: any, attachments?: AttachmentReader) {
   let bot = createBot({ config, store, engine, telegram, attachments });
   t.after(async () => {
     await bot.shutdown();
-    config.close();
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -96,9 +125,8 @@ function fixture(t: any, attachments?: AttachmentReader) {
   });
   return {
     dir,
-    env,
-    config,
     configText,
+    writeConfig,
     sent,
     requests,
     telegram,
@@ -454,7 +482,7 @@ test("a request timing out before Codex opens the thread preserves the completed
   await f.bot.handleUpdate(f.update(2, "first answer"));
   await f.bot.drain();
   const run = f.engine.run;
-  writeFileSync(f.env, f.configText("2", "REQUEST_TIMEOUT_MS=20"));
+  f.writeConfig(f.configText("2", "REQUEST_TIMEOUT_MS=20"));
   await new Promise((resolve) => setTimeout(resolve, 60));
   f.engine.run = async () => new Promise(() => {});
 
@@ -859,6 +887,53 @@ test("Telegram retry_after delays delivery and resumes automatically without an 
   assert.equal(f.sent.at(-1)!.text, "answer retry");
 });
 
+test("an earlier operation wakes the bot without opening inactive histories or sending a cancelled answer", async (t) => {
+  const f = fixture(t);
+  const history = [{role: "assistant" as const, text: "a".repeat(144 * 1024)}];
+  for (let topicId = 20; topicId < 100; topicId++) f.store.put({userId: 2, topicId, history});
+  const saved = (topicId: number, text: string, retryAt: number) => ({userId: 2, topicId, history: [],
+    delivery: {parts: [{kind: "text" as const, text}], next: 0, retryAt}});
+  f.store.put(saved(10, "cancelled", Date.now() + 30_000));
+  const fullScans = t.mock.method(f.store, "all");
+  const read = t.mock.method(f.store, "findDialogue");
+  await f.bot.recover();
+  assert.equal(read.mock.callCount(), 0);
+
+  const early = Promise.withResolvers<void>();
+  const sendPart = f.telegram.sendPart;
+  f.telegram.sendPart = async (...args) => {
+    const result = await sendPart(...args);
+    early.resolve();
+    return result;
+  };
+  f.store.put(saved(11, "earlier", Date.now() + 25));
+  f.store.put(saved(12, "ready", 0));
+  const watchdog = setTimeout(() => early.reject(new Error("ready delivery did not wake up")), 1000);
+  try { await early.promise; } finally { clearTimeout(watchdog); }
+  await f.bot.drain();
+  assert.equal(f.sent[0]?.text, "ready");
+  assert.ok(read.mock.calls.every(call => [11, 12].includes(call.arguments[0].topicId)));
+
+  await f.bot.handleUpdate(f.update(2, "/new"));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await f.bot.drain();
+  assert.equal(f.store.get(2, 10).delivery, undefined);
+  assert.deepEqual(f.sent.map(item => item.text).filter(text => ["ready", "earlier", "cancelled"].includes(text)), ["ready", "earlier"]);
+  assert.equal(fullScans.mock.callCount(), 0);
+});
+
+test("startup applies the access list before resuming a saved delivery", async (t) => {
+  const f = fixture(t);
+  await f.bot.shutdown();
+  f.store.put({userId: 2, topicId: 10, history: [{role: "user", text: "retained"}],
+    delivery: {parts: [{kind: "text", text: "restricted"}], next: 0}});
+  f.writeConfig(f.configText(""));
+  await f.reopen();
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.store.get(2, 10).delivery, undefined);
+  assert.equal(f.store.get(2, 10).history[0]?.text, "retained");
+});
+
 test("invalid runtime configuration pauses accepted output and owner diagnostics recover automatically", async (t) => {
   const f = fixture(t);
   let finish!: (value: any) => void;
@@ -868,8 +943,7 @@ test("invalid runtime configuration pauses accepted output and owner diagnostics
   };
   await f.bot.handleUpdate(f.update(2, "pending"));
   await new Promise((r) => setTimeout(r, 5));
-  writeFileSync(
-    f.env,
+  f.writeConfig(
     "TELEGRAM_BOT_TOKEN=do-not-expose-this-secret\nOWNER_TELEGRAM_ID=1",
   );
   await new Promise((r) => setTimeout(r, 60));
@@ -881,7 +955,7 @@ test("invalid runtime configuration pauses accepted output and owner diagnostics
   assert.match(f.sent.at(-1)!.text, /приостановлена/);
   assert.ok(!f.sent.at(-1)!.text.includes("do-not-expose"));
   await f.bot.handleUpdate(f.update(2, "not accepted"));
-  writeFileSync(f.env, f.configText());
+  f.writeConfig(f.configText());
   await new Promise((r) => setTimeout(r, 80));
   await f.bot.drain();
   assert.equal(f.sent.at(-1)!.text, "saved during pause");
@@ -897,9 +971,9 @@ test("revocation during image generation permanently cancels all output while gr
   };
   await f.bot.handleUpdate(f.update(2, "before revoke"));
   await new Promise((r) => setTimeout(r, 5));
-  writeFileSync(f.env, f.configText(""));
+  f.writeConfig(f.configText(""));
   await new Promise((r) => setTimeout(r, 60));
-  writeFileSync(f.env, f.configText("2"));
+  f.writeConfig(f.configText("2"));
   await new Promise((r) => setTimeout(r, 60));
   finish({ text: "cancelled answer", threadId: "retained", images: [{ name: "private.png", mime: "image/png", bytes: generatedPng }] });
   await f.bot.drain();
@@ -1214,7 +1288,7 @@ test("revocation during download cancels the batch before the next file and pend
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt"));
   await f.bot.handleUpdate(f.update(2, "Explain both"));
   await new Promise((resolve) => setTimeout(resolve, 5));
-  writeFileSync(f.env, f.configText(""));
+  f.writeConfig(f.configText(""));
   await new Promise((resolve) => setTimeout(resolve, 60));
   const cancelled = signal?.aborted;
   finishDownload(new Uint8Array(4));
@@ -1222,7 +1296,7 @@ test("revocation during download cancels the batch before the next file and pend
   await f.bot.drain();
   assert.deepEqual(downloads, ["first.txt"]);
   assert.equal(f.requests.length, 0);
-  writeFileSync(f.env, f.configText());
+  f.writeConfig(f.configText());
   await new Promise((resolve) => setTimeout(resolve, 60));
   f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
   await f.bot.handleUpdate(f.update(1, "Owner continues independently"));
@@ -1341,10 +1415,10 @@ test("invalid configuration pauses an album before download and valid reload res
   const downloads: string[] = [];
   f.telegram.downloadFile = async (id) => { downloads.push(id); return new Uint8Array(4); };
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "album.txt", "Read", "paused"));
-  writeFileSync(f.env, "OWNER_TELEGRAM_ID=1\n");
+  f.writeConfig("OWNER_TELEGRAM_ID=1\n");
   await new Promise((resolve) => setTimeout(resolve, 1550));
   assert.deepEqual(downloads, []);
-  writeFileSync(f.env, f.configText());
+  f.writeConfig(f.configText());
   await new Promise((resolve) => setTimeout(resolve, 80));
   await f.bot.drain();
   assert.deepEqual(downloads, ["album.txt"]);
@@ -1401,7 +1475,7 @@ test("a busy user's new files are rejected without download or inclusion in a la
 
 test("the request deadline also bounds an unresponsive attachment download", async (t) => {
   const f = fixture(t, { prepare: async () => [] });
-  writeFileSync(f.env, f.configText("2", "REQUEST_TIMEOUT_MS=20"));
+  f.writeConfig(f.configText("2", "REQUEST_TIMEOUT_MS=20"));
   await new Promise((resolve) => setTimeout(resolve, 60));
   let signal: AbortSignal | undefined;
   f.telegram.downloadFile = async (_id, _max, abortSignal) => { signal = abortSignal; return new Promise(() => {}); };
@@ -1459,7 +1533,7 @@ test("a model attachment error retains pending originals for an explicit retry",
 
 test("a captioned album rejected by the global capacity limit never becomes an implicit request queue", async (t) => {
   const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
-  writeFileSync(f.env, f.configText("2", "MAX_CONCURRENT_REQUESTS=1"));
+  f.writeConfig(f.configText("2", "MAX_CONCURRENT_REQUESTS=1"));
   await new Promise((resolve) => setTimeout(resolve, 60));
   f.telegram.downloadFile = async () => new Uint8Array(4);
   const original = f.engine.run;
@@ -1876,7 +1950,7 @@ test('revoking access, resetting the dialogue and confirming deletion cancel pen
       await f.bot.handleUpdate(f.update(2, 'Первое задание'));
       const signal = await started.promise;
       const cancelled = new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), {once: true}));
-      if (action === 'revoke') writeFileSync(f.env, f.configText(''));
+      if (action === 'revoke') f.writeConfig(f.configText(''));
       else if (action === 'reset') await f.bot.handleUpdate(f.update(2, '/new'));
       else {
         await f.bot.handleUpdate(f.update(2, '/delete'));
@@ -1942,7 +2016,7 @@ test('an exported file in an interrupted request is delivered on recovery withou
 });
 
 test('a timed-out turn delivers the completed file and enforces the ten-file limit',async(t)=>{
- const f=fixture(t);writeFileSync(f.env,f.configText('2','REQUEST_TIMEOUT_MS=250'));
+ const f=fixture(t);f.writeConfig(f.configText('2','REQUEST_TIMEOUT_MS=250'));
  await new Promise(r=>setTimeout(r,60));
  const sent:string[]=[];
  f.telegram.sendFile=async(chatId,file)=>{sent.push(file.name);return sent.length;};
@@ -1957,7 +2031,7 @@ test('a timed-out turn delivers the completed file and enforces the ten-file lim
 });
 
 test('quota rejecting a later generated image still delivers earlier persisted images and assistant explanation',async(t)=>{
- const f=fixture(t);writeFileSync(f.env,f.configText('2','DIALOGUE_FILE_BYTES='+generatedPng.length));
+ const f=fixture(t);f.writeConfig(f.configText('2','DIALOGUE_FILE_BYTES='+generatedPng.length));
  await new Promise(r=>setTimeout(r,60));
  f.engine.run=async()=>({text:'Chart and illustration',threadId:'thread-2',images:[{name:'one.png',mime:'image/png',bytes:generatedPng},{name:'two.png',mime:'image/png',bytes:generatedPng}]});
  await f.bot.handleUpdate(f.update(2,'two images'));await f.bot.drain();
@@ -2059,18 +2133,6 @@ function pressBroadcast(f: ReturnType<typeof fixture>, userId: number, data: str
   } });
 }
 
-async function changeBroadcastAccess(f: ReturnType<typeof fixture>, allowed: string) {
-  const reloaded = new Promise<void>(resolve => {
-    const stop = f.config.watch(() => { stop(); resolve(); });
-  });
-  // FileConfigSource's interval is unref'ed, so keep the test alive until reload.
-  const keepAlive = setTimeout(() => {}, 1000);
-  try {
-    writeFileSync(f.env, f.configText(allowed));
-    await reloaded;
-  } finally { clearTimeout(keepAlive); }
-}
-
 test("broadcast requires an owner confirmation for the newest unexpired preview in its original chat", async t => {
   const f = fixture(t);
   let now = Date.now();
@@ -2121,7 +2183,7 @@ test("broadcast requires an owner confirmation for the newest unexpired preview 
 
 test("broadcast rechecks access, continues after a refusal or timeout and leaves active dialogue work alone", async t => {
   const f = fixture(t);
-  await changeBroadcastAccess(f, "1,2,3,4,5,7,7");
+  f.writeConfig(f.configText("1,2,3,4,5,7,7"));
   const topic = { userId: 5, topicId: 10 };
   f.store.put({ ...topic, history: [{ role: "user", text: "existing context" }] });
   const started = Promise.withResolvers<void>();
@@ -2154,7 +2216,7 @@ test("broadcast rechecks access, continues after a refusal or timeout and leaves
     await f.bot.handleUpdate(f.update(1, "/broadcast Объявление\nВторая строка"));
     assert.match(f.sent.at(-1)!.text, /Получателей: 5/);
     const confirmation = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
-    await changeBroadcastAccess(f, "1,2,4,5,6,7,7");
+    f.writeConfig(f.configText("1,2,4,5,6,7,7"));
     await pressBroadcast(f, 1, confirmation);
     await reported.promise;
 
@@ -2174,7 +2236,7 @@ test("broadcast rechecks access, continues after a refusal or timeout and leaves
 
 test("broadcast keeps retry_after across reopen, rechecks revoked access and skips previously confirmed deliveries", async t => {
   const f = fixture(t);
-  await changeBroadcastAccess(f, "2,3,4,5");
+  f.writeConfig(f.configText("2,3,4,5"));
   let now = Date.now();
   t.mock.method(Date, "now", () => now);
   const attempts: number[] = [];
@@ -2199,7 +2261,7 @@ test("broadcast keeps retry_after across reopen, rechecks revoked access and ski
   saved.recipients.find(recipient => recipient.userId === 4)!.status = "sending";
   f.store.putBroadcast(saved);
 
-  await changeBroadcastAccess(f, "2,3,4");
+  f.writeConfig(f.configText("2,3,4"));
   now += 1999;
   await f.reopen();
   await f.bot.drain();

@@ -34,7 +34,7 @@ import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./br
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
 import { TelegramError } from "./telegram/transport.ts";
-import { SqliteStore } from "./store.ts";
+import { SqliteStore, StoredDialogueError } from "./store.ts";
 import type { DialogueState, TaskSource } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 import { DEFAULT_TOPIC_TITLE, GENERIC_TOPIC_TITLE, safeTopicTitle, topicTitleInput } from "./topic-title.ts";
@@ -82,8 +82,13 @@ export class BotController implements Bot {
   private readonly previewCleanups = new Set<string>();
   private readonly albums = new Map<string, { timer: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void }>();
   private readonly offlineNotified = new Set<string>();
-  private readonly unsubscribe: () => void;
-  private readonly retryTimer: ReturnType<typeof setInterval>;
+  private readonly unsubscribeConfig: (() => void) | undefined;
+  private readonly unsubscribeWork: () => void;
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private resumeQueued = false;
+  private recovering = false;
+  private readonly dialogueRetries = new Map<string, number>();
+  private readonly previewRetries = new Map<string, number>();
   private closed = false;
   private backgroundErrorReported = false;
   private pendingReload: ConfigSnapshot | undefined;
@@ -94,10 +99,9 @@ export class BotController implements Bot {
   >();
   constructor(deps: Dependencies) {
     this.deps = deps;
-    this.broadcasts = new BroadcastController({ ...deps, signal: this.controlAbort.signal });
-    this.unsubscribe = deps.config.watch((snapshot) => { this.pendingReload = snapshot; this.resume(); });
-    this.retryTimer = setInterval(() => this.resume(), 250);
-    this.retryTimer.unref();
+    this.broadcasts = new BroadcastController({ ...deps, signal: this.controlAbort.signal, wake: () => this.resume() });
+    this.unsubscribeWork = deps.store.watchWork(() => this.resume());
+    this.unsubscribeConfig = deps.config.watch?.((snapshot) => { this.pendingReload = snapshot; this.resume(); });
   }
   private allowed(userId: number, config: BotConfig): boolean {
     return userId === config.ownerId || config.allowedUserIds.includes(userId);
@@ -114,6 +118,13 @@ export class BotController implements Bot {
   }
   async handleUpdate(update: TelegramUpdate): Promise<void> {
     if (this.closed || update.update_id < this.deps.store.offset) return;
+    try { await this.processUpdate(update); }
+    catch (error) {
+      if (!(error instanceof StoredDialogueError)) throw error;
+      this.deps.store.accept(update.update_id);
+    }
+  }
+  private async processUpdate(update: TelegramUpdate): Promise<void> {
     const snapshot = this.deps.config.snapshot();
     const config = snapshot.valid ? snapshot.config : snapshot.lastValid;
     const stopped = update.stopped_message_generation;
@@ -365,7 +376,12 @@ export class BotController implements Bot {
     this.startRequest(state, config, updateId);
   }
   private atCapacity(config: BotConfig): boolean {
-    return this.deps.store.all().filter(state => this.busy(state)).length >= config.maxConcurrentRequests;
+    return this.busyCount() >= config.maxConcurrentRequests;
+  }
+  private busyCount(): number {
+    const keys = new Set(this.jobs.keys());
+    for (const address of this.deps.store.busyAddresses()) keys.add(dialogueKey(address));
+    return keys.size;
   }
   private editTask(address: DialogueAddress, message: TelegramMessage, updateId: number): void {
     const state = this.deps.store.get(address);
@@ -465,12 +481,12 @@ export class BotController implements Bot {
     const task = work().catch(() => {}).finally(() => this.controlJobs.delete(task));
     this.controlJobs.add(task);
   }
-  private launch(address: DialogueAddress, work: () => Promise<void>): void {
+  private launch(address: DialogueAddress, work: () => Promise<void>, failed: (error: unknown) => void = () => {}): void {
     if (this.closed || this.jobs.has(dialogueKey(address))) return;
     // Defer work so the busy marker is installed before any adapter callback can re-enter.
     const task = Promise.resolve()
       .then(work)
-      .catch(() => {})
+      .catch(failed)
       .finally(() => {
         this.jobs.delete(dialogueKey(address));
         this.controllers.delete(dialogueKey(address));
@@ -1094,9 +1110,9 @@ export class BotController implements Bot {
           } catch {
             health = { available: false };
           }
-          text += `\nАктивных запросов: ${this.deps.store.all().filter((s) => this.busy(s)).length}/${config.maxConcurrentRequests}. Codex: ${health.available ? "доступен" : "недоступен"}.`;
+          text += `\nАктивных запросов: ${this.busyCount()}/${config.maxConcurrentRequests}. Codex: ${health.available ? "доступен" : "недоступен"}.`;
         }
-        const incomplete = this.deps.store.all().filter(s => s.userId === state.userId && s.deleting?.error).length;
+        const incomplete = this.deps.store.incompleteDeletions(state.userId);
         if (incomplete) text += `\nНезавершённых удалений: ${incomplete}. Полная очистка ещё не подтверждена; бот повторяет попытки.`;
         await this.safeText(address, text);
         break;
@@ -1107,8 +1123,8 @@ export class BotController implements Bot {
             address,
             [...new Set([config.ownerId, ...config.allowedUserIds])]
               .map((userId) => {
-                const u = this.deps.store.all().find(s => s.userId === userId);
-                return `${userId}${u?.username ? ` @${u?.username}` : ""}${userId === config.ownerId ? " (владелец)" : ""}`;
+                const username = this.deps.store.username(userId);
+                return `${userId}${username ? ` @${username}` : ""}${userId === config.ownerId ? " (владелец)" : ""}`;
               })
               .join("\n"),
           );
@@ -1368,34 +1384,44 @@ export class BotController implements Bot {
   private reloaded(snapshot: ConfigSnapshot): void {
     if (!snapshot.valid) {
       for (const controller of this.topicTitles.values()) controller.abort();
-      for (const [id, controller] of this.controllers)
+      for (const [id, controller] of this.controllers) {
+        const [userId, topicId] = id.split(":").map(Number);
         if (this.preparing.has(id)) controller.abort(new AttachmentError("Обработка приостановлена. После исправления настроек повторите текст задания; материалы сохранены."));
-        else if (!this.deps.store.all().find(s => dialogueKey(s) === id)?.request) controller.abort();
+        else if (!this.readSaved({userId: userId!, topicId: topicId!})?.request) controller.abort();
+      }
       return;
     }
-    for (const state of this.deps.store.all())
-      if (!this.allowed(state.userId, snapshot.config)) {
-        this.topicTitles.get(dialogueKey(state))?.abort();
-        this.cancelAlbum(state);
-        if (state.pending) {
-          clearPendingPrompt(state.pending);
-          state.pending.awaitingTask = true;
-        }
-        if (state.request) state.request.revoked = true;
-        delete state.delivery;
-        this.deps.store.put(state);
-        if (!state.request || this.preparing.has(dialogueKey(state))) this.controllers.get(dialogueKey(state))?.abort();
+    for (const [key, controller] of this.topicTitles)
+      if (!this.allowed(Number(key.split(":")[0]), snapshot.config)) controller.abort();
+  }
+  private reconcilePending(config: BotConfig): void {
+    for (const address of this.deps.store.revokedWorkAddresses([config.ownerId, ...config.allowedUserIds])) {
+      const state = this.readSaved(address);
+      if (!state) continue;
+      this.cancelAlbum(address);
+      if (state.pending) {
+        clearPendingPrompt(state.pending);
+        state.pending.awaitingTask = true;
       }
-    for (const state of this.deps.store.all())
-      if (this.allowed(state.userId, snapshot.config) && state.pending?.readyAt && !this.albums.has(dialogueKey(state)))
-        this.scheduleAlbum(state, state.pending.readyAt);
-    this.resumeSaved();
+      if (state.request) state.request.revoked = true;
+      delete state.delivery;
+      this.deps.store.put(state);
+      if (!state.request || this.preparing.has(dialogueKey(address))) this.controllers.get(dialogueKey(address))?.abort();
+    }
+    for (const address of this.deps.store.albumAddresses()) {
+      if (!this.allowed(address.userId, config) || this.albums.has(dialogueKey(address))) continue;
+      const readyAt = this.readSaved(address)?.pending?.readyAt;
+      if (readyAt) this.scheduleAlbum(address, readyAt);
+    }
   }
   private startLegacyMigrations(userId?: number): void {
     const snapshot = this.deps.config.snapshot();
     if (!snapshot.valid || this.closed) return;
-    for (const state of this.deps.store.all()) {
-      if (state.topicId || state.migration?.phase === "creating" || (userId !== undefined && state.userId !== userId) || !this.allowed(state.userId, snapshot.config)) continue;
+    const addresses = userId === undefined ? this.deps.store.legacyAddresses() : [{userId}];
+    for (const address of addresses) {
+      if (!this.allowed(address.userId, snapshot.config)) continue;
+      const state = this.readSaved(address);
+      if (!state || state.migration?.phase === "creating") continue;
       // Persist intent before Telegram. Ambiguous failures wait for the service update,
       // never blindly call non-idempotent createForumTopic a second time.
       state.migration = {phase: "creating"};
@@ -1418,7 +1444,6 @@ export class BotController implements Bot {
   }
   private adoptLegacy(userId: number, topicId: number): void {
     this.deps.store.moveLegacy(userId, topicId);
-    this.resume();
   }
   private async bindLegacy(address: DialogueAddress): Promise<void> {
     const state = this.deps.store.get(address);
@@ -1443,47 +1468,88 @@ export class BotController implements Bot {
   }
   private background(work: () => void): void {
     try { work(); this.backgroundErrorReported = false; }
-    catch {
-      // Retry reload effects too (access revocation and pending albums).
-      this.pendingReload = this.deps.config.snapshot();
-      // Storage errors must neither kill the timer nor expose private state.
+    catch (error) {
+      if (error instanceof StoredDialogueError) return;
       if (!this.backgroundErrorReported) console.error("Не удалось восстановить фоновые операции. Данные сохранены; повторим попытку.");
       this.backgroundErrorReported = true;
+      this.pendingReload = this.deps.config.snapshot();
+      this.wakeAt(Date.now() + 1000);
     }
   }
   private resume(): void {
-    if (this.closed) return;
-    this.broadcasts.resume();
-    this.background(() => {
-      const snapshot = this.pendingReload;
-      this.pendingReload = undefined;
-      if (snapshot) this.reloaded(snapshot);
-      else this.resumeSaved();
+    if (this.closed || this.recovering || this.resumeQueued) return;
+    this.resumeQueued = true;
+    queueMicrotask(() => {
+      this.resumeQueued = false;
+      if (this.closed || this.recovering) return;
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+      this.background(() => {
+        const reload = this.pendingReload;
+        this.pendingReload = undefined;
+        if (reload) this.reloaded(reload);
+        const snapshot = this.deps.config.snapshot();
+        if (!snapshot.valid) return;
+        this.reconcilePending(snapshot.config);
+        const now = Date.now();
+        const dialogue = this.resumeSaved("dialogue", now);
+        const preview = this.deps.telegram.deleteMessage ? this.resumeSaved("preview", now) : Infinity;
+        const broadcast = this.broadcasts.resume(now) ?? Infinity;
+        this.wakeAt(Math.min(dialogue, preview, broadcast));
+      });
     });
   }
-  private resumeSaved(): void {
-    if (this.closed || !this.deps.config.snapshot().valid) return;
-    for (const state of this.deps.store.all()) {
-      const key = dialogueKey(state);
-      if (this.deps.telegram.deleteMessage && !this.previews.has(key) && !this.previewCleanups.has(key) &&
-          state.previewCleanup?.some(entry => !entry.retryAt || entry.retryAt <= Date.now())) {
+  private wakeAt(at: number): void {
+    if (this.closed || !Number.isFinite(at)) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.resume(), Math.min(2_147_483_647, Math.max(0, at - Date.now())));
+    this.retryTimer.unref();
+  }
+  private resumeSaved(kind: "dialogue" | "preview", now: number): number {
+    const preview = kind === "preview";
+    const retries = preview ? this.previewRetries : this.dialogueRetries;
+    let next = Infinity;
+    for (const address of this.deps.store.scheduledDialogues(kind)) {
+      if (address.dueAt >= next && address.dueAt > now) break;
+      const key = dialogueKey(address);
+      if (preview ? this.previews.has(key) || this.previewCleanups.has(key) : this.jobs.has(key)) continue;
+      const due = Math.max(address.dueAt, retries.get(key) ?? 0);
+      if (due > now) { next = Math.min(next, due); continue; }
+      const failed = (error: unknown) => {
+        if (error instanceof StoredDialogueError) { retries.delete(key); return; }
+        if (!retries.has(key)) console.error("Не удалось выполнить фоновую операцию. Данные сохранены; повторим попытку.");
+        retries.set(key, Date.now() + 1000);
+      };
+      if (preview) {
         this.previewCleanups.add(key);
         this.control(async () => {
-          try { await this.cleanPreviews(state); }
-          finally { this.previewCleanups.delete(key); }
+          await Promise.resolve();
+          try { await this.cleanPreviews(address); retries.delete(key); }
+          catch (error) { failed(error); }
+          finally { this.previewCleanups.delete(key); this.resume(); }
         });
-      }
-      if (state.topicId && !this.jobs.has(dialogueKey(state))) {
-        if (state.legacyBinding) {
-          if (!state.bindingRetryAt || state.bindingRetryAt <= Date.now()) this.launch(state, () => this.bindLegacy(state));
-        } else if (state.deleting && (!state.deleting.retryAt || state.deleting.retryAt <= Date.now()))
-          this.launch(state, () => this.deleteDialogue(state));
-        else if (state.reset && (!state.reset.retryAt || state.reset.retryAt <= Date.now()))
-          this.launch(state, () => this.reset(state));
-        else if (state.delivery && (!state.delivery.retryAt || state.delivery.retryAt <= Date.now()))
-          this.launch(state, () => this.deliver(state));
+      } else {
+        this.launch(address, async () => {
+          await this.runSaved(address);
+          retries.delete(key);
+        }, failed);
       }
     }
+    return next;
+  }
+  private async runSaved(address: DialogueAddress): Promise<void> {
+    if (this.closed || !this.deps.config.snapshot().valid) return;
+    const state = this.deps.store.get(address);
+    const now = Date.now();
+    if (state.legacyBinding) {
+      if ((state.bindingRetryAt ?? 0) <= now) await this.bindLegacy(address);
+    } else if (state.deleting && (state.deleting.retryAt ?? 0) <= now) await this.deleteDialogue(address);
+    else if (state.reset && (state.reset.retryAt ?? 0) <= now) await this.reset(address);
+    else if (state.delivery && (state.delivery.retryAt ?? 0) <= now) await this.deliver(address);
+  }
+  private readSaved(address: DialogueAddress): DialogueState | undefined {
+    try { return this.deps.store.findDialogue(address); }
+    catch (error) { if (!(error instanceof StoredDialogueError)) throw error; }
   }
   async discardOfflineUpdates(updates: TelegramUpdate[]): Promise<void> {
     for (const update of updates) {
@@ -1513,7 +1579,14 @@ export class BotController implements Bot {
           this.control(() => this.safeText({userId: from.id}, OPEN_TOPIC));
           continue;
         }
-        const state = this.deps.store.get(from.id,message.message_thread_id);
+        const address = {userId: from.id, topicId: message.message_thread_id};
+        let state: DialogueState;
+        try { state = this.deps.store.get(address); }
+        catch (error) {
+          if (!(error instanceof StoredDialogueError)) throw error;
+          this.deps.store.accept(update.update_id);
+          continue;
+        }
         const notice: OutgoingPart = {
           kind: "text",
           text: "Бот был недоступен. Пожалуйста, повторите пропущенный запрос.",
@@ -1527,33 +1600,41 @@ export class BotController implements Bot {
     await this.drainDialogues();
   }
   async recover(): Promise<void> {
-    for (const state of this.deps.store.all()) {
-      if (state.pending) {
-        clearPendingPrompt(state.pending);
-        if (!state.request && !state.delivery)
-          state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
-        this.deps.store.put(state);
-      }
-      if (state.request) {
-        if (state.request.stopped) {
-          await this.finishStopped(state, state.request.id);
-          continue;
+    this.recovering = true;
+    try {
+      for (const address of this.deps.store.recoveryAddresses()) {
+        const state = this.readSaved(address);
+        if (!state) continue;
+        if (state.pending) {
+          clearPendingPrompt(state.pending);
+          if (!state.request && !state.delivery)
+            state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
+          this.deps.store.put(state);
         }
-        const threadId = state.request.threadId ?? (state.request.repeat ? undefined : state.threadId);
-        this.failRequest(state, threadId, REPEAT);
+        if (state.request) {
+          if (state.request.stopped) {
+            await this.finishStopped(state, state.request.id);
+            continue;
+          }
+          const threadId = state.request.threadId ?? (state.request.repeat ? undefined : state.threadId);
+          this.failRequest(state, threadId, REPEAT);
+        }
+        if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
       }
-      if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
+      this.startLegacyMigrations();
+    } finally {
+      this.recovering = false;
     }
-    this.startLegacyMigrations();
-    this.reloaded(this.deps.config.snapshot());
-    this.broadcasts.resume();
+    this.resume();
     await this.drainDialogues();
   }
   private async drainDialogues(): Promise<void> {
+    await Promise.resolve();
     while (this.jobs.size || this.controlJobs.size || this.albums.size)
       await Promise.all([...this.jobs.values(), ...this.controlJobs, ...[...this.albums.values()].map((a) => a.done)]);
   }
   async drain(): Promise<void> {
+    await Promise.resolve();
     await Promise.all([this.drainDialogues(), this.broadcasts.drain()]);
   }
   async shutdown(): Promise<void> {
@@ -1561,8 +1642,9 @@ export class BotController implements Bot {
     // Shutdown must work even when a saved snapshot cannot be read.
     for (const album of this.albums.values()) { clearTimeout(album.timer); album.resolve(); }
     this.albums.clear();
-    clearInterval(this.retryTimer);
-    this.unsubscribe();
+    clearTimeout(this.retryTimer);
+    this.unsubscribeConfig?.();
+    this.unsubscribeWork();
     this.controlAbort.abort(new Error("Bot shutting down"));
     for (const controller of this.controllers.values())
       controller.abort(new Error("Bot shutting down"));

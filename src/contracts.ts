@@ -276,7 +276,6 @@ export interface BotConfig {
   requestTimeoutMs: number;
   dialogueFileBytes?: number;
   pollTimeoutSeconds: number;
-  configReloadIntervalMs: number;
   defaultModel: typeof DEFAULT_MODEL_SELECTION.model;
   defaultEffort: typeof DEFAULT_MODEL_SELECTION.effort;
 }
@@ -289,8 +288,7 @@ export type ConfigSnapshot =
 export interface ConfigSource {
   snapshot(): ConfigSnapshot;
   /** Subscribe to validated reloads; the returned function stops this subscription. */
-  watch(listener: (snapshot: ConfigSnapshot) => void): () => void;
-  close(): void;
+  watch?(listener: (snapshot: ConfigSnapshot) => void): () => void;
 }
 
 export interface Bot {

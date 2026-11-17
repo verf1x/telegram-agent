@@ -5,6 +5,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SqliteStore } from '../src/store.ts';
+import { createBot } from '../src/bot.ts';
+import type { BotConfig, ModelEngine, TelegramTransport } from '../src/contracts.ts';
 
 test('legacy history, materials and outbox move once into a topic and survive reopening', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'verfix-migration-'));
@@ -42,6 +44,53 @@ test('existing response file databases migrate without exposing files in another
   assert.equal(Buffer.from(store.readFile(2,'legacy-file')).toString(),'data');
   assert.throws(()=>store.readFile({userId:2,topicId:10},'legacy-file'));
  } finally {store.close();}
+});
+
+test('old pending operations resume around an unreadable dialogue and pick it up after repair', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'verfix-scheduling-schema-'));
+  t.after(() => rmSync(directory, {recursive: true, force: true}));
+  const path = join(directory, 'db');
+  const marker = 'PRIVATE-LEGACY-DIALOGUE';
+  const diagnostic = t.mock.method(console, 'error', () => {});
+  const db = new DatabaseSync(path);
+  db.exec(`CREATE TABLE dialogues (user_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+    state TEXT NOT NULL, PRIMARY KEY(user_id,topic_id))`);
+  const insert = db.prepare('INSERT INTO dialogues VALUES (2,?,?)');
+  const reply = (topicId: number, text: string) => JSON.stringify({userId: 2, topicId, history: [],
+    delivery: {parts: [{kind: 'text', text: 'already acknowledged'}, {kind: 'text', text}], next: 1}});
+  insert.run(10, `{"invalid": "${marker}"`);
+  insert.run(11, reply(11, 'valid answer'));
+  insert.run(12, JSON.stringify({userId: 2, topicId: 12, history: [], reset: {threadIds: ['old']}}));
+  db.close();
+
+  const sent: string[] = [], cleaned: string[] = [];
+  const telegram = {sendPart: async (_id, part) => { if (part.kind === 'text') sent.push(part.text); return 1; }} satisfies Partial<TelegramTransport>;
+  const engine = {deleteThread: async id => { cleaned.push(id); }} satisfies Partial<ModelEngine>;
+  const config: BotConfig = {botToken: '123:TEST', ownerId: 1, allowedUserIds: [2],
+    databasePath: path, runtimeDir: directory, defaultModel: 'gpt-6.2-sol', defaultEffort: 'medium',
+    maxConcurrentRequests: 4, requestTimeoutMs: 1000, pollTimeoutSeconds: 30};
+  async function recover() {
+    const store = new SqliteStore(path);
+    const bot = createBot({store, config: {snapshot: () => ({valid: true, config})},
+      telegram: telegram as TelegramTransport, engine: engine as ModelEngine});
+    try { await bot.recover(); }
+    finally { await bot.shutdown(); store.close(); }
+  }
+  await recover();
+  const delivered = ['valid answer', 'Диалог сброшен. Отправьте новый запрос.'];
+  assert.deepEqual(sent.slice().sort(), delivered.slice().sort());
+  assert.deepEqual(cleaned, ['old']);
+  assert.equal(diagnostic.mock.callCount(), 1);
+  assert.ok(!String(diagnostic.mock.calls[0]?.arguments).includes(marker));
+
+  const repair = new DatabaseSync(path);
+  assert.equal(repair.prepare('SELECT state FROM dialogues WHERE topic_id=10').get()?.state, `{"invalid": "${marker}"`);
+  repair.prepare('UPDATE dialogues SET state=? WHERE topic_id=10').run(reply(10, 'repaired answer'));
+  repair.close();
+  await recover();
+  assert.equal(sent.length, 3);
+  assert.equal(sent[2], 'repaired answer');
+  assert.equal(diagnostic.mock.callCount(), 1);
 });
 
 test('malformed stored state never exposes dialogue content through parser errors', t=>{

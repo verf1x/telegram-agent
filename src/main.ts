@@ -43,8 +43,7 @@ async function main(): Promise<void> {
     ) ? error.message : 'Проверьте обязательные поля и синтаксис .env.';
     throw new Error(`Ошибка конфигурации: ${detail}`);
   }
-  const initial = config.snapshot();
-  if (!initial.valid) { config.close(); throw new Error(`Ошибка конфигурации: ${initial.error}`); }
+  const {config: initial} = config.snapshot();
   const stop = new AbortController();
   let bot: ReturnType<typeof createBot> | undefined;
   const onSignal = () => {
@@ -56,24 +55,19 @@ async function main(): Promise<void> {
   let unlock: (() => Promise<void>) | undefined;
   let store: SqliteStore | undefined;
   let engine: CodexEngine | undefined;
-  let unwatch: (() => void) | undefined;
   try {
-    await mkdir(initial.config.runtimeDir,{recursive:true,mode:0o700});
-    await chmod(initial.config.runtimeDir,0o700);
-    await mkdir(dirname(initial.config.databasePath),{recursive:true,mode:0o700});
-    unlock = await instanceLock(resolve(initial.config.runtimeDir,'bot.lock'),onSignal);
-    store = new SqliteStore(initial.config.databasePath);
-    await chmod(initial.config.databasePath,0o600);
-    engine = new CodexEngine({runtimeDir:initial.config.runtimeDir});
-    const telegram = new TelegramApi(initial.config.botToken);
+    await mkdir(initial.runtimeDir,{recursive:true,mode:0o700});
+    await chmod(initial.runtimeDir,0o700);
+    await mkdir(dirname(initial.databasePath),{recursive:true,mode:0o700});
+    unlock = await instanceLock(resolve(initial.runtimeDir,'bot.lock'),onSignal);
+    store = new SqliteStore(initial.databasePath);
+    await chmod(initial.databasePath,0o600);
+    engine = new CodexEngine({runtimeDir:initial.runtimeDir});
+    const telegram = new TelegramApi(initial.botToken);
     await telegram.requireTopics(stop.signal);
     const attachments = new SandboxedAttachmentReader();
     bot = createBot({config,store,engine,telegram,attachments});
     if (stop.signal.aborted) return;
-    unwatch = config.watch(snapshot => {
-      if (!snapshot.valid) console.error(`Ошибка конфигурации: ${snapshot.error}`);
-      else console.info('Конфигурация перечитана.');
-    });
     await bot.recover();
     if (stop.signal.aborted) return;
     console.info('Бот запущен. Остановка: Ctrl+C.');
@@ -81,9 +75,7 @@ async function main(): Promise<void> {
     let failures = 0;
     while (!stop.signal.aborted) {
       try {
-        const snapshot = config.snapshot();
-        const current = snapshot.valid ? snapshot.config : snapshot.lastValid ?? initial.config;
-        const updates = await telegram.getUpdates({offset:store.offset,timeout:startup ? 0 : current.pollTimeoutSeconds,signal:stop.signal});
+        const updates = await telegram.getUpdates({offset:store.offset,timeout:startup ? 0 : initial.pollTimeoutSeconds,signal:stop.signal});
         for (const update of updates) {
           if (stop.signal.aborted) break;
           if ((update.message && update.message.date < startupCutoff) || (startup && update.callback_query)) {
@@ -102,8 +94,6 @@ async function main(): Promise<void> {
       }
     }
   } finally {
-    unwatch?.();
-    config.close();
     await Promise.allSettled([bot?.shutdown()]);
     await Promise.allSettled([engine?.close()]);
     try { store?.close(); } finally { await unlock?.(); }

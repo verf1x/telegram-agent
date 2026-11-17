@@ -1,41 +1,21 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DEFAULT_MODEL_SELECTION } from "./contracts.ts";
-import type { BotConfig, ConfigSnapshot, ConfigSource } from "./contracts.ts";
+import type { BotConfig, ConfigSource } from "./contracts.ts";
 
 /** Reads only the explicit private configuration file, never the parent process environment. */
 export class FileConfigSource implements ConfigSource {
-  private current: ConfigSnapshot;
-  private readonly listeners = new Set<(snapshot: ConfigSnapshot) => void>();
-  private readonly timer: ReturnType<typeof setInterval>;
-  private lastContents = "";
-  private readonly initial: BotConfig;
-  private readonly path: string;
+  private readonly current: { valid: true; config: BotConfig };
   constructor(path = ".env") {
-    this.path = path;
-    this.initial = this.read();
-    this.current = { valid: true, config: this.initial };
-    this.timer = setInterval(
-      () => this.reload(),
-      this.initial.configReloadIntervalMs,
-    );
-    this.timer.unref();
+    this.current = { valid: true, config: this.read(path) };
   }
-  snapshot(): ConfigSnapshot {
+  snapshot(): { valid: true; config: BotConfig } {
     return this.current;
   }
-  watch(listener: (snapshot: ConfigSnapshot) => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-  close(): void {
-    clearInterval(this.timer);
-    this.listeners.clear();
-  }
-  private read(): BotConfig {
+  private read(path: string): BotConfig {
     let contents: string;
     try {
-      contents = readFileSync(this.path, "utf8");
+      contents = readFileSync(path, "utf8");
     } catch {
       throw new Error("Cannot read .env configuration file");
     }
@@ -98,47 +78,9 @@ export class FileConfigSource implements ConfigSource {
       requestTimeoutMs: positive("REQUEST_TIMEOUT_MS", 1_200_000),
       dialogueFileBytes: positive("DIALOGUE_FILE_BYTES", 500_000_000),
       pollTimeoutSeconds: positive("POLL_TIMEOUT_SECONDS", 30, 50),
-      configReloadIntervalMs: positive("CONFIG_RELOAD_INTERVAL_MS", 500),
       defaultModel: DEFAULT_MODEL_SELECTION.model,
       defaultEffort: DEFAULT_MODEL_SELECTION.effort,
     };
-    this.lastContents = contents;
     return config;
-  }
-  private reload(): void {
-    const previous = this.current;
-    try {
-      if (
-        readFileSync(this.path, "utf8") === this.lastContents &&
-        this.current.valid
-      )
-        return;
-      const config = this.read();
-      for (const key of [
-        "botToken",
-        "ownerId",
-        "databasePath",
-        "runtimeDir",
-      ] as const)
-        if (config[key] !== this.initial[key])
-          throw new Error(
-            `Configuration ${key} changed; restore the original value or restart the bot`,
-          );
-      this.current = { valid: true, config };
-    } catch (error) {
-      this.current = {
-        valid: false,
-        error: error instanceof Error ? error.message : "Invalid configuration",
-        lastValid: this.current.valid
-          ? this.current.config
-          : (this.current.lastValid ?? this.initial),
-      };
-    }
-    if (
-      !this.current.valid &&
-      (previous.valid || previous.error !== this.current.error)
-    )
-      console.error(this.current.error);
-    for (const listener of this.listeners) listener(this.current);
   }
 }

@@ -19,12 +19,13 @@ interface BroadcastDependencies {
   store: SqliteStore;
   telegram: TelegramTransport;
   signal: AbortSignal;
+  wake: () => void;
 }
 
 export class BroadcastController {
   private draft?: BroadcastDraft | undefined;
   private active?: Promise<void> | undefined;
-  private storageErrorReported = false;
+  private storageRetryAt: number | undefined;
   private readonly deps: BroadcastDependencies;
 
   constructor(deps: BroadcastDependencies) {
@@ -93,54 +94,40 @@ export class BroadcastController {
     const { id, text, recipients } = draft;
     this.deps.store.accept(updateId, { id, owner, text, recipients });
     this.draft = undefined;
-    this.resume();
     return "Рассылка запущена.";
   }
 
-  resume(): void {
-    if (this.draft && this.draft.expiresAt <= Date.now()) this.draft = undefined;
-    if (this.active || this.deps.signal.aborted) return;
-    let broadcast: BroadcastState | undefined;
-    try { broadcast = this.nextReady(); }
-    catch { this.reportStorageError(); return; }
-    if (!broadcast) return;
+  resume(now: number): number | undefined {
+    if (this.active) return;
+    const config = this.config();
+    if (!config) return;
+    if (this.storageRetryAt !== undefined && this.storageRetryAt > now) return this.storageRetryAt;
+    const head = this.deps.store.broadcastHead(config.ownerId);
+    if (!head) return;
+    if (head.due_at > now) return head.due_at;
     this.active = Promise.resolve()
-      .then(() => this.run(broadcast))
-      .then(() => { this.storageErrorReported = false; })
-      .catch(() => this.reportStorageError())
-      .finally(() => { this.active = undefined; });
+      .then(async () => {
+        if (!this.config()) return;
+        const broadcast = this.deps.store.getBroadcast(head.id);
+        if (!broadcast) return;
+        delete broadcast.retryAt;
+        if (await this.deliver(broadcast)) this.deps.store.removeBroadcast(broadcast.id);
+      })
+      .then(() => { this.storageRetryAt = undefined; })
+      .catch(() => {
+        if (this.storageRetryAt === undefined) console.error("Не удалось обновить состояние рассылки. Повторим попытку.");
+        this.storageRetryAt = Date.now() + 1000;
+      })
+      .finally(() => { this.active = undefined; this.deps.wake(); });
   }
 
   async drain(): Promise<void> {
-    await this.active;
+    while (this.active) await this.active;
   }
 
   private config(): BotConfig | undefined {
     const snapshot = this.deps.config.snapshot();
     if (!this.deps.signal.aborted && snapshot.valid) return snapshot.config;
-  }
-
-  private nextReady(): BroadcastState | undefined {
-    const config = this.config();
-    if (!config) return undefined;
-    const broadcast = this.deps.store.nextBroadcast(config.ownerId);
-    if (broadcast && (broadcast.retryAt ?? 0) <= Date.now()) return broadcast;
-  }
-
-  private reportStorageError(): void {
-    if (!this.storageErrorReported) console.error("Не удалось обновить состояние рассылки. Повторим попытку.");
-    this.storageErrorReported = true;
-  }
-
-  private async run(broadcast: BroadcastState): Promise<void> {
-    while (true) {
-      delete broadcast.retryAt;
-      if (!await this.deliver(broadcast)) return;
-      this.deps.store.removeBroadcast(broadcast.id);
-      const next = this.nextReady();
-      if (!next) return;
-      broadcast = next;
-    }
   }
 
   private async deliver(broadcast: BroadcastState): Promise<boolean> {
