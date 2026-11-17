@@ -59,7 +59,7 @@ export class TelegramApi implements TelegramTransport {
       throw new Error('Включите Threaded Mode и управление темами пользователями в BotFather.');
   }
   getUpdates(options: {offset?:number;timeout:number;signal?:AbortSignal}): Promise<TelegramUpdate[]> {
-    return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','callback_query','stopped_message_generation']},options.signal,(options.timeout + 15) * 1000);
+    return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','edited_message','callback_query','stopped_message_generation']},options.signal,(options.timeout + 15) * 1000);
   }
   async sendDraft(chatId: ChatId, draftId: number, text: string, topicId: number, signal?: AbortSignal): Promise<void> {
     const accepted = await this.#call<boolean>('sendMessageDraft',{chat_id:chatId,message_thread_id:topicId,draft_id:draftId,text,can_stop:true},signal,2500);
@@ -105,9 +105,11 @@ export class TelegramApi implements TelegramTransport {
   }
   async sendText(chatId: ChatId, text: string, options: SendOptions = {}): Promise<number> {
     let id = 0;
-    for (const part of formatText(text)) {
+    const parts = formatText(text);
+    for (const [index, part] of parts.entries()) {
       if (part.kind === 'image') continue;
-      const sent = await this.#call<{message_id:number}>('sendMessage',{chat_id:chatId,message_thread_id:options.message_thread_id,text:part.text,...(options.reply_markup ? {reply_markup:options.reply_markup} : {})},options.signal);
+      const replyMarkup = index === parts.length - 1 ? options.reply_markup : undefined;
+      const sent = await this.#call<{message_id:number}>('sendMessage',{chat_id:chatId,message_thread_id:options.message_thread_id,text:part.text,reply_markup:replyMarkup},options.signal);
       id = sent.message_id;
     }
     return id;
@@ -119,6 +121,7 @@ export class TelegramApi implements TelegramTransport {
     if (options.message_thread_id !== undefined) form.set('message_thread_id',String(options.message_thread_id));
     form.set('document',new Blob([Buffer.from(file.bytes)],{type:file.mime}),file.name.replace(/[\x00-\x1f\x7f/\\]/g,'_').slice(0,180) || 'document');
     form.set('disable_content_type_detection','true');
+    if (options.reply_markup) form.set('reply_markup',JSON.stringify(options.reply_markup));
     const sent = await this.#call<{message_id:number}>('sendDocument',form,options.signal,120_000);
     return sent.message_id;
   }

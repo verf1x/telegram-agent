@@ -1996,3 +1996,303 @@ test("broadcast keeps retry_after across reopen, rechecks revoked access and ski
   await f.bot.drain();
   assert.deepEqual(attempts, [2, 3, 3]);
 });
+
+function repeatButton(f: ReturnType<typeof fixture>, label = "Другой вариант") {
+  const sent = f.sent.findLast(item =>
+    item.options?.reply_markup?.inline_keyboard[0]?.[0]?.text === label);
+  assert.ok(sent, `Expected button "${label}"`);
+  return sent.options.reply_markup.inline_keyboard[0][0].callback_data as string;
+}
+
+function repeatPress(f: ReturnType<typeof fixture>, data: string, userId = 2, topicId = 10): TelegramUpdate {
+  const update = f.update(userId, "");
+  return { update_id: update.update_id, callback_query: {
+    id: String(update.update_id), from: { id: userId },
+    message: { ...update.message!, message_thread_id: topicId }, data,
+  } };
+}
+
+test("another variant rebuilds the context from before the task and becomes the active answer", async (t) => {
+  const f = fixture(t, { prepare: async (files) => files.map(file => ({
+    name: file.name, text: Buffer.from(file.bytes).toString(), images: [],
+  })) });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async id => { downloads.push(id); return Buffer.from(id); };
+  f.telegram.sendFile = async (chatId, file, options) => {
+    f.sent.push({ chatId, text: file.name, options });
+    return f.sent.length;
+  };
+  f.engine.run = async r => {
+    const number = f.requests.push(r);
+    const threadId = r.threadId ?? `thread-${number}`;
+    await r.onThread(threadId);
+    if (r.text === "compare")
+      await r.onFile!({ name: `answer-${number}.txt`, mime: "text/plain", bytes: Buffer.from(String(number)) });
+    const images = number === 1 ? [{ name: "earlier.png", mime: "image/png", bytes: generatedPng }] : [];
+    return { text: `answer ${number}`, threadId, images };
+  };
+  await f.bot.handleUpdate(f.update(2, "earlier question"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt"));
+  await f.bot.handleUpdate(f.update(2, "compare"));
+  await f.bot.drain();
+  const button = repeatButton(f);
+  await f.reopen();
+  const press = repeatPress(f, button);
+  await f.bot.handleUpdate(press);
+  await f.bot.handleUpdate(press);
+  await f.bot.handleUpdate(repeatPress(f, button));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 3);
+  const repeat = f.requests[2];
+  assert.equal(repeat.text, "compare");
+  assert.equal(repeat.threadId, undefined);
+  const earlierImage = repeat.files[0];
+  assert.deepEqual(repeat.readFile(earlierImage.id), new Uint8Array(generatedPng));
+  assert.deepEqual(repeat.history, [
+    { role: "user", text: "earlier question" },
+    { role: "assistant", text: "answer 1", imageIds: [earlierImage.id], materials: [{id: earlierImage.id, name: "earlier.png"}] },
+  ]);
+  assert.deepEqual(repeat.attachments.map((a: any) => a.text), ["first.txt", "second.txt"]);
+  assert.deepEqual(repeat.files.map((file: any) => file.name), ["earlier.png", "first.txt", "second.txt"]);
+  assert.deepEqual(downloads, ["first.txt", "second.txt"]);
+  await f.bot.handleUpdate(f.update(2, "/text"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /answer 3/);
+  assert.ok(f.sent.some(message => message.text === "answer 2"));
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests[3].threadId, "thread-3");
+  assert.deepEqual(f.requests[3].files.map((file: any) => file.name), ["earlier.png", "first.txt", "second.txt", "answer-3.txt"]);
+});
+
+function editMessage(f: ReturnType<typeof fixture>, original: TelegramUpdate, text: string): TelegramUpdate {
+  const message = { ...original.message! };
+  if (message.document || message.photo) message.caption = text;
+  else message.text = text;
+  return { update_id: f.update(message.from!.id, "").update_id, edited_message: message };
+}
+
+test("a stopped variant of a task with compacted history keeps the active answer and can be retried", {timeout: 8000}, async (t) => {
+  const f = fixture(t, {prepare: async files => files.map(({name}) => ({name, text: "new notes", images: []}))});
+  f.telegram.downloadFile = async () => Buffer.from("new notes");
+  f.store.put({userId: 2, topicId: 10, threadId: "old-thread", contextPressure: true, history: [
+    {role: "user", text: "remember old notes", attachments: [{name: "old.txt", text: "old notes", images: []}]},
+    {role: "assistant", text: "old answer"},
+  ]});
+  f.engine.summarize = async () => "Remember the old notes";
+  const draft = Promise.withResolvers<number>();
+  const secondStarted = Promise.withResolvers<void>();
+  f.engine.run = async request => {
+    const number = f.requests.push(request);
+    const threadId = `thread-${number}`;
+    await request.onThread(threadId);
+    if (number === 2) {
+      await request.onFile!({name: "stopped.txt", mime: "text/plain", bytes: Buffer.from("partial")});
+      secondStarted.resolve();
+      await new Promise<void>(resolve => {
+        if (request.signal.aborted) resolve();
+        else request.signal.addEventListener("abort", () => resolve(), {once: true});
+      });
+    }
+    return {threadId, text: `answer ${number}`, images: []};
+  };
+  const task = fileUpdate(f.update(2, ""), "new.txt", "original task");
+  await f.bot.handleUpdate(task);
+  await f.bot.drain();
+  await f.reopen();
+  f.telegram.sendDraft = async (_chat, id) => { draft.resolve(id); };
+  await f.bot.handleUpdate(repeatPress(f, repeatButton(f)));
+  await secondStarted.promise;
+  await f.bot.handleUpdate({
+    update_id: f.update(2, "").update_id,
+    stopped_message_generation: {chat: {id: 2, type: "private"}, message_thread_id: 10, draft_id: await draft.promise},
+  });
+  await f.bot.drain();
+  await f.bot.handleUpdate(f.update(2, "/text"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, "answer 1");
+  await f.bot.handleUpdate(editMessage(f, task, "new wording"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(repeatPress(f, repeatButton(f, "Запустить снова")));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 3);
+  assert.equal(f.requests[2].text, "new wording");
+  for (const request of f.requests.slice(1)) {
+    assert.equal(request.threadId, undefined);
+    assert.equal(request.summary, "Remember the old notes");
+    assert.deepEqual(request.history, []);
+    assert.equal(request.attachments[0].text, "new notes");
+    assert.deepEqual(request.files.map(({name}: {name: string}) => name), ["new.txt", "old.txt"]);
+  }
+  assert.equal(f.sent.at(-1)!.text, "answer 3");
+});
+
+test("only the latest caption edit runs and the original album stays in order", async (t) => {
+  const f = fixture(t, { prepare: async files => files.map(file => ({ name: file.name, text: "material", images: [] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  const caption = fileUpdate(f.update(2, ""), "first.txt", "Compare", "album");
+  await f.bot.handleUpdate(caption);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt", "by date", "album"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].text, "Compare\n\nby date");
+
+  const edit = editMessage(f, caption, "Sort");
+  await f.bot.handleUpdate(edit);
+  await f.bot.handleUpdate(edit);
+  await f.bot.drain();
+  const old = repeatButton(f, "Запустить снова");
+  await f.bot.handleUpdate(editMessage(f, caption, "Summarize"));
+  await f.bot.drain();
+  const latest = repeatButton(f, "Запустить снова");
+  assert.notEqual(latest, old);
+  assert.equal(f.requests.length, 1);
+
+  await f.reopen();
+  await f.bot.handleUpdate(repeatPress(f, old));
+  await f.bot.handleUpdate(repeatPress(f, latest, 2, 11));
+  await f.bot.handleUpdate(repeatPress(f, latest, 1));
+  await f.bot.handleUpdate(repeatPress(f, latest, 99));
+  assert.equal(f.requests.length, 1);
+  await f.bot.handleUpdate(repeatPress(f, latest));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.requests[1].text, "Summarize\n\nby date");
+  assert.deepEqual(f.requests[1].attachments.map((a: any) => a.name), ["first.txt", "second.txt"]);
+});
+
+test("an edited separate text reuses the attached file, and a failed rerun leaves the active answer and context", async (t) => {
+  const f = fixture(t, { prepare: async files => files.map(file => ({ name: file.name, text: "notes", images: [] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, "")));
+  const original = f.update(2, "Read my notes");
+  await f.bot.handleUpdate(original);
+  await f.bot.drain();
+  await f.bot.handleUpdate(editMessage(f, original, "List the key points"));
+  await f.bot.drain();
+  const button = repeatButton(f, "Запустить снова");
+  const run = f.engine.run;
+  f.engine.run = async r => {
+    f.requests.push(r);
+    await r.onThread("failed-variant");
+    throw new ModelSelectionError("Модель недоступна.");
+  };
+  await f.bot.handleUpdate(repeatPress(f, button));
+  await f.bot.drain();
+  assert.equal(f.requests[1].text, "List the key points");
+  assert.equal(f.requests[1].attachments[0].text, "notes");
+  assert.match(f.sent.at(-1)!.text, /Модель недоступна/);
+  await f.bot.handleUpdate(f.update(2, "/text"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, "answer Read my notes");
+  const retry = repeatButton(f, "Запустить снова");
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(repeatPress(f, retry));
+  await f.bot.handleUpdate(editMessage(f, original, "ignored edit"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 3);
+  assert.equal(f.requests[2].threadId, "thread-2");
+});
+
+test("reset and confirmed topic deletion invalidate earlier variant buttons", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "first task"));
+  await f.bot.drain();
+  const beforeReset = repeatButton(f);
+  await f.bot.handleUpdate(f.update(2, "/new"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(repeatPress(f, beforeReset));
+  await f.bot.handleUpdate(f.update(2, "second task"));
+  await f.bot.drain();
+  const beforeDeletion = repeatButton(f);
+  await f.bot.handleUpdate(f.update(2, "/delete"));
+  await f.bot.drain();
+  const confirmation = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+  await f.bot.handleUpdate(repeatPress(f, confirmation));
+  await f.bot.drain();
+  await f.bot.handleUpdate(repeatPress(f, beforeDeletion));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 2);
+});
+
+test("recovery delivers a saved partial image and keeps the active context without restarting the model", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "original"));
+  await f.bot.drain();
+  const button = repeatButton(f);
+  const run = f.engine.run;
+  let allocated!: () => void;
+  const running = new Promise<void>(resolve => { allocated = resolve; });
+  f.engine.run = async r => {
+    f.requests.push(r);
+    await r.onThread("incomplete-repeat");
+    allocated();
+    return new Promise(() => {});
+  };
+  await f.bot.handleUpdate(repeatPress(f, button));
+  await running;
+  const address = { userId: 2, topicId: 10 };
+  const requestId = f.store.get(address).request!.id;
+  f.store.saveResponseImage(address, requestId, { name: "partial.png", mime: "image/png", bytes: generatedPng });
+  await f.bot.handleUpdate(repeatPress(f, button));
+  await f.reopen();
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.sent.at(-1)!.part?.kind, "image");
+  assert.equal(f.sent.at(-1)!.text, "partial.png");
+  assert.notEqual(repeatButton(f), button);
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests[2].threadId, "thread-2");
+  assert.deepEqual(f.requests[2].files, []);
+});
+
+test("removing the only caption invalidates the previous variant and edited-text buttons", async (t) => {
+  const f = fixture(t, { prepare: async files => files.map(file => ({ name: file.name, text: "notes", images: [] })) });
+  f.telegram.downloadFile = async () => new Uint8Array(4);
+  const original = fileUpdate(f.update(2, ""), "notes.txt", "Read my notes");
+  await f.bot.handleUpdate(original);
+  await f.bot.drain();
+  const variant = repeatButton(f);
+  await f.bot.handleUpdate(editMessage(f, original, "List the key points"));
+  await f.bot.drain();
+  const rerun = repeatButton(f, "Запустить снова");
+  await f.bot.handleUpdate(editMessage(f, original, ""));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /Текст задания удалён/);
+  assert.equal(f.sent.at(-1)!.options.reply_markup, undefined);
+  await f.bot.handleUpdate(repeatPress(f, variant));
+  await f.bot.handleUpdate(repeatPress(f, rerun));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 1);
+});
+
+test("a partial variant can deliver its files without becoming the active answer", async (t) => {
+  const f = fixture(t);
+  await f.bot.handleUpdate(f.update(2, "original"));
+  await f.bot.drain();
+  const run = f.engine.run;
+  f.telegram.sendFile = async (chatId, file, options) => {
+    f.sent.push({ chatId, text: file.name, options });
+    return f.sent.length;
+  };
+  f.engine.run = async r => {
+    await r.onThread("incomplete-variant");
+    await r.onFile!({ name: "partial.txt", mime: "text/plain", bytes: Buffer.from("partial") });
+    return { text: "Только часть ответа готова.", threadId: "incomplete-variant", images: [], incomplete: true };
+  };
+  await f.bot.handleUpdate(repeatPress(f, repeatButton(f)));
+  await f.bot.drain();
+  assert.ok(f.sent.some(message => message.text === "partial.txt"));
+  await f.bot.handleUpdate(f.update(2, "/text"));
+  await f.bot.drain();
+  assert.equal(f.sent.at(-1)!.text, "answer original");
+  f.engine.run = run;
+  await f.bot.handleUpdate(f.update(2, "continue"));
+  await f.bot.drain();
+  assert.equal(f.requests[1].threadId, "thread-2");
+  assert.deepEqual(f.requests[1].files, []);
+});

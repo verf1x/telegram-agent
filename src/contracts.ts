@@ -105,6 +105,7 @@ export interface TelegramCallbackQuery {
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  edited_message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
   stopped_message_generation?: {
     chat: TelegramMessage["chat"];
@@ -186,6 +187,8 @@ export interface ConversationMessage {
   text: string;
   attachments?: PreparedAttachment[];
   materials?: MaterialReference[];
+  /** IDs of saved generated images in delivery order. */
+  imageIds?: string[];
 }
 
 export interface SummaryRequest extends ModelSelection {
@@ -239,6 +242,8 @@ export interface ModelResponse {
   images: GeneratedImage[];
   fileIds?: string[];
   contextPressure?: boolean;
+  /** A failed turn or tool can still produce files or images worth delivering. */
+  incomplete?: true;
 }
 
 export interface ModelEngine {

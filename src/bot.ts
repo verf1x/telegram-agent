@@ -14,6 +14,8 @@ import type {
   ModelSelection,
   ModelResponse,
   OutgoingPart,
+  SendOptions,
+  TelegramMessage,
   TelegramTransport,
   TelegramUpdate,
 } from "./contracts.ts";
@@ -32,7 +34,7 @@ import { formatAnswer, formatText } from "./telegram/format.ts";
 import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
 import { TelegramError } from "./telegram/transport.ts";
 import { SqliteStore } from "./store.ts";
-import type { DialogueState } from "./store.ts";
+import type { DialogueState, TaskSource } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 interface Dependencies {
   config: ConfigSource;
@@ -41,10 +43,23 @@ interface Dependencies {
   telegram: TelegramTransport;
   attachments?: AttachmentReader;
 }
+const REPEAT_CALLBACK = "repeat:";
+const CAPACITY = "Все места обработки заняты. Повторите запрос позже.";
 const REPEAT = "Обработка запроса прервалась. Пожалуйста, повторите запрос.";
 const OPEN_TOPIC = "Откройте или создайте тему в личном чате и отправьте запрос в ней. Каждая тема хранит отдельный диалог.";
 const BUSY =
   "Запрос ещё обрабатывается или доставляется. Дождитесь завершения и повторите сообщение.";
+function taskText(sources: TaskSource[] = []): string {
+  return sources.map(source => source.text).filter(text => text.trim()).join("\n\n");
+}
+function pendingSources(pending: NonNullable<DialogueState["pending"]>): TaskSource[] {
+  return pending.sources ?? pending.captions?.map(text => ({ text })) ?? [];
+}
+function clearPendingPrompt(pending: NonNullable<DialogueState["pending"]>): void {
+  delete pending.sources;
+  delete pending.captions;
+  delete pending.readyAt;
+}
 export function createBot(deps: Dependencies): BotController {
   return new BotController(deps);
 }
@@ -107,9 +122,9 @@ export class BotController implements Bot {
       return;
     }
     const callback = update.callback_query;
-    const message = callback?.message ?? update.message;
+    const message = callback?.message ?? update.edited_message ?? update.message;
     const from = callback?.from ?? message?.from;
-    if (snapshot.valid && !callback && message?.chat.type === "private" && message.forum_topic_created && message.message_thread_id && this.allowed(message.chat.id, snapshot.config)) {
+    if (snapshot.valid && update.message && !callback && message?.chat.type === "private" && message.forum_topic_created && message.message_thread_id && this.allowed(message.chat.id, snapshot.config)) {
       const legacy = this.deps.store.get(message.chat.id);
       if (legacy.migration && message.forum_topic_created.name === "Предыдущий диалог") {
         this.adoptLegacy(message.chat.id, message.message_thread_id);
@@ -132,7 +147,7 @@ export class BotController implements Bot {
     if (!snapshot.valid) {
       this.deps.store.accept(update.update_id);
       if (
-        !callback &&
+        update.message && !callback &&
         userId === config.ownerId &&
         /^\/status(?:@\w+)?(?:\s|$)/.test(message.text ?? "")
       )
@@ -150,6 +165,11 @@ export class BotController implements Bot {
         this.control(() => this.deps.telegram.answerCallback(callback.id, stopped ? "Задание остановлено" : "Задание уже завершилось", this.controlAbort.signal));
         return;
       }
+      if (data?.startsWith(REPEAT_CALLBACK)) {
+        const text = this.repeatTask(address, data, config, update.update_id);
+        this.control(() => this.deps.telegram.answerCallback(callback.id, text, this.controlAbort.signal));
+        return;
+      }
       if (data?.startsWith(BROADCAST_CALLBACK)) {
         const answer = this.broadcasts.confirm(address, config.ownerId, data, update.update_id);
         if (answer) this.control(() => this.deps.telegram.answerCallback(callback.id, answer, this.controlAbort.signal));
@@ -162,6 +182,11 @@ export class BotController implements Bot {
       this.deps.store.accept(update.update_id);
       if (userId === config.ownerId) this.bumpPicker(address);
       this.control(() => this.modelCallback(address, callback.id, callback.data, config));
+      return;
+    }
+    if (update.edited_message) {
+      if (address.topicId) this.editTask(address, message, update.update_id);
+      else this.deps.store.accept(update.update_id);
       return;
     }
     const broadcast = BROADCAST_COMMAND.exec(message.text ?? "");
@@ -256,15 +281,14 @@ export class BotController implements Bot {
         refs.reduce((n, r) => n + (r.size ?? 0), 0) > ATTACHMENT_LIMITS.batchBytes
       ) {
         this.cancelAlbum(address);
-        state.pending ??= { refs: [], captions: [] };
-        state.pending.captions = [];
-        delete state.pending.readyAt;
+        state.pending ??= { refs: [] };
+        clearPendingPrompt(state.pending);
         state.pending.awaitingTask = true;
         this.deps.store.accept(update.update_id, state);
         this.control(() => this.safeText(address, "Не более 10 вложений, 20 МБ на файл и 50 МБ на задание. Вложение отклонено; остальные материалы сохранены. Разделите материалы и повторите текст задания или очистите их через /new."));
         return;
       }
-      state.pending ??= { refs: [], captions: [] };
+      state.pending ??= { refs: [] };
       state.pending.refs.push(ref);
     }
     const text = message.text ?? (
@@ -272,9 +296,10 @@ export class BotController implements Bot {
     );
     if (state.pending) {
       if (message.text?.trim()) delete state.pending.awaitingTask;
-      if (text?.trim()) state.pending.captions.push(text);
-      if (ref && !state.pending.awaitingTask && (message.media_group_id || state.pending.readyAt))
-        state.pending.readyAt = Date.now() + ATTACHMENT_LIMITS.albumQuietMs;
+      const collectingAlbum = ref && !state.pending.awaitingTask && (message.media_group_id || state.pending.readyAt);
+      if (text?.trim() || collectingAlbum)
+        (state.pending.sources ??= pendingSources(state.pending)).push({ messageId: message.message_id, text: text ?? "" });
+      if (collectingAlbum) state.pending.readyAt = Date.now() + ATTACHMENT_LIMITS.albumQuietMs;
       if (state.pending.readyAt) {
         this.deps.store.accept(update.update_id, state);
         this.scheduleAlbum(address, state.pending.readyAt);
@@ -286,41 +311,97 @@ export class BotController implements Bot {
       this.control(() => this.safeText(address, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
       return;
     }
-    this.dispatch(state, text, config, update.update_id);
+    this.dispatch(state, state.pending?.sources ?? [{ messageId: message.message_id, text }], config, update.update_id);
   }
   private dispatch(
     state: DialogueState,
-    text: string,
+    sources: TaskSource[],
     config: BotConfig,
     updateId?: number,
   ): void {
     const address = state;
-    const userId = state.userId;
     if (this.busy(state)) return;
-    if (this.deps.store.all().filter((s) => this.busy(s)).length >= config.maxConcurrentRequests) {
+    if (this.atCapacity(config)) {
       if (state.pending) {
-        state.pending.captions = [];
-        delete state.pending.readyAt;
+        clearPendingPrompt(state.pending);
       }
       if (updateId === undefined) this.deps.store.put(state);
       else this.deps.store.accept(updateId, state);
-      this.control(() => this.safeText(address, "Все места обработки заняты. Повторите запрос позже."));
+      this.control(() => this.safeText(address, CAPACITY));
       return;
     }
+    state.latestTask = { sources, historyIndex: state.history.length };
     state.request = {
       id: randomUUID(),
-      text,
+      text: taskText(sources),
       started: Date.now(),
       ...(state.pending?.refs.length ? { attachments: state.pending.refs } : {}),
     };
     if (state.pending) {
-      state.pending.captions = [];
-      delete state.pending.readyAt;
+      clearPendingPrompt(state.pending);
     }
-    if (userId === config.ownerId) this.invalidatePicker(address);
+    this.startRequest(state, config, updateId);
+  }
+  private atCapacity(config: BotConfig): boolean {
+    return this.deps.store.all().filter(state => this.busy(state)).length >= config.maxConcurrentRequests;
+  }
+  private editTask(address: DialogueAddress, message: TelegramMessage, updateId: number): void {
+    const state = this.deps.store.get(address);
+    const task = state.latestTask;
+    const pending = state.pending?.sources?.find(source => source.messageId === message.message_id);
+    const source = pending ?? task?.sources.find(source => source.messageId === message.message_id);
+    const text = message.text ?? message.caption ?? "";
+    if (!source || source.text === text) {
+      this.deps.store.accept(updateId);
+      return;
+    }
+    const previous = taskText(task?.sources);
+    source.text = text;
+    const edited = taskText(task?.sources);
+    if (!pending && task?.completed && !state.request && previous !== edited) {
+      state.delivery ??= { parts: [], next: 0 };
+      state.delivery.parts.push({
+        kind: "text",
+        text: edited ? "Формулировка задания изменена." : "Текст задания удалён. Добавьте его снова или отправьте новое задание.",
+      });
+      this.armRepeat(state);
+    }
+    this.deps.store.accept(updateId, state);
+    this.resume();
+  }
+  private repeatTask(address: DialogueAddress, data: string, config: BotConfig, updateId: number): string | undefined {
+    const state = this.deps.store.get(address);
+    const task = state.latestTask;
+    const text = taskText(task?.sources);
+    if (!address.topicId || !task?.completed || !text || !task.button || data !== REPEAT_CALLBACK + task.button) {
+      this.deps.store.accept(updateId);
+      return "Кнопка устарела. Используйте кнопку под последним ответом.";
+    }
+    const blocked = this.busy(state) || state.pending?.readyAt ? BUSY : this.atCapacity(config) ? CAPACITY : undefined;
+    if (blocked) {
+      this.deps.store.accept(updateId);
+      return blocked;
+    }
+    delete task.button;
+    state.request = { id: randomUUID(), text, started: Date.now(), repeat: true };
+    this.startRequest(state, config, updateId);
+  }
+  private startRequest(state: DialogueState, config: BotConfig, updateId?: number): void {
+    if (state.userId === config.ownerId) this.invalidatePicker(state);
     if (updateId === undefined) this.deps.store.put(state);
     else this.deps.store.accept(updateId, state);
-    this.launch(address, () => this.process(address, config));
+    this.launch(state, () => this.process(state, config));
+  }
+  private armRepeat(state: DialogueState): void {
+    const task = state.latestTask;
+    if (!task?.completed || !state.delivery?.parts.length) return;
+    if (taskText(task.sources)) {
+      task.button = randomUUID();
+      state.delivery.buttonAt = state.delivery.parts.length - 1;
+    } else {
+      delete task.button;
+      delete state.delivery.buttonAt;
+    }
   }
   private cancelAlbum(address: DialogueAddress): void {
     const album = this.albums.get(dialogueKey(address));
@@ -341,17 +422,15 @@ export class BotController implements Bot {
         const state = this.deps.store.get(address);
         if (!snapshot.valid || !this.allowed(userId, snapshot.config) || !state.pending) return;
         if (this.busy(state)) {
-          state.pending.captions = [];
-          delete state.pending.readyAt;
+          clearPendingPrompt(state.pending);
           this.deps.store.put(state);
           this.control(() => this.safeText(address, BUSY));
           return;
         }
-        const text = state.pending.captions.join("\n\n");
-        if (text.trim()) this.dispatch(state, text, snapshot.config);
+        const sources = pendingSources(state.pending);
+        if (taskText(sources)) this.dispatch(state, sources, snapshot.config);
         else {
-          state.pending.captions = [];
-          delete state.pending.readyAt;
+          clearPendingPrompt(state.pending);
           this.deps.store.put(state);
           this.control(() => this.safeText(address, "Материалы сохранены. Отправьте текст задания; /new — удалить материалы."));
         }
@@ -400,10 +479,17 @@ export class BotController implements Bot {
       await this.deps.engine.restoreStoppedThread?.(threadId, requestId, address).catch(() => false);
     const current = this.deps.store.get(address);
     if (current.request?.id !== requestId || !current.request.stopped) return;
+    if (current.request.repeat) {
+      this.hideFiles(current, [...(current.request.fileIds ?? []), ...(current.request.imageIds ?? [])]);
+      if (!current.request.revoked) {
+        current.delivery = {parts: [{kind: "text", text: "Задание остановлено."}], next: 0};
+        this.armRepeat(current);
+      }
+    }
     delete current.request;
     if (threadId && !restored) {
       if (current.threadId === threadId) delete current.threadId;
-      current.retiredThreadIds = [...new Set([...(current.retiredThreadIds ?? []), threadId])];
+      this.retireThread(current, threadId);
     }
     this.deps.store.put(current);
     if (threadId && !restored) void this.cleanRetiredThreads(address).catch(() => {});
@@ -483,7 +569,12 @@ export class BotController implements Bot {
         sendTyping();
         typing = setInterval(sendTyping, 4000);
       }
-      let attachments: PreparedAttachment[] | undefined;
+      const previousTask = request.repeat ? state.latestTask : undefined;
+      const previousResult = previousTask?.completed;
+      if (request.repeat && !previousResult) throw new Error("Repeat context unavailable");
+      const original = previousTask ? state.history[previousTask.historyIndex] : undefined;
+      if (request.repeat && original?.role !== "user") throw new Error("Repeat task unavailable");
+      let attachments = original?.attachments;
       const materials: MaterialReference[] = [];
       if (request.attachments?.length) {
         this.preparing.add(dialogueKey(address));
@@ -532,12 +623,13 @@ export class BotController implements Bot {
       }
       this.preparing.delete(dialogueKey(address));
       this.ensureActive(address, request.id, controller.signal);
+      const inputMaterials = original?.materials ?? materials;
       const incoming = {
         role: "user" as const, text: request.text,
         ...(attachments ? {attachments} : {}),
-        ...(materials.length ? {materials} : {}),
+        ...(inputMaterials.length ? {materials: inputMaterials} : {}),
       };
-      const start = state.contextPressure ? state.history.length : recentHistoryStart(state.history, incoming);
+      const start = previousTask ? 0 : state.contextPressure ? state.history.length : recentHistoryStart(state.history, incoming);
       if (start > 0) {
         preview?.stage("Обновляю контекст диалога…");
         const retainFrom = state.contextPressure ? start : recentHistoryStart(state.history, incoming, 0.5);
@@ -547,19 +639,30 @@ export class BotController implements Bot {
       preview?.stage("Готовлю ответ…");
       engineStarted = true;
       const live = preview;
-      const run = () => this.abortable(this.deps.engine.run({
+      const visible = previousResult && new Set(previousResult.inputFileIds);
+      const inactive = new Set(state.inactiveFileIds);
+      let inputFileIds: string[] = [];
+      const run = () => {
+        const files = this.deps.store.listFiles(address).filter(file =>
+          visible ? visible.has(file.id) : !inactive.has(file.id));
+        const availableIds = new Set(files.map(file => file.id));
+        inputFileIds = [...availableIds];
+        return this.abortable(this.deps.engine.run({
           requestId: request.id,
           userId,
           topicId: address.topicId,
           text: request.text,
           ...(attachments ? { attachments } : {}),
           ...selection,
-          ...(state.threadId ? {threadId: state.threadId} : {}),
-          history: state.history,
+          ...(!previousTask && state.threadId ? {threadId: state.threadId} : {}),
+          history: previousTask ? state.history.slice(0, previousTask.historyIndex) : state.history,
           ...(state.summary ? {summary: state.summary} : {}),
-          files: this.deps.store.listFiles(address),
+          files,
           ...(live ? {onProgress: (progress) => live.progress(progress)} : {}),
-          readFile: (id) => this.deps.store.readFile(address,id),
+          readFile: id => {
+            if (!availableIds.has(id)) throw new ResponseFileError("Файл недоступен в контексте задания.");
+            return this.deps.store.readFile(address, id);
+          },
           onFile: async (file) => {
             this.ensureActive(address,request.id,controller.signal);
             return this.deps.store.saveResponseFile(address,request.id,file,config.dialogueFileBytes);
@@ -577,11 +680,12 @@ export class BotController implements Bot {
             }
           },
         }), controller.signal);
+      };
       let response: ModelResponse;
       try {
         response = await run();
       } catch (error) {
-        if (!(error instanceof ModelContextError) || (!state.threadId && !state.history.length)) throw error;
+        if (!(error instanceof ModelContextError) || previousTask || (!state.threadId && !state.history.length)) throw error;
         const attempted = this.deps.store.get(address);
         if (attempted.request?.fileIds?.length) throw error;
         // The provider can exceed the estimate inside a turn. Retry once with the summary alone.
@@ -594,20 +698,19 @@ export class BotController implements Bot {
       const current = this.deps.store.get(address);
       if (current.request?.id !== request.id) return;
       if (current.request.stopped) throw new RequestStopped();
-      current.threadId = response.threadId;
-      if (response.contextPressure) current.contextPressure = true;
-      if (attachments) delete current.pending;
       const fileIds = current.request.fileIds ?? [];
       const savedIds = new Set(fileIds);
       const resultFiles: MaterialReference[] = fileIds.length
         ? this.deps.store.listFiles(address).filter(file => savedIds.has(file.id)).map(({id, name}) => ({id, name}))
         : [];
+      const imageIds: string[] = [];
       const readyImages = [];
       let imageWarning = "";
       for (const image of response.images) {
         try {
-          const {id, name} = this.deps.store.saveFile(address,image,config.dialogueFileBytes);
+          const {id, name} = this.deps.store.saveResponseImage(address, request.id, image, config.dialogueFileBytes);
           resultFiles.push({id, name});
+          imageIds.push(id);
           readyImages.push(image);
         }
         catch (error) {
@@ -615,17 +718,39 @@ export class BotController implements Bot {
           imageWarning = "\n\nГотова только часть изображений. " + error.message;
         }
       }
+      const outputFileIds = [...fileIds, ...imageIds];
       const answer = {...response,text:response.text+imageWarning,images:readyImages};
-      current.history.push(incoming, {
-        role: "assistant", text: response.text,
-        ...(resultFiles.length ? {materials: resultFiles} : {}),
-      });
-      current.lastResponse = answer.text;
+      let retired: string | undefined;
+      if (previousResult && (response.incomplete || imageWarning)) {
+        if (current.threadId !== response.threadId) retired = response.threadId;
+        this.hideFiles(current, outputFileIds);
+      } else {
+        if (previousTask && previousResult) {
+          if (current.threadId !== response.threadId) retired = current.threadId;
+          current.history.length = previousTask.historyIndex;
+          this.hideFiles(current, previousResult.outputFileIds);
+          delete current.contextPressure;
+        } else if (attachments) delete current.pending;
+        current.threadId = response.threadId;
+        if (response.contextPressure) current.contextPressure = true;
+        current.history.push(incoming, {
+          role: "assistant", text: response.text,
+          ...(imageIds.length ? {imageIds} : {}),
+          ...(resultFiles.length ? {materials: resultFiles} : {}),
+        });
+        current.lastResponse = answer.text;
+        if (current.latestTask)
+          current.latestTask.completed = { inputFileIds, outputFileIds };
+      }
+      if (retired) this.retireThread(current, retired);
       const revoked = current.request.revoked;
       delete current.request;
-      if (!revoked)
-        current.delivery = { parts: [...formatAnswer(answer),...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
+      if (!revoked) {
+        current.delivery = { parts: [...formatAnswer(answer), ...fileIds.map(id => ({kind: "file" as const, id}))], next: 0 };
+        this.armRepeat(current);
+      }
       this.deps.store.put(current);
+      if (retired) this.control(() => this.cleanRetiredThreads(address));
     } catch (error) {
       if (this.closed) return;
       const current = this.deps.store.get(address);
@@ -637,29 +762,14 @@ export class BotController implements Bot {
       // A rejected or timed-out preflight leaves the completed native thread usable.
       const rejectedBeforeTurn = current.request.threadId === undefined &&
         (error instanceof ModelSelectionError || controller.signal.aborted);
-      const retireThread = engineStarted && !rejectedBeforeTurn;
-      const poisoned = retireThread ? current.request.threadId ?? current.threadId : undefined;
-      const revoked = current.request?.revoked;
-      const fileIds = current.request?.fileIds ?? [];
-      delete current.request;
-      if (retireThread) delete current.threadId;
-      if (poisoned) current.retiredThreadIds = [...new Set([...(current.retiredThreadIds ?? []), poisoned])];
-      if (!revoked) {
-        const message = isUserFacingRequestError(error) ? error.message : controller.signal.aborted
-          ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
-          : "Не удалось обработать запрос. Пожалуйста, повторите позже.";
-        const prefix = fileIds.length ? "Готова только часть задания; созданные файлы приложены. " : "";
-        current.delivery = {
-          parts: [
-            { kind: "text", text: prefix + message },
-            ...fileIds.map(id=>({kind:"file" as const,id})),
-          ],
-          next: 0,
-        };
-      }
-      this.deps.store.put(current);
-      if (poisoned)
-        await this.cleanRetiredThreads(address);
+      const poisoned = engineStarted && !rejectedBeforeTurn
+        ? current.request.threadId ?? (request.repeat ? undefined : current.threadId)
+        : undefined;
+      const message = isUserFacingRequestError(error) ? error.message : controller.signal.aborted
+        ? "Время обработки запроса истекло. Пожалуйста, повторите запрос."
+        : "Не удалось обработать запрос. Пожалуйста, повторите позже.";
+      this.failRequest(current, poisoned, message);
+      if (poisoned) await this.cleanRetiredThreads(address);
     } finally {
       this.preparing.delete(dialogueKey(address));
       clearTimeout(timer);
@@ -692,6 +802,7 @@ export class BotController implements Bot {
     const current = this.deps.store.get(state);
     if (summary) current.summary = summary;
     current.history = current.history.slice(retainFrom);
+    if (current.latestTask) current.latestTask.historyIndex = current.history.length;
     delete current.contextPressure;
     const retired = new Set(current.retiredThreadIds);
     if (current.threadId) retired.add(current.threadId);
@@ -714,6 +825,43 @@ export class BotController implements Bot {
       if (!current.retiredThreadIds.length) delete current.retiredThreadIds;
       this.deps.store.put(current);
     }
+  }
+  private hideFiles(state: DialogueState, ids: string[]): void {
+    if (ids.length) state.inactiveFileIds = [...new Set([...(state.inactiveFileIds ?? []), ...ids])];
+  }
+  private retireThread(state: DialogueState, id: string): void {
+    state.retiredThreadIds = [...new Set([...(state.retiredThreadIds ?? []), id])];
+  }
+  private failRequest(state: DialogueState, threadId: string | undefined, message: string): void {
+    const request = state.request;
+    if (!request) return;
+    const fileIds = request.fileIds ?? [];
+    const imageIds = request.imageIds ?? [];
+    if (request.repeat) this.hideFiles(state, [...fileIds, ...imageIds]);
+    else delete state.latestTask;
+    if (threadId) {
+      if (!request.repeat) delete state.threadId;
+      this.retireThread(state, threadId);
+    }
+    delete state.request;
+    if (!request.revoked) {
+      const saved = imageIds.length ? this.deps.store.listFiles(state) : [];
+      const images = imageIds.flatMap(id => {
+        const file = saved.find(item => item.id === id);
+        return file ? [{...file, bytes: this.deps.store.readFile(state, id)}] : [];
+      });
+      const prefix = fileIds.length || images.length ? "Готова только часть задания; созданные файлы приложены. " : "";
+      state.delivery = {
+        parts: [
+          { kind: "text", text: prefix + message },
+          ...formatAnswer({text: "", images}),
+          ...fileIds.map(id => ({kind: "file" as const, id})),
+        ],
+        next: 0,
+      };
+      this.armRepeat(state);
+    }
+    this.deps.store.put(state);
   }
   private ensureActive(address: DialogueAddress, requestId: string, signal: AbortSignal): void {
     const userId = address.userId;
@@ -753,15 +901,22 @@ export class BotController implements Bot {
       }
       const controller = new AbortController();
       this.controllers.set(dialogueKey(address), controller);
+      const options: SendOptions = { signal: controller.signal, message_thread_id: address.topicId };
+      const task = state.latestTask;
+      if (delivery.buttonAt === delivery.next && task?.button) {
+        const text = taskText(task.sources);
+        const edited = text !== state.history[task.historyIndex]?.text;
+        options.reply_markup = { inline_keyboard: [[{
+          text: edited ? "Запустить снова" : "Другой вариант",
+          callback_data: REPEAT_CALLBACK + task.button,
+        }]] };
+      }
       try {
         if (part.kind === "file") {
           const file = this.deps.store.listFiles(address).find(file=>file.id===part.id);
           if (!file || !this.deps.telegram.sendFile) throw new Error("File delivery unavailable");
-          await this.abortable(this.deps.telegram.sendFile(userId,{...file,bytes:this.deps.store.readFile(address,file.id)},{signal:controller.signal,message_thread_id:address.topicId}),controller.signal);
-        } else await this.abortable(this.deps.telegram.sendPart(userId, part, {
-          signal: controller.signal,
-          message_thread_id: address.topicId,
-        }), controller.signal);
+          await this.abortable(this.deps.telegram.sendFile(userId,{...file,bytes:this.deps.store.readFile(address,file.id)}, options), controller.signal);
+        } else await this.abortable(this.deps.telegram.sendPart(userId, part, options), controller.signal);
       } catch (error) {
         if (
           error &&
@@ -1150,8 +1305,7 @@ export class BotController implements Bot {
       if (!this.allowed(state.userId, snapshot.config)) {
         this.cancelAlbum(state);
         if (state.pending) {
-          state.pending.captions = [];
-          delete state.pending.readyAt;
+          clearPendingPrompt(state.pending);
           state.pending.awaitingTask = true;
         }
         if (state.request) state.request.revoked = true;
@@ -1299,8 +1453,7 @@ export class BotController implements Bot {
   async recover(): Promise<void> {
     for (const state of this.deps.store.all()) {
       if (state.pending) {
-        state.pending.captions = [];
-        delete state.pending.readyAt;
+        clearPendingPrompt(state.pending);
         if (!state.request && !state.delivery)
           state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
         this.deps.store.put(state);
@@ -1310,15 +1463,8 @@ export class BotController implements Bot {
           await this.finishStopped(state, state.request.id);
           continue;
         }
-        const threadId = state.request.threadId ?? state.threadId,
-          revoked = state.request.revoked;
-        const fileIds = state.request.fileIds ?? [];
-        delete state.request;
-        delete state.threadId;
-        if (threadId) state.retiredThreadIds = [...new Set([...(state.retiredThreadIds ?? []), threadId])];
-        if (!revoked)
-          state.delivery = { parts: [{ kind: "text", text: REPEAT },...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
-        this.deps.store.put(state);
+        const threadId = state.request.threadId ?? (state.request.repeat ? undefined : state.threadId);
+        this.failRequest(state, threadId, REPEAT);
       }
       if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
     }

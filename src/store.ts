@@ -12,6 +12,11 @@ import type {
   ModelSelection,
   OutgoingPart,
 } from "./contracts.ts";
+export interface TaskSource {
+  messageId?: number;
+  text: string;
+}
+
 export interface DialogueState extends DialogueAddress {
   migration?: { phase: "creating" | "retry" };
   legacyBinding?: boolean;
@@ -25,9 +30,18 @@ export interface DialogueState extends DialogueAddress {
   history: ConversationMessage[];
   summary?: string;
   contextPressure?: boolean;
+  latestTask?: {
+    sources: TaskSource[];
+    historyIndex: number;
+    completed?: { inputFileIds: string[]; outputFileIds: string[] };
+    button?: string;
+  };
+  /** Superseded outputs remain stored, but are no longer model context. */
+  inactiveFileIds?: string[];
   pending?: {
     refs: AttachmentRef[];
-    captions: string[];
+    sources?: TaskSource[];
+    captions?: string[]; // Legacy pending snapshots.
     readyAt?: number;
     awaitingTask?: boolean;
     savedFiles?: Record<string,string>;
@@ -39,16 +53,19 @@ export interface DialogueState extends DialogueAddress {
     id: string;
     text: string;
     threadId?: string;
+    repeat?: boolean;
     started: number;
     attachments?: AttachmentRef[];
     revoked?: boolean;
     stopped?: boolean;
     fileIds?: string[];
+    imageIds?: string[];
   };
   reset?: { id?: string; threadIds: string[]; retryAt?: number };
   delivery?: {
     parts: Array<OutgoingPart | {kind: "file"; id: string}>;
     next: number;
+    buttonAt?: number;
     retryAt?: number;
     failures?: number;
   };
@@ -223,9 +240,12 @@ export class SqliteStore {
     return this.persistFile(user,file,quota);
   }
   saveResponseFile(user: number | DialogueAddress, requestId: string, file: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
-    return this.persistFile(user,file,quota,requestId);
+    return this.persistFile(user, file, quota, {id: requestId, kind: "file"});
   }
-  private persistFile(user: number | DialogueAddress, file: GeneratedFile, quota: number, requestId?: string): DialogueFile {
+  saveResponseImage(user: DialogueAddress, requestId: string, image: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
+    return this.persistFile(user, image, quota, {id: requestId, kind: "image"});
+  }
+  private persistFile(user: number | DialogueAddress, file: GeneratedFile, quota: number, output?: {id: string; kind: "file" | "image"}): DialogueFile {
     const address = typeof user === "number" ? {userId:user} : user;
     if (!(file.bytes instanceof Uint8Array) || file.bytes.byteLength > RESPONSE_FILE_LIMITS.fileBytes)
       throw new ResponseFileError("Файл превышает 50 МБ. Попросите уменьшить его размер.");
@@ -235,13 +255,20 @@ export class SqliteStore {
     const result = {id: randomUUID(),name,mime,size:file.bytes.byteLength};
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const state = requestId === undefined ? undefined : this.get(address);
-      if (state && (!state.request || state.request.id !== requestId || state.request.revoked || state.request.stopped)) throw new ResponseFileError("Задание больше недоступно.");
-      if (state && (state.request!.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files) throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
-      const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=? AND prepared=0").get(address.userId,address.topicId??0) as {size:number}).size;
+      const state = output ? this.get(address) : undefined;
+      const request = state?.request;
+      if (output && (request?.id !== output.id || request.stopped || (request.revoked && output.kind === "file")))
+        throw new ResponseFileError("Задание больше недоступно.");
+      if (output?.kind === "file" && (request?.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files)
+        throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
+      const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=?").get(address.userId,address.topicId??0) as {size:number}).size;
       if (used + result.size > quota) throw new ResponseFileError("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new.");
       this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes) VALUES(?,?,?,?,?,?,?)").run(result.id,address.userId,address.topicId??0,name,mime,result.size,file.bytes);
-      if (state) { (state.request!.fileIds ??= []).push(result.id); this.put(state); }
+      if (state && request) {
+        const ids = output?.kind === "image" ? (request.imageIds ??= []) : (request.fileIds ??= []);
+        ids.push(result.id);
+        this.put(state);
+      }
       this.db.exec("COMMIT");
       return result;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }

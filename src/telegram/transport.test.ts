@@ -164,14 +164,20 @@ test('long answers preserve every code, table and formula character in order', a
   } finally { await remote.close(); }
 });
 
-test('polling carries durable offset, accepts native draft stops, and supports cancellation', async () => {
+test('polling carries durable offset, accepts edits and native draft stops, and supports cancellation', async () => {
   const remote = await server((method, body) => {
     assert.equal(method,'getUpdates');
-    assert.deepEqual(JSON.parse(body),{offset:71,timeout:20,allowed_updates:['message','callback_query','stopped_message_generation']});
-    return {ok:true,result:[{update_id:71,stopped_message_generation:{chat:{id:7,type:'private'},message_thread_id:9,draft_id:42}}]};
+    assert.deepEqual(JSON.parse(body),{offset:71,timeout:20,allowed_updates:['message','edited_message','callback_query','stopped_message_generation']});
+    return {ok:true,result:[
+      {update_id:71,edited_message:{message_id:1,date:123,chat:{id:7,type:'private'},text:'edited'}},
+      {update_id:72,stopped_message_generation:{chat:{id:7,type:'private'},message_thread_id:9,draft_id:42}},
+    ]};
   });
   try {
-    assert.equal((await remote.api.getUpdates({offset:71,timeout:20}))[0]?.stopped_message_generation?.draft_id,42);
+    const [update, stopped] = await remote.api.getUpdates({offset:71,timeout:20});
+    assert.equal(update?.update_id,71);
+    assert.equal(update?.edited_message?.text,'edited');
+    assert.equal(stopped?.stopped_message_generation?.draft_id,42);
     const controller = new AbortController();
     controller.abort(new Error('secret 123:secret'));
     await assert.rejects(remote.api.getUpdates({offset:71,timeout:20,signal:controller.signal}), (error: any) => error.name === 'AbortError' && !String(error).includes('secret'));
@@ -249,6 +255,23 @@ test('topic routing survives rich fallback, uploads, typing and topic management
   } finally { await remote.close(); }
 });
 
+test('an answer keyboard is attached only to the last message of a long rich fallback', async () => {
+  const seen: Array<{text?: string; reply_markup?: unknown}> = [];
+  const remote = await server((method, body) => {
+    if (method === 'sendRichMessage') return {ok:false,error_code:400,description:'unsupported markdown format'};
+    seen.push(JSON.parse(body));
+    return {ok:true,result:{message_id:seen.length}};
+  });
+  const reply_markup = {inline_keyboard:[[{text:'Другой вариант',callback_data:'repeat:token'}]]};
+  try {
+    const text = 'word '.repeat(1200);
+    await remote.api.sendPart(7,{kind:'rich',text},{message_thread_id:78,reply_markup});
+    assert.equal(seen.map(message => message.text).join(''),text);
+    assert.equal(seen[0]?.reply_markup,undefined);
+    assert.deepEqual(seen.at(-1)?.reply_markup,reply_markup);
+  } finally { await remote.close(); }
+});
+
 test('arbitrary response files use sendDocument with their original editable bytes and Unicode filename',async()=>{
  let received:any;
  const api=new TelegramApi('123:secret',{fetch:async(url,options)=>{
@@ -256,10 +279,12 @@ test('arbitrary response files use sendDocument with their original editable byt
   return new Response(JSON.stringify({ok:true,result:{message_id:9}}));
  }});
  const bytes=Buffer.from('a,b\n1,2');
- assert.equal(await api.sendFile(2,{name:'Отчёт.csv',mime:'text/csv',bytes},{message_thread_id:78}),9);
+ const reply_markup = {inline_keyboard:[[{text:'Другой вариант',callback_data:'repeat:token'}]]};
+ assert.equal(await api.sendFile(2,{name:'Отчёт.csv',mime:'text/csv',bytes},{message_thread_id:78,reply_markup}),9);
  assert.ok(received.url.endsWith('/sendDocument'));
  assert.equal(received.body.get('chat_id'),'2');
  assert.equal(received.body.get('message_thread_id'),'78');
+ assert.deepEqual(JSON.parse(received.body.get('reply_markup')),reply_markup);
  const file=received.body.get('document') as File;
  assert.equal(file.name,'Отчёт.csv');assert.deepEqual(Buffer.from(await file.arrayBuffer()),bytes);
  await assert.rejects(api.sendFile(2,{name:'large.bin',mime:'application/octet-stream',bytes:Buffer.alloc(50_000_001)}));
