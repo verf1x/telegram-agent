@@ -495,11 +495,12 @@ export class BotController implements Bot {
     if (threadId && !restored) void this.cleanRetiredThreads(address).catch(() => {});
   }
 
-  private async cleanPreviews(address: DialogueAddress): Promise<void> {
+  private async cleanPreviews(address: DialogueAddress, messageId?: number): Promise<void> {
     const telegram = this.deps.telegram;
     if (!telegram.deleteMessage) return;
     const entries = this.deps.store.get(address).previewCleanup ?? [];
     for (const {id, retryAt} of entries) {
+      if (messageId !== undefined && id !== messageId) continue;
       if (this.closed || (retryAt && retryAt > Date.now())) continue;
       let retryIn = 0;
       try { await telegram.deleteMessage(address.userId, id, this.controlAbort.signal); }
@@ -531,6 +532,7 @@ export class BotController implements Bot {
       config.requestTimeoutMs,
     );
     let preview: RequestPreview | undefined;
+    let fallbackMessageId: number | undefined;
     const sendTyping = () => {
       const s = this.deps.config.snapshot();
       if (s.valid && this.allowed(userId, s.config))
@@ -560,11 +562,12 @@ export class BotController implements Bot {
             const current = this.deps.store.get(address);
             (current.previewCleanup ??= []).push({id});
             this.deps.store.put(current);
+            fallbackMessageId = id;
           },
         });
         preview = live;
         this.previews.set(key, live);
-        live.stage(request.attachments?.length ? "Загружаю вложения…" : "Готовлю ответ…");
+        live.stage(request.attachments?.length ? "Загружаю вложения" : "Готовлю ответ");
       } else {
         sendTyping();
         typing = setInterval(sendTyping, 4000);
@@ -606,7 +609,7 @@ export class BotController implements Bot {
           materials.push({id: materialId, name: ref.name});
         }
         this.ensureActive(address, request.id, controller.signal);
-        preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF…" : "Читаю вложения…");
+        preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF" : "Читаю вложения");
         attachments = [];
         let textBytes = 0;
         let imageBytes = 0;
@@ -644,12 +647,12 @@ export class BotController implements Bot {
       };
       const start = previousTask ? 0 : state.contextPressure ? state.history.length : recentHistoryStart(state.history, incoming);
       if (start > 0) {
-        preview?.stage("Обновляю контекст диалога…");
+        preview?.stage("Обновляю контекст диалога");
         const retainFrom = state.contextPressure ? start : recentHistoryStart(state.history, incoming, 0.5);
         state = await this.compactHistory(state, retainFrom, request.id, selection, controller.signal);
       }
       this.ensureActive(address, request.id, controller.signal);
-      preview?.stage("Готовлю ответ…");
+      preview?.stage("Готовлю ответ");
       engineStarted = true;
       const live = preview;
       const visible = previousResult && new Set(previousResult.inputFileIds);
@@ -702,10 +705,10 @@ export class BotController implements Bot {
         const attempted = this.deps.store.get(address);
         if (attempted.request?.fileIds?.length) throw error;
         // The provider can exceed the estimate inside a turn. Retry once with the summary alone.
-        preview?.stage("Обновляю контекст диалога…");
+        preview?.stage("Обновляю контекст диалога");
         state = await this.compactHistory(attempted, attempted.history.length, request.id, selection, controller.signal);
         this.ensureActive(address, request.id, controller.signal);
-        preview?.stage("Готовлю ответ…");
+        preview?.stage("Готовлю ответ");
         response = await run();
       }
       const current = this.deps.store.get(address);
@@ -789,6 +792,7 @@ export class BotController implements Bot {
       clearInterval(typing);
       this.controllers.delete(key);
       await preview?.close();
+      if (fallbackMessageId !== undefined) await this.cleanPreviews(address, fallbackMessageId).catch(() => {});
       this.previews.delete(key);
     }
     if (!this.closed) await this.deliver(address);

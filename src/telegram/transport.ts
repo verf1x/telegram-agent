@@ -1,4 +1,4 @@
-import type { ChatId, GeneratedFile, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
+import type { ChatId, DraftOptions, GeneratedFile, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
 import { AttachmentError, ATTACHMENT_LIMITS, RESPONSE_FILE_LIMITS } from '../contracts.ts';
 import { formatText } from './format.ts';
 
@@ -61,8 +61,13 @@ export class TelegramApi implements TelegramTransport {
   getUpdates(options: {offset?:number;timeout:number;signal?:AbortSignal}): Promise<TelegramUpdate[]> {
     return this.#call('getUpdates',{offset:options.offset,timeout:options.timeout,allowed_updates:['message','edited_message','callback_query','stopped_message_generation']},options.signal,(options.timeout + 15) * 1000);
   }
-  async sendDraft(chatId: ChatId, draftId: number, text: string, topicId: number, signal?: AbortSignal): Promise<void> {
-    const accepted = await this.#call<boolean>('sendMessageDraft',{chat_id:chatId,message_thread_id:topicId,draft_id:draftId,text,can_stop:true},signal,2500);
+  async sendDraft(chatId: ChatId, draftId: number, text: string, topicId: number, options: DraftOptions = {}): Promise<void> {
+    // Match the final sendRichMessage. Plain paragraph content keeps incomplete Markdown literal.
+    const type = options.thinking ? 'thinking' : 'paragraph';
+    const accepted = await this.#call<boolean>('sendRichMessageDraft',{
+      chat_id:chatId,message_thread_id:topicId,draft_id:draftId,can_stop:true,
+      rich_message:{blocks:[{type,text}],skip_entity_detection:true},
+    },options.signal,2500);
     if (accepted !== true) throw new TelegramError(0,'draft was not accepted');
   }
   async deleteMessage(chatId: ChatId, messageId: number, signal?: AbortSignal): Promise<void> {

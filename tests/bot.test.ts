@@ -120,12 +120,12 @@ function fixture(t: any, attachments?: AttachmentReader) {
 
 test("one live draft grows in its topic before the formatted answer is delivered", async (t) => {
   const f = fixture(t);
-  const drafts: Array<{id: number; topic: number; text: string}> = [];
+  const drafts: Array<{id: number; topic: number; text: string; thinking: boolean}> = [];
   const streamed = Promise.withResolvers<void>();
   const finish = Promise.withResolvers<void>();
   t.after(() => finish.resolve());
-  f.telegram.sendDraft = async (_chat, id, text, topic) => {
-    drafts.push({id, topic, text});
+  f.telegram.sendDraft = async (_chat, id, text, topic, options) => {
+    drafts.push({id, topic, text, thinking: options?.thinking === true});
     if (text === "Вычислим сумму") streamed.resolve();
   };
   f.engine.run = async (r) => {
@@ -140,9 +140,9 @@ test("one live draft grows in its topic before the formatted answer is delivered
       setTimeout(() => reject(new Error("live text was never shown")), 2500).unref();
     })]);
     assert.equal(f.sent.length, 0);
-    assert.deepEqual(drafts.map(draft => [draft.id, draft.topic, draft.text]), [
-      [drafts[0]!.id, 10, "Готовлю ответ…"],
-      [drafts[0]!.id, 10, "Вычислим сумму"],
+    assert.deepEqual(drafts.map(draft => [draft.id, draft.topic, draft.text, draft.thinking]), [
+      [drafts[0]!.id, 10, "Готовлю ответ", true],
+      [drafts[0]!.id, 10, "Вычислим сумму", false],
     ]);
   } finally { finish.resolve(); }
   await f.bot.drain();
@@ -212,7 +212,7 @@ test("Stop during PDF preparation preserves the source for the next task", {time
   }});
   let downloads = 0;
   f.telegram.downloadFile = async () => { downloads++; return Buffer.from("PDF source"); };
-  f.telegram.sendDraft = async (_chat, id, text) => { if (text === "Читаю PDF…") reading.resolve(id); };
+  f.telegram.sendDraft = async (_chat, id, text) => { if (text === "Читаю PDF") reading.resolve(id); };
   const task = f.update(2, "");
   delete task.message!.text;
   task.message!.caption = "stop while reading";
@@ -329,6 +329,18 @@ test("unsupported drafts use a temporary Stop button that is removed after cance
   assert.deepEqual(callback, ["button-365"]);
   assert.deepEqual(removed, [365]);
   assert.deepEqual(f.sent, []);
+});
+
+test("the temporary Stop message is removed before delivering a completed answer", async (t) => {
+  const f = fixture(t);
+  const events: string[] = [];
+  f.telegram.sendDraft = async () => { throw new TelegramError(404, "unsupported"); };
+  f.telegram.sendText = async () => { events.push("temporary"); return 365; };
+  f.telegram.deleteMessage = async (_chat, id) => { events.push(`removed ${id}`); };
+  f.telegram.sendPart = async (_chat, part) => { events.push(part.kind); return 366; };
+  await f.bot.handleUpdate(f.update(2, "show how"));
+  await f.bot.drain();
+  assert.deepEqual(events, ["temporary", "removed 365", "rich"]);
 });
 
 test("a throttled draft leaves final delivery recoverable after restart", async (t) => {

@@ -184,17 +184,22 @@ test('polling carries durable offset, accepts edits and native draft stops, and 
   } finally { await remote.close(); }
 });
 
-test('drafts stream to a single stoppable preview in the requested topic', async () => {
+test('a formatted answer uses the matching Telegram draft and final methods in its topic', async () => {
   const seen: Array<[string,unknown]> = [];
-  const remote = await server((method,body) => { seen.push([method,JSON.parse(body)]); return {ok:true,result:true}; });
+  const remote = await server((method,body) => {
+    seen.push([method,JSON.parse(body)]);
+    return {ok:true,result:method === 'sendRichMessage' ? {message_id:51} : true};
+  });
   try {
-    await remote.api.sendDraft(7,42,'Читаю PDF',9);
-    await remote.api.sendDraft(7,42,'Ответ 😀',9);
-    await remote.api.deleteMessage(7,51);
+    await remote.api.sendDraft(7,42,'Читаю PDF',9,{thinking:true});
+    await remote.api.sendDraft(7,42,'Ответ 😀 <x> & **',9);
+    await remote.api.sendPart(7,{kind:'rich',text:'Ответ **готов**'},{message_thread_id:9});
     assert.deepEqual(seen,[
-      ['sendMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,text:'Читаю PDF',can_stop:true}],
-      ['sendMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,text:'Ответ 😀',can_stop:true}],
-      ['deleteMessage',{chat_id:7,message_id:51}],
+      ['sendRichMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,can_stop:true,
+        rich_message:{blocks:[{type:'thinking',text:'Читаю PDF'}],skip_entity_detection:true}}],
+      ['sendRichMessageDraft',{chat_id:7,message_thread_id:9,draft_id:42,can_stop:true,
+        rich_message:{blocks:[{type:'paragraph',text:'Ответ 😀 <x> & **'}],skip_entity_detection:true}}],
+      ['sendRichMessage',{chat_id:7,message_thread_id:9,rich_message:{markdown:'Ответ **готов**'}}],
     ]);
   } finally { await remote.close(); }
 });
