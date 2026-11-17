@@ -2,11 +2,17 @@ import { fork } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
-function preload() {
+async function preload() {
+  const enginePath = join(dirname(process.argv[1]), "codex", "engine.ts");
+  const {CodexEngine} = await import(pathToFileURL(enginePath).href);
+  for (const method of ["run", "summarize", "generateTopicTitle", "listModels", "deleteThread", "bindLegacyThread", "health"]) {
+    CodexEngine.prototype[method] = async () => { throw new Error(`Unexpected Codex call during idle benchmark: ${method}`); };
+  }
   let statements = 0;
   let fullScans = 0;
   const prepare = DatabaseSync.prototype.prepare;
@@ -106,7 +112,7 @@ async function run(root, label, historyKiB, seconds) {
   }
 }
 
-if (process.env.VERFIX_ISSUE34_BENCH_CHILD === "1") preload();
+if (process.env.VERFIX_ISSUE34_BENCH_CHILD === "1") await preload();
 else {
   const [baseline, candidate = ".", duration = "60"] = process.argv.slice(2);
   const seconds = Number(duration);

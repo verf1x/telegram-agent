@@ -112,6 +112,7 @@ export class BroadcastController {
         if (!broadcast) return;
         delete broadcast.retryAt;
         if (await this.deliver(broadcast)) this.deps.store.removeBroadcast(broadcast.id);
+        else if (broadcast.retryAt === undefined && this.config()) throw new Error("Broadcast did not advance");
       })
       .then(() => { this.storageRetryAt = undefined; })
       .catch(() => {

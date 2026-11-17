@@ -89,14 +89,49 @@ export interface BroadcastState {
 export class StoredDialogueError extends Error {
   constructor() { super("Не удалось прочитать сохранённое состояние диалога. Данные сохранены."); this.name = "StoredDialogueError"; }
 }
+function validDeadline(value: unknown): boolean {
+  return value == null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+function stringList(value: unknown): boolean {
+  return Array.isArray(value) && value.every(id => typeof id === "string");
+}
 function parseState(value: string): DialogueState {
+  let state: DialogueState;
   try {
-    const state = JSON.parse(value) as DialogueState;
-    if (!state || typeof state !== "object" || !Array.isArray(state.history) ||
-        (state.previewCleanup !== undefined && !Array.isArray(state.previewCleanup))) throw new StoredDialogueError();
-    return state;
+    state = JSON.parse(value) as DialogueState;
+  } catch {
+    throw new StoredDialogueError();
   }
-  catch { throw new StoredDialogueError(); }
+  if (!state || !Array.isArray(state.history) || !validDeadline(state.bindingRetryAt) ||
+      (state.threadId != null && typeof state.threadId !== "string") ||
+      (state.pending != null && (!Array.isArray(state.pending.refs) || !validDeadline(state.pending.readyAt))) ||
+      (state.request != null && (typeof state.request.id !== "string" ||
+        (state.request.threadId != null && typeof state.request.threadId !== "string") ||
+        (state.request.fileIds != null && !stringList(state.request.fileIds)) ||
+        (state.request.imageIds != null && !stringList(state.request.imageIds)))) ||
+      (state.reset != null && (!stringList(state.reset.threadIds) || !validDeadline(state.reset.retryAt))) ||
+      (state.deleting != null && (!stringList(state.deleting.threadIds) || !validDeadline(state.deleting.retryAt))) ||
+      (state.delivery != null && (!Array.isArray(state.delivery.parts) || !validDeadline(state.delivery.retryAt) ||
+        !Number.isSafeInteger(state.delivery.next) || state.delivery.next < 0)) ||
+      (state.previewCleanup != null && (!Array.isArray(state.previewCleanup) ||
+        state.previewCleanup.some(entry => !Number.isSafeInteger(entry?.id) || !validDeadline(entry.retryAt)))) ||
+      (state.latestTask?.sources !== undefined && (!Array.isArray(state.latestTask.sources) ||
+        state.latestTask.sources.some(source => typeof source?.text !== "string"))) ||
+      (state.retiredThreadIds != null && !stringList(state.retiredThreadIds)) ||
+      (state.inactiveFileIds != null && !stringList(state.inactiveFileIds)) ||
+      (state.username != null && typeof state.username !== "string")) throw new StoredDialogueError();
+  return state;
+}
+
+type BroadcastRow = {id: string; owner_id: number; state: string};
+const broadcastStatuses = new Set(["pending", "sending", "sent", "skipped", "failed", "unknown"]);
+function parseBroadcast(row: BroadcastRow): BroadcastState | undefined {
+  try {
+    const state = JSON.parse(row.state) as BroadcastState;
+    if (state?.id === row.id && state.owner?.userId === row.owner_id && typeof state.text === "string" &&
+        validDeadline(state.retryAt) && Array.isArray(state.recipients) && state.recipients.every(recipient =>
+          Number.isSafeInteger(recipient?.userId) && broadcastStatuses.has(recipient.status))) return state;
+  } catch { /* Report the error at the storage boundary, without the input. */ }
 }
 
 type DialogueRow = { user_id: number; topic_id: number };
@@ -104,29 +139,33 @@ function addressOf(row: DialogueRow): DialogueAddress {
   return {userId: row.user_id, ...(row.topic_id ? {topicId: row.topic_id} : {})};
 }
 
+type DialogueOperation = {kind: "binding" | "delete" | "reset" | "delivery"; dueAt: number};
+export function dialogueOperations(state: DialogueState): DialogueOperation[] {
+  if (state.legacyBinding) return [{kind: "binding", dueAt: state.bindingRetryAt ?? 0}];
+  const operations: DialogueOperation[] = [];
+  if (state.deleting) operations.push({kind: "delete", dueAt: state.deleting.retryAt ?? 0});
+  if (state.reset) operations.push({kind: "reset", dueAt: state.reset.retryAt ?? 0});
+  if (state.delivery) operations.push({kind: "delivery", dueAt: state.delivery.retryAt ?? 0});
+  return operations;
+}
+
 function dialogueMetadata(state: DialogueState) {
-  const due = [];
-  if (state.legacyBinding) due.push(state.bindingRetryAt ?? 0);
-  else {
-    if (state.deleting) due.push(state.deleting.retryAt ?? 0);
-    if (state.reset) due.push(state.reset.retryAt ?? 0);
-    if (state.delivery) due.push(state.delivery.retryAt ?? 0);
-  }
+  const operations = dialogueOperations(state);
   let previewDue: number | null = null;
   for (const preview of state.previewCleanup ?? []) {
     const at = preview?.retryAt ?? 0;
     previewDue = previewDue === null ? at : Math.min(previewDue, at);
   }
-  return [state.username ?? null, Number(Boolean(state.request || due.length)),
+  return [state.username ?? null, Number(Boolean(state.request || operations.length)),
     Number(Boolean(state.pending || state.request || state.retiredThreadIds?.length)),
     state.pending?.readyAt ?? null, Number(Boolean((state.request && !state.request.revoked) || state.delivery || state.pending?.readyAt || (state.pending && !state.pending.awaitingTask))),
-    Number(Boolean(state.deleting?.error)), state.topicId && due.length ? Math.min(...due) : null,
+    Number(Boolean(state.deleting?.error)), state.topicId && operations.length ? Math.min(...operations.map(op => op.dueAt)) : null,
     previewDue] as const;
 }
 
 export class SqliteStore {
   private readonly db: DatabaseSync;
-  private acceptedOffset: number;
+  private acceptedOffset = 0;
   private transacting = false;
   private changed = false;
   private readonly listeners = new Set<() => void>();
@@ -181,6 +220,7 @@ export class SqliteStore {
         CREATE INDEX dialogues_preview ON dialogues (preview_at,user_id,topic_id) WHERE preview_at IS NOT NULL AND unreadable=0;
         CREATE INDEX dialogues_unreadable ON dialogues (user_id,topic_id) WHERE unreadable=1;
         CREATE INDEX broadcasts_owner ON broadcasts (owner_id) WHERE unreadable=0;
+        CREATE INDEX broadcasts_unreadable ON broadcasts (id) WHERE unreadable=1;
       `);
       const addresses = this.addresses(upgrade ? "1" : "unreadable=1");
       const update = this.db.prepare(`UPDATE dialogues SET
@@ -192,8 +232,14 @@ export class SqliteStore {
           if (state) update.run(...dialogueMetadata(state), address.userId, address.topicId ?? 0);
         } catch (error) { if (!(error instanceof StoredDialogueError)) throw error; }
       }
-      if (upgrade) this.db.exec(`UPDATE broadcasts SET due_at=CASE WHEN json_valid(state)
-        THEN coalesce(json_extract(state,'$.retryAt'),0) ELSE 0 END`);
+      const reports = this.db.prepare(`SELECT id,owner_id,state FROM broadcasts WHERE ${upgrade ? "1" : "unreadable=1"}`)
+        .all() as BroadcastRow[];
+      const saveDue = this.db.prepare("UPDATE broadcasts SET due_at=?,unreadable=0 WHERE id=?");
+      for (const row of reports) {
+        const state = parseBroadcast(row);
+        if (state) saveDue.run(state.retryAt ?? 0, row.id);
+        else this.markUnreadableBroadcast(row.id);
+      }
     });
   }
   watchWork(listener: () => void): () => void {
@@ -207,12 +253,14 @@ export class SqliteStore {
   private transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     this.transacting = true;
+    const previousOffset = this.acceptedOffset;
     let result: T;
     try {
       result = work();
       this.db.exec("COMMIT");
     } catch (error) {
       this.changed = false;
+      this.acceptedOffset = previousOffset;
       this.db.exec("ROLLBACK");
       throw error;
     } finally { this.transacting = false; }
@@ -349,10 +397,12 @@ export class SqliteStore {
     const offset = Math.max(updateId + 1, this.acceptedOffset);
     this.transaction(() => {
       save();
-      if (offset > this.acceptedOffset) this.db.prepare(`INSERT INTO metadata(key,value) VALUES('offset',?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(offset));
+      if (offset > this.acceptedOffset) {
+        this.db.prepare(`INSERT INTO metadata(key,value) VALUES('offset',?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(offset));
+        this.acceptedOffset = offset;
+      }
     });
-    this.acceptedOffset = offset;
   }
   broadcastHead(ownerId: number): {id: string; due_at: number} | undefined {
     return this.db.prepare("SELECT id,due_at FROM broadcasts WHERE owner_id=? AND unreadable=0 ORDER BY rowid LIMIT 1")
@@ -363,14 +413,15 @@ export class SqliteStore {
     return head && this.getBroadcast(head.id);
   }
   getBroadcast(id: string): BroadcastState | undefined {
-    const row = this.db.prepare("SELECT state FROM broadcasts WHERE id=? AND unreadable=0").get(id) as {state: string} | undefined;
+    const row = this.db.prepare("SELECT id,owner_id,state FROM broadcasts WHERE id=? AND unreadable=0").get(id) as BroadcastRow | undefined;
     if (!row) return;
-    try {
-      const state = JSON.parse(row.state) as BroadcastState;
-      if (!state?.owner || state.id !== id || !Array.isArray(state.recipients)) throw new Error();
-      return state;
-    } catch {
-      this.db.prepare("UPDATE broadcasts SET unreadable=1 WHERE id=?").run(id);
+    const state = parseBroadcast(row);
+    if (!state) this.markUnreadableBroadcast(id);
+    return state;
+  }
+  private markUnreadableBroadcast(id: string): void {
+    const result = this.db.prepare("UPDATE broadcasts SET unreadable=1 WHERE id=? AND unreadable=0").run(id);
+    if (result.changes) {
       console.error("Не удалось прочитать сохранённую рассылку. Данные сохранены.");
       this.notifyWork();
     }

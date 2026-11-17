@@ -34,7 +34,7 @@ import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./br
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
 import { TelegramError } from "./telegram/transport.ts";
-import { SqliteStore, StoredDialogueError } from "./store.ts";
+import { dialogueOperations, SqliteStore, StoredDialogueError } from "./store.ts";
 import type { DialogueState, TaskSource } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 import { DEFAULT_TOPIC_TITLE, GENERIC_TOPIC_TITLE, safeTopicTitle, topicTitleInput } from "./topic-title.ts";
@@ -85,6 +85,7 @@ export class BotController implements Bot {
   private readonly unsubscribeConfig: (() => void) | undefined;
   private readonly unsubscribeWork: () => void;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private retryAt = Infinity;
   private resumeQueued = false;
   private recovering = false;
   private readonly dialogueRetries = new Map<string, number>();
@@ -109,10 +110,7 @@ export class BotController implements Bot {
   private busy(state: DialogueState): boolean {
     return Boolean(
       state.request ||
-      state.delivery ||
-      state.reset ||
-      state.deleting ||
-      state.legacyBinding ||
+      dialogueOperations(state).length ||
       this.jobs.has(dialogueKey(state)),
     );
   }
@@ -146,7 +144,7 @@ export class BotController implements Bot {
       const created = message.forum_topic_created;
       if (created && snapshot.valid && this.allowed(address.userId, snapshot.config)) {
         if (created.name === "Предыдущий диалог" && this.deps.store.get(address.userId).migration) {
-          this.adoptLegacy(address.userId, address.topicId);
+          this.deps.store.moveLegacy(address.userId, address.topicId);
           this.deps.store.accept(update.update_id);
         } else if (created.name === "Предыдущий диалог") {
           // The createTopic response can arrive before the migration service event.
@@ -1429,7 +1427,7 @@ export class BotController implements Bot {
       this.control(async () => {
         try {
           const topicId = await this.deps.telegram.createTopic(state.userId, "Предыдущий диалог", this.controlAbort.signal);
-          this.adoptLegacy(state.userId, topicId);
+          this.deps.store.moveLegacy(state.userId, topicId);
         } catch (error) {
           const current = this.deps.store.get(state.userId);
           if (!current.migration) return;
@@ -1441,9 +1439,6 @@ export class BotController implements Bot {
         }
       });
     }
-  }
-  private adoptLegacy(userId: number, topicId: number): void {
-    this.deps.store.moveLegacy(userId, topicId);
   }
   private async bindLegacy(address: DialogueAddress): Promise<void> {
     const state = this.deps.store.get(address);
@@ -1484,6 +1479,7 @@ export class BotController implements Bot {
       if (this.closed || this.recovering) return;
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
+      this.retryAt = Infinity;
       this.background(() => {
         const reload = this.pendingReload;
         this.pendingReload = undefined;
@@ -1500,8 +1496,9 @@ export class BotController implements Bot {
     });
   }
   private wakeAt(at: number): void {
-    if (this.closed || !Number.isFinite(at)) return;
+    if (this.closed || !Number.isFinite(at) || at >= this.retryAt) return;
     clearTimeout(this.retryTimer);
+    this.retryAt = at;
     this.retryTimer = setTimeout(() => this.resume(), Math.min(2_147_483_647, Math.max(0, at - Date.now())));
     this.retryTimer.unref();
   }
@@ -1524,7 +1521,11 @@ export class BotController implements Bot {
         this.previewCleanups.add(key);
         this.control(async () => {
           await Promise.resolve();
-          try { await this.cleanPreviews(address); retries.delete(key); }
+          try {
+            if (this.closed || !this.deps.config.snapshot().valid) return;
+            await this.cleanPreviews(address);
+            retries.delete(key);
+          }
           catch (error) { failed(error); }
           finally { this.previewCleanups.delete(key); this.resume(); }
         });
@@ -1541,11 +1542,12 @@ export class BotController implements Bot {
     if (this.closed || !this.deps.config.snapshot().valid) return;
     const state = this.deps.store.get(address);
     const now = Date.now();
-    if (state.legacyBinding) {
-      if ((state.bindingRetryAt ?? 0) <= now) await this.bindLegacy(address);
-    } else if (state.deleting && (state.deleting.retryAt ?? 0) <= now) await this.deleteDialogue(address);
-    else if (state.reset && (state.reset.retryAt ?? 0) <= now) await this.reset(address);
-    else if (state.delivery && (state.delivery.retryAt ?? 0) <= now) await this.deliver(address);
+    switch (dialogueOperations(state).find(operation => operation.dueAt <= now)?.kind) {
+      case "binding": await this.bindLegacy(address); break;
+      case "delete": await this.deleteDialogue(address); break;
+      case "reset": await this.reset(address); break;
+      case "delivery": await this.deliver(address); break;
+    }
   }
   private readSaved(address: DialogueAddress): DialogueState | undefined {
     try { return this.deps.store.findDialogue(address); }
@@ -1603,23 +1605,27 @@ export class BotController implements Bot {
     this.recovering = true;
     try {
       for (const address of this.deps.store.recoveryAddresses()) {
-        const state = this.readSaved(address);
-        if (!state) continue;
-        if (state.pending) {
-          clearPendingPrompt(state.pending);
-          if (!state.request && !state.delivery)
-            state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
-          this.deps.store.put(state);
-        }
-        if (state.request) {
-          if (state.request.stopped) {
-            await this.finishStopped(state, state.request.id);
-            continue;
+        try {
+          const state = this.deps.store.findDialogue(address);
+          if (!state) continue;
+          if (state.pending) {
+            clearPendingPrompt(state.pending);
+            if (!state.request && !state.delivery)
+              state.delivery = { parts: [{ kind: "text", text: "Материалы сохранены. После перезапуска повторите текст задания." }], next: 0 };
+            this.deps.store.put(state);
           }
-          const threadId = state.request.threadId ?? (state.request.repeat ? undefined : state.threadId);
-          this.failRequest(state, threadId, REPEAT);
+          if (state.request) {
+            if (state.request.stopped) {
+              await this.finishStopped(state, state.request.id);
+              continue;
+            }
+            const threadId = state.request.threadId ?? (state.request.repeat ? undefined : state.threadId);
+            this.failRequest(state, threadId, REPEAT);
+          }
+          if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
+        } catch (error) {
+          if (!(error instanceof StoredDialogueError)) throw error;
         }
-        if (state.retiredThreadIds?.length) await this.cleanRetiredThreads(state);
       }
       this.startLegacyMigrations();
     } finally {

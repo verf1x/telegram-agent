@@ -58,9 +58,15 @@ test('old pending operations resume around an unreadable dialogue and pick it up
   const insert = db.prepare('INSERT INTO dialogues VALUES (2,?,?)');
   const reply = (topicId: number, text: string) => JSON.stringify({userId: 2, topicId, history: [],
     delivery: {parts: [{kind: 'text', text: 'already acknowledged'}, {kind: 'text', text}], next: 1}});
-  insert.run(10, `{"invalid": "${marker}"`);
+  const unreadable = JSON.stringify({userId: 2, topicId: 10, history: [{role: 'user', text: marker}],
+    pending: {refs: [], readyAt: {}}});
+  insert.run(10, unreadable);
   insert.run(11, reply(11, 'valid answer'));
   insert.run(12, JSON.stringify({userId: 2, topicId: 12, history: [], reset: {threadIds: ['old']}}));
+  insert.run(13, JSON.stringify({userId: 2, topicId: 13, history: [], request: {id: 'running', imageIds: {length: 1}}}));
+  insert.run(14, JSON.stringify({userId: 2, topicId: 14, history: [], request: {id: 'repeat', repeat: true},
+    latestTask: {sources: null, completed: {}}}));
+  insert.run(15, JSON.stringify({userId: 2, topicId: 15, history: [], request: {id: 'thread', threadId: {}}}));
   db.close();
 
   const sent: string[] = [], cleaned: string[] = [];
@@ -80,17 +86,44 @@ test('old pending operations resume around an unreadable dialogue and pick it up
   const delivered = ['valid answer', 'Диалог сброшен. Отправьте новый запрос.'];
   assert.deepEqual(sent.slice().sort(), delivered.slice().sort());
   assert.deepEqual(cleaned, ['old']);
-  assert.equal(diagnostic.mock.callCount(), 1);
-  assert.ok(!String(diagnostic.mock.calls[0]?.arguments).includes(marker));
+  assert.equal(diagnostic.mock.callCount(), 4);
+  assert.ok(diagnostic.mock.calls.every(call => !String(call.arguments).includes(marker)));
 
   const repair = new DatabaseSync(path);
-  assert.equal(repair.prepare('SELECT state FROM dialogues WHERE topic_id=10').get()?.state, `{"invalid": "${marker}"`);
+  assert.equal(repair.prepare('SELECT state FROM dialogues WHERE topic_id=10').get()?.state, unreadable);
   repair.prepare('UPDATE dialogues SET state=? WHERE topic_id=10').run(reply(10, 'repaired answer'));
   repair.close();
   await recover();
   assert.equal(sent.length, 3);
   assert.equal(sent[2], 'repaired answer');
-  assert.equal(diagnostic.mock.callCount(), 1);
+  assert.equal(diagnostic.mock.callCount(), 4);
+});
+
+test('an unreadable confirmed broadcast does not prevent the following one from reaching its recipients', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'verfix-broadcast-schema-'));
+  t.after(() => rmSync(dir, {recursive: true, force: true}));
+  const path = join(dir, 'db');
+  const db = new DatabaseSync(path);
+  db.exec('CREATE TABLE broadcasts (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, state TEXT NOT NULL)');
+  const insert = db.prepare('INSERT INTO broadcasts VALUES (?,1,?)');
+  insert.run('bad', JSON.stringify({id: 'bad', owner: {}, text: 'PRIVATE-BROADCAST', recipients: []}));
+  insert.run('good', JSON.stringify({id: 'good', owner: {userId: 1}, text: 'announcement',
+    recipients: [{userId: 2, status: 'pending'}]}));
+  db.close();
+  const diagnostic = t.mock.method(console, 'error', () => {});
+  const store = new SqliteStore(path);
+  const sends: [number, string][] = [];
+  const telegram = {sendText: async (id, text) => { sends.push([id, text]); return 1; }} satisfies Partial<TelegramTransport>;
+  const config = {ownerId: 1, allowedUserIds: [2]} as BotConfig;
+  const bot = createBot({store, config: {snapshot: () => ({valid: true, config})},
+    telegram: telegram as TelegramTransport, engine: {} as ModelEngine});
+  try {
+    await bot.recover();
+    await bot.drain();
+    assert.deepEqual(sends.filter(([id]) => id === 2), [[2, 'announcement']]);
+    assert.equal(diagnostic.mock.callCount(), 1);
+    assert.ok(!String(diagnostic.mock.calls[0]?.arguments).includes('PRIVATE-BROADCAST'));
+  } finally { await bot.shutdown(); store.close(); }
 });
 
 test('malformed stored state never exposes dialogue content through parser errors', t=>{

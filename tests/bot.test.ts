@@ -934,6 +934,29 @@ test("startup applies the access list before resuming a saved delivery", async (
   assert.equal(f.store.get(2, 10).history[0]?.text, "retained");
 });
 
+test("after restart the saved retry deadline gates the remaining answer and a pending deletion", async (t) => {
+  const f = fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  await f.bot.shutdown();
+  f.store.put({userId: 2, topicId: 10, history: [], delivery: {next: 1, retryAt: now + 30_000,
+    parts: [{kind: "text", text: "acknowledged"}, {kind: "text", text: "remaining"}]}});
+  f.store.put({userId: 2, topicId: 11, history: [], deleting: {threadIds: [], retryAt: now + 30_000}});
+  const deletes: number[] = [];
+  f.telegram.deleteTopic = async (_userId, topicId) => { deletes.push(topicId); };
+  await f.reopen();
+  assert.deepEqual(f.sent, []);
+  assert.deepEqual(deletes, []);
+
+  now += 30_000;
+  await f.reopen();
+  assert.deepEqual(f.sent.map(item => item.text), ["remaining"]);
+  assert.deepEqual(deletes, [11]);
+  await f.reopen();
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual(deletes, [11]);
+});
+
 test("invalid runtime configuration pauses accepted output and owner diagnostics recover automatically", async (t) => {
   const f = fixture(t);
   let finish!: (value: any) => void;
