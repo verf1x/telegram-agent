@@ -51,11 +51,13 @@ function fixture(t: any, attachments?: AttachmentReader) {
     },
     typing: async () => {},
     createTopic: async () => 77,
+    renameTopic: async () => {},
     deleteTopic: async () => {},
     answerCallback: async () => {},
   };
   const engine: ModelEngine = {
     summarize: async ({summary, text}) => summary ?? text.slice(0, 1000),
+    generateTopicTitle: async () => undefined,
     run: async (r) => {
       requests.push(r);
       await r.onThread(`thread-${r.userId}`);
@@ -1391,6 +1393,202 @@ test('native topic renaming is acknowledged without an unsolicited task or error
   const f=fixture(t);const u=f.update(2,'');u.message!.forum_topic_edited={name:'Работа'};
   await f.bot.handleUpdate(u);await f.bot.drain();
   assert.equal(f.requests.length,0);assert.equal(f.sent.length,0);
+});
+
+function topicEvent(f: ReturnType<typeof fixture>, topicId: number, kind: 'forum_topic_created' | 'forum_topic_edited', name: string) {
+  const update = f.update(2, '');
+  update.message!.message_thread_id = topicId;
+  update.message![kind] = {name};
+  return update;
+}
+
+test('the first successful request gives a confirmed new topic a single title across replay, restart and reset', async (t) => {
+  const f = fixture(t);
+  const renamed: unknown[][] = [];
+  f.telegram.renameTopic = async (userId, topicId, title) => { renamed.push([userId, topicId, title]); };
+  f.engine.generateTopicTitle = async text => {
+    assert.equal(text, 'Помоги подготовиться к экзамену по матанализу');
+    return 'Подготовка к экзамену по матанализу';
+  };
+  const created = topicEvent(f, 10, 'forum_topic_created', 'Новый диалог');
+  await f.bot.handleUpdate(created);
+  const run = f.engine.run;
+  f.engine.run = async () => { throw new Error('model failed'); };
+  await f.bot.handleUpdate(f.update(2, 'failed'));
+  await f.bot.drain();
+  assert.equal(renamed.length, 0);
+  f.engine.run = async () => ({text: 'partial answer', threadId: 'partial', images: [], partial: true});
+  await f.bot.handleUpdate(f.update(2, 'partial'));
+  await f.bot.drain();
+  assert.equal(renamed.length, 0);
+  f.engine.run = run;
+  const first = f.update(2, 'Помоги подготовиться к экзамену по матанализу');
+  await f.bot.handleUpdate(first);
+  await f.bot.drain();
+  await f.bot.handleUpdate(first);
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, '/new'));
+  await f.bot.drain();
+  await f.bot.handleUpdate(topicEvent(f, 10, 'forum_topic_created', 'Новый диалог'));
+  await f.bot.handleUpdate(f.update(2, 'another request'));
+  await f.bot.drain();
+  assert.deepEqual(renamed, [[2, 10, 'Подготовка к экзамену по матанализу']]);
+  assert.match(f.sent.at(-1)!.text, /another request/);
+});
+
+test('parallel topics get titles from their own tasks, including an attachment caption', {timeout: 5000}, async (t) => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({name: file.name, text: 'private document', images: []}))});
+  f.telegram.downloadFile = async () => new Uint8Array([1, 2, 3]);
+  const renamed = new Map<number, string>();
+  f.telegram.renameTopic = async (userId, topicId, title) => {
+    assert.equal(userId, 2);
+    renamed.set(topicId, title);
+  };
+  const first = Promise.withResolvers<string>();
+  const second = Promise.withResolvers<string>();
+  t.after(() => { first.resolve(''); second.resolve(''); });
+  const firstNaming = Promise.withResolvers<void>();
+  const bothAnswered = Promise.withResolvers<void>();
+  const sendPart = f.telegram.sendPart;
+  f.telegram.sendPart = async (...args) => {
+    const result = await sendPart(...args);
+    if (f.sent.filter(sent => sent.part).length === 2) bothAnswered.resolve();
+    return result;
+  };
+  const inputs: string[] = [];
+  f.engine.generateTopicTitle = text => {
+    inputs.push(text);
+    if (inputs.length === 1) {
+      firstNaming.resolve();
+      return first.promise;
+    }
+    return second.promise;
+  };
+  await f.bot.handleUpdate(topicEvent(f, 10, 'forum_topic_created', 'Новый диалог'));
+  const implicit = topicEvent(f, 11, 'forum_topic_created', 'New Topic');
+  implicit.message!.forum_topic_created!.is_name_implicit = true;
+  await f.bot.handleUpdate(implicit);
+  await f.bot.handleUpdate(f.update(2, 'Составь план тренировки'));
+  const upload = fileUpdate(f.update(2, ''), 'private-name.txt', 'Изучи таблицу');
+  upload.message!.message_thread_id = 11;
+  await f.bot.handleUpdate(upload);
+  await Promise.all([bothAnswered.promise, firstNaming.promise]);
+  assert.equal(inputs.length, 1);
+  assert.deepEqual(f.sent.filter(sent => sent.part).map(sent => sent.options.message_thread_id).sort(), [10, 11]);
+  assert.equal(renamed.size, 0);
+  const captionFirst = inputs[0] === 'Изучи таблицу';
+  first.resolve(captionFirst ? 'Разбор таблицы' : 'План тренировки');
+  second.resolve(captionFirst ? 'План тренировки' : 'Разбор таблицы');
+  await f.bot.drain();
+  assert.deepEqual(inputs.sort(), ['Изучи таблицу', 'Составь план тренировки']);
+  assert.equal(renamed.get(10), 'План тренировки');
+  assert.equal(renamed.get(11), 'Разбор таблицы');
+});
+
+test('custom, existing unknown and migrated topic titles are preserved', async (t) => {
+  const f = fixture(t);
+  const named: string[] = [];
+  f.engine.generateTopicTitle = async text => { named.push(text); return 'Заголовок'; };
+  await f.bot.handleUpdate(topicEvent(f, 11, 'forum_topic_created', 'Учеба'));
+  f.store.put({userId: 2, topicId: 12, history: []});
+  await f.bot.handleUpdate(topicEvent(f, 12, 'forum_topic_created', 'Новый диалог'));
+  f.store.put({userId: 2, history: [{role: 'user', text: 'legacy content'}], migration: {phase: 'creating'}});
+  await f.bot.handleUpdate(topicEvent(f, 77, 'forum_topic_created', 'Предыдущий диалог'));
+  for (const topicId of [10, 11, 12, 77]) {
+    const request = f.update(2, 'request');
+    request.message!.message_thread_id = topicId;
+    await f.bot.handleUpdate(request);
+    await f.bot.drain();
+  }
+  assert.equal(f.sent.filter(sent => sent.part).length, 4);
+  assert.deepEqual(named, []);
+});
+
+test('service edits received before or during title generation preserve the user title', {timeout: 5000}, async (t) => {
+  const f = fixture(t);
+  const started = Promise.withResolvers<AbortSignal>();
+  const proposal = Promise.withResolvers<string>();
+  f.engine.generateTopicTitle = async (_text, signal) => { started.resolve(signal); return proposal.promise; };
+  const renamed: number[] = [];
+  f.telegram.renameTopic = async (_user, topicId) => { renamed.push(topicId); };
+  await f.bot.handleUpdate(topicEvent(f, 11, 'forum_topic_created', 'Новый диалог'));
+  await f.bot.discardOfflineUpdates([topicEvent(f, 11, 'forum_topic_edited', 'Мой заголовок')]);
+  const request = f.update(2, 'Existing manual name');
+  request.message!.message_thread_id = 11;
+  await f.bot.handleUpdate(request);
+  await f.bot.drain();
+
+  await f.bot.handleUpdate(topicEvent(f, 10, 'forum_topic_created', 'Новый диалог'));
+  await f.bot.handleUpdate(f.update(2, 'Manual rename in progress'));
+  const signal = await started.promise;
+  await f.bot.handleUpdate(topicEvent(f, 10, 'forum_topic_edited', 'Новый диалог'));
+  proposal.resolve('Автоматический заголовок');
+  await f.bot.drain();
+  assert.equal(signal.aborted, true);
+  assert.equal(f.sent.filter(sent => sent.part).length, 2);
+  assert.deepEqual(renamed, []);
+});
+
+test('an empty title or a Telegram rename failure leaves the already delivered answer and consumes the attempt', async (t) => {
+  const f = fixture(t);
+  const inputs: string[] = [];
+  const renamed: string[] = [];
+  f.engine.generateTopicTitle = async text => {
+    inputs.push(text);
+    if (text === 'пустой заголовок') return ' ';
+    return 'Логин @private_handle и номер 123456';
+  };
+  f.telegram.renameTopic = async (_user, topicId, title) => {
+    assert.ok(f.sent.some(sent => sent.part && sent.options.message_thread_id === topicId));
+    renamed.push(title);
+    throw new TelegramError(400, 'TOPIC_DELETED');
+  };
+  const tasks = [
+    {topicId: 10, text: 'пустой заголовок'},
+    {topicId: 11, text: 'Проверь @private_handle 123456 test@example.com проект Магнолия для Ивана Петрова\nПароль: hidden'},
+  ];
+  for (const {topicId, text} of tasks) {
+    await f.bot.handleUpdate(topicEvent(f, topicId, 'forum_topic_created', 'Новый диалог'));
+    for (const input of [text, 'follow-up']) {
+      const request = f.update(2, input);
+      request.message!.message_thread_id = topicId;
+      await f.bot.handleUpdate(request);
+      await f.bot.drain();
+    }
+  }
+  assert.deepEqual(inputs, ['пустой заголовок', 'Проверь для']);
+  assert.deepEqual(renamed, ['Обсуждение задания']);
+  assert.equal(f.sent.filter(sent => sent.part).length, 4);
+});
+
+test('revoking access, resetting the dialogue and confirming deletion cancel pending title generation', {timeout: 5000}, async (t) => {
+  for (const action of ['revoke', 'reset', 'delete']) {
+    await t.test(action, async (subtest) => {
+      const f = fixture(subtest);
+      const started = Promise.withResolvers<AbortSignal>();
+      const title = Promise.withResolvers<string>();
+      f.engine.generateTopicTitle = async (_text, signal) => { started.resolve(signal); return title.promise; };
+      const renamed: number[] = [];
+      f.telegram.renameTopic = async (_user, topicId) => { renamed.push(topicId); };
+      await f.bot.handleUpdate(topicEvent(f, 10, 'forum_topic_created', 'Новый диалог'));
+      await f.bot.handleUpdate(f.update(2, 'Первое задание'));
+      const signal = await started.promise;
+      const cancelled = new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), {once: true}));
+      if (action === 'revoke') writeFileSync(f.env, f.configText(''));
+      else if (action === 'reset') await f.bot.handleUpdate(f.update(2, '/new'));
+      else {
+        await f.bot.handleUpdate(f.update(2, '/delete'));
+        const token = f.sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].callback_data;
+        const update = f.update(2, '');
+        await f.bot.handleUpdate({update_id: update.update_id, callback_query: {id: 'yes', from: {id: 2}, message: update.message!, data: token}});
+      }
+      await cancelled;
+      title.resolve('Автоматический заголовок');
+      await f.bot.drain();
+      assert.match(f.sent.find(sent => sent.part)?.text ?? '', /Первое задание/);
+      assert.deepEqual(renamed, []);
+    });
+  }
 });
 
 test('expired delete confirmation cannot delete a topic, including after restart',async(t)=>{

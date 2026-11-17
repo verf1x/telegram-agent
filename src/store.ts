@@ -13,6 +13,7 @@ import type {
   OutgoingPart,
 } from "./contracts.ts";
 export interface DialogueState extends DialogueAddress {
+  autoNameTopic?: true;
   migration?: { phase: "creating" | "retry" };
   legacyBinding?: boolean;
   bindingRetryAt?: number;
@@ -173,11 +174,23 @@ export class SqliteStore {
       throw error;
     }
   }
+  acceptTopicCreation(updateId: number, address: DialogueAddress & {topicId: number}, eligible: boolean): void {
+    this.acceptUpdate(updateId, () => {
+      const state: DialogueState = {...address, history: [], ...(eligible ? {autoNameTopic: true} : {})};
+      this.db.prepare("INSERT INTO dialogues(user_id,topic_id,state) VALUES(?,?,?) ON CONFLICT DO NOTHING")
+        .run(address.userId, address.topicId, JSON.stringify(state));
+    });
+  }
   accept(updateId: number, state?: DialogueState | BroadcastState): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    this.acceptUpdate(updateId, () => {
       if (state && "recipients" in state) this.putBroadcast(state);
       else if (state) this.put(state);
+    });
+  }
+  private acceptUpdate(updateId: number, save: () => void): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      save();
       this.setOffset(updateId + 1);
       this.db.exec("COMMIT");
     } catch (error) {

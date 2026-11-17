@@ -226,7 +226,10 @@ test('topic routing survives rich fallback, uploads, typing and topic management
     const png = readFileSync(new URL('../../tests/fixtures/attachments/tiny.png',import.meta.url));
     await remote.api.sendPart(2,{kind:'image',name:'result.png',mime:'image/png',base64:png.toString('base64')},{message_thread_id:78});
     assert.equal(await remote.api.createTopic(2,'Предыдущий диалог'),78);
+    await remote.api.renameTopic(2,78,'Подготовка к экзамену');
     await remote.api.deleteTopic(2,78);
+    assert.deepEqual(JSON.parse(seen.find(call => call.method === 'editForumTopic')!.body),
+      {chat_id:2,message_thread_id:78,name:'Подготовка к экзамену'});
     for (const call of seen.filter(x=>x.method!=='createForumTopic')) {
       if (call.method==='sendPhoto') assert.match(call.body,/name="message_thread_id"\r\n\r\n78/);
       else assert.equal(JSON.parse(call.body).message_thread_id,78,call.method);

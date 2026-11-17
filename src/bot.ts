@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import type {
   AttachmentReader,
   DialogueAddress,
@@ -31,6 +32,7 @@ import { formatAnswer, formatText } from "./telegram/format.ts";
 import { SqliteStore } from "./store.ts";
 import type { DialogueState } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
+import { DEFAULT_TOPIC_TITLE, GENERIC_TOPIC_TITLE, safeTopicTitle, topicTitleInput } from "./topic-title.ts";
 interface Dependencies {
   config: ConfigSource;
   store: SqliteStore;
@@ -52,6 +54,9 @@ export class BotController implements Bot {
   private readonly controlAbort = new AbortController();
   private readonly broadcasts: BroadcastController;
   private readonly topicControls = new Map<string, AbortController>();
+  private readonly topicTitles = new Map<string, AbortController>();
+  // At most one background naming turn, outside the slots reserved for user requests.
+  private topicTitleQueue = Promise.resolve();
   private readonly preparing = new Set<string>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly albums = new Map<string, { timer: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void }>();
@@ -93,12 +98,29 @@ export class BotController implements Bot {
     const callback = update.callback_query;
     const message = callback?.message ?? update.message;
     const from = callback?.from ?? message?.from;
-    if (snapshot.valid && !callback && message?.chat.type === "private" && message.forum_topic_created && message.message_thread_id && this.allowed(message.chat.id, snapshot.config)) {
-      const legacy = this.deps.store.get(message.chat.id);
-      if (legacy.migration && message.forum_topic_created.name === "Предыдущий диалог") {
-        this.adoptLegacy(message.chat.id, message.message_thread_id);
-      }
-      this.deps.store.accept(update.update_id);
+    if (!callback && message?.chat.type === "private" && message.message_thread_id &&
+        (message.forum_topic_created || message.forum_topic_edited)) {
+      const address = {userId: message.chat.id, topicId: message.message_thread_id};
+      const created = message.forum_topic_created;
+      if (created && snapshot.valid && this.allowed(address.userId, snapshot.config)) {
+        if (created.name === "Предыдущий диалог" && this.deps.store.get(address.userId).migration) {
+          this.adoptLegacy(address.userId, address.topicId);
+          this.deps.store.accept(update.update_id);
+        } else if (created.name === "Предыдущий диалог") {
+          // The createTopic response can arrive before the migration service event.
+          this.deps.store.accept(update.update_id);
+        } else {
+          const eligible = created.name === DEFAULT_TOPIC_TITLE || created.is_name_implicit === true;
+          this.deps.store.acceptTopicCreation(update.update_id, address, eligible);
+        }
+      } else if (message.forum_topic_edited?.name !== undefined) {
+        const state = this.deps.store.get(address);
+        this.topicTitles.get(dialogueKey(address))?.abort();
+        if (state.autoNameTopic) {
+          delete state.autoNameTopic;
+          this.deps.store.accept(update.update_id, state);
+        } else this.deps.store.accept(update.update_id);
+      } else this.deps.store.accept(update.update_id);
       return;
     }
     if (
@@ -514,10 +536,13 @@ export class BotController implements Bot {
       });
       current.lastResponse = answer.text;
       const revoked = current.request.revoked;
+      const autoName = current.autoNameTopic && !revoked && !response.partial && !imageWarning;
+      if (autoName) delete current.autoNameTopic;
       delete current.request;
       if (!revoked)
         current.delivery = { parts: [...formatAnswer(answer),...fileIds.map(id=>({kind:"file" as const,id}))], next: 0 };
       this.deps.store.put(current);
+      if (autoName && address.topicId) this.nameTopic({userId, topicId: address.topicId}, request.text);
     } catch (error) {
       if (this.closed) return;
       const current = this.deps.store.get(address);
@@ -600,6 +625,33 @@ export class BotController implements Bot {
       if (!current.retiredThreadIds.length) delete current.retiredThreadIds;
       this.deps.store.put(current);
     }
+  }
+  private nameTopic(address: DialogueAddress & {topicId: number}, text: string): void {
+    const key = dialogueKey(address);
+    const abort = new AbortController();
+    this.topicTitles.set(key, abort);
+    const signal = AbortSignal.any([abort.signal, this.controlAbort.signal, AbortSignal.timeout(30_000)]);
+    const canRename = () => {
+      const snapshot = this.deps.config.snapshot();
+      return !signal.aborted && snapshot.valid && this.allowed(address.userId, snapshot.config);
+    };
+    const task = this.topicTitleQueue.then(async () => {
+      try {
+        // Start the first answer send before spending time on the title.
+        await setImmediate(undefined, {signal});
+        if (!canRename()) return;
+        const input = topicTitleInput(text);
+        const title = input && /\p{L}/u.test(input)
+          ? safeTopicTitle(await this.abortable(this.deps.engine.generateTopicTitle(input, signal), signal))
+          : GENERIC_TOPIC_TITLE;
+        if (title && canRename())
+          await this.abortable(this.deps.telegram.renameTopic(address.userId, address.topicId, title, signal), signal);
+      } finally {
+        this.topicTitles.delete(key);
+      }
+    }).catch(() => {});
+    this.topicTitleQueue = task;
+    this.control(() => task);
   }
   private ensureActive(address: DialogueAddress, requestId: string, signal: AbortSignal): void {
     const userId = address.userId;
@@ -850,12 +902,14 @@ export class BotController implements Bot {
     const threadIds = [...new Set([state.threadId, state.request?.threadId, ...(state.retiredThreadIds ?? []), ...(state.reset?.threadIds ?? [])].filter((id): id is string => Boolean(id)))];
     const cleared: DialogueState = {
       userId: state.userId, topicId: state.topicId, history: [],
+      ...(!deleting && state.autoNameTopic ? {autoNameTopic: true} : {}),
       ...(state.username ? {username: state.username} : {}),
       ...(state.selection ? {selection: state.selection} : {}),
       ...(deleting ? {deleting: {id: randomUUID(), threadIds}} : {reset: {id: randomUUID(), threadIds}}),
     };
     // Durable cancellation precedes abort: every late callback sees the tombstone.
     this.deps.store.accept(updateId, cleared);
+    this.topicTitles.get(dialogueKey(state))?.abort();
     this.cancelAlbum(state);
     this.topicControls.get(dialogueKey(state))?.abort();
     this.topicControls.delete(dialogueKey(state));
@@ -1022,6 +1076,7 @@ export class BotController implements Bot {
   }
   private reloaded(snapshot: ConfigSnapshot): void {
     if (!snapshot.valid) {
+      for (const controller of this.topicTitles.values()) controller.abort();
       for (const [id, controller] of this.controllers)
         if (this.preparing.has(id)) controller.abort(new AttachmentError("Обработка приостановлена. После исправления настроек повторите текст задания; материалы сохранены."));
         else if (!this.deps.store.all().find(s => dialogueKey(s) === id)?.request) controller.abort();
@@ -1029,6 +1084,7 @@ export class BotController implements Bot {
     }
     for (const state of this.deps.store.all())
       if (!this.allowed(state.userId, snapshot.config)) {
+        this.topicTitles.get(dialogueKey(state))?.abort();
         this.cancelAlbum(state);
         if (state.pending) {
           state.pending.captions = [];
@@ -1132,7 +1188,10 @@ export class BotController implements Bot {
   async discardOfflineUpdates(updates: TelegramUpdate[]): Promise<void> {
     for (const update of updates) {
       if (update.update_id < this.deps.store.offset) continue;
-      if (update.message?.forum_topic_created) { await this.handleUpdate(update); continue; }
+      if (update.message?.forum_topic_created || update.message?.forum_topic_edited) {
+        await this.handleUpdate(update);
+        continue;
+      }
       if (BROADCAST_COMMAND.test(update.message?.text ?? "")) {
         this.deps.store.accept(update.update_id);
         continue;
