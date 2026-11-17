@@ -99,6 +99,7 @@ export interface TelegramCallbackQuery {
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  edited_message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
 }
 
@@ -171,6 +172,8 @@ export interface ConversationMessage {
   role: "user" | "assistant";
   text: string;
   attachments?: PreparedAttachment[];
+  /** IDs of saved generated images in delivery order. */
+  imageIds?: string[];
 }
 
 export interface ModelInfo {
@@ -206,6 +209,8 @@ export interface ModelResponse {
   threadId: string;
   images: GeneratedImage[];
   fileIds?: string[];
+  /** A failed turn or tool can still produce files or images worth delivering. */
+  incomplete?: true;
 }
 
 export interface ModelEngine {

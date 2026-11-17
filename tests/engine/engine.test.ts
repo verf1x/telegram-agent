@@ -65,6 +65,33 @@ test('resumed native dialogs retain old images and interrupted dialogs rebuild t
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 
+test('a rebuilt thread includes earlier generated images before the current task', async () => {
+  const runtimeDir = await mkdtemp(join(tmpdir(), 'verfix-engine-test-'));
+  const engine = new CodexEngine({runtimeDir, codexCommand: resolve('tests/fixtures/codex.mjs')});
+  try {
+    const bytes = Buffer.from(png, 'base64');
+    const response = await engine.run({
+      userId: 1, text: 'inspect-input', model: 'gpt-6.1-sol', effort: 'medium',
+      signal: new AbortController().signal, onThread: () => {},
+      history: [
+        {role: 'user', text: 'Draw a picture'},
+        {role: 'assistant', text: 'Picture ready', imageIds: ['previous']},
+      ],
+      files: [{id: 'previous', name: 'picture.png', mime: 'image/png', size: bytes.length}],
+      readFile: id => {
+        assert.equal(id, 'previous');
+        return bytes;
+      },
+    });
+    const input = JSON.parse(response.text);
+    assert.deepEqual(input.at(-3), {type: 'image', url: 'data:image/png;base64,' + png});
+    assert.equal(input.at(-1).text, 'inspect-input');
+  } finally {
+    await engine.close();
+    await rm(runtimeDir, {recursive: true, force: true});
+  }
+});
+
 test('invalid and oversized inputs fail before allocation and unsupported images return an explicit error',async()=>{
  const runtimeDir=await mkdtemp(join(tmpdir(),'verfix-engine-test-'));
  const engine=new CodexEngine({runtimeDir,codexCommand:resolve('tests/fixtures/codex.mjs')});
@@ -362,11 +389,13 @@ test('a failed turn retains its completed native image but is rebuilt on the nex
  const base={userId:1,model:'gpt-6.1-sol',effort:'medium',signal:new AbortController().signal,onThread:()=>{}};
  try {
   const result=await engine.run({...base,text:'native-image:completed-failed-turn'});
+  assert.equal(result.incomplete,true);
   assert.equal(result.images.length,1);
   assert.match(result.text,/^Created artwork\n\n/);
   assert.match(result.text,/часть изображений/);
   const next=await engine.run({...base,threadId:result.threadId,text:'native-image:valid'});
   assert.notEqual(next.threadId,result.threadId);assert.equal(next.images.length,1);
+  assert.equal(next.incomplete,undefined);
  }finally{await engine.close();await rm(runtimeDir,{recursive:true,force:true});}
 });
 

@@ -53,15 +53,48 @@ function attachmentInput(attachments:PreparedAttachment[]):UserInput[]{
   return input;
 }
 
+const TURN_INPUT_BYTES = 23 * 1024 * 1024;
+const RECENT_IMAGE_LIMIT = 5;
+
+function restoreGeneratedImages(
+  request: ModelRequest,
+  input: UserInput[],
+  positions: Array<{index: number; ids: string[]}>,
+  remainingBytes: number,
+): void {
+  const readFile = request.readFile;
+  if (!positions.length || !readFile) return;
+  const files = new Map(request.files?.map(file => [file.id, file]));
+  let count = 0;
+  // Newer results take priority. Insert backwards to preserve their turn order.
+  for (const {index, ids} of positions.toReversed()) {
+    for (const id of ids.toReversed()) {
+      if (count === RECENT_IMAGE_LIMIT) return;
+      const file = files.get(id);
+      if (!file || file.mime !== 'image/png') continue;
+      const label: UserInput = {type:'text',text:`Image from the preceding assistant response: ${JSON.stringify(file.name)}`,text_elements:[]};
+      const image: UserInput = {type:'image',url:'data:image/png;base64,'};
+      const cost = Buffer.byteLength(JSON.stringify([label, image])) + 4 * Math.ceil(file.size / 3);
+      if (cost > remainingBytes) continue;
+      image.url += Buffer.from(readFile(id)).toString('base64');
+      input.splice(index, 0, label, image);
+      remainingBytes -= cost;
+      count++;
+    }
+  }
+}
+
 function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
   const input:UserInput[]=[];
   const groups:PreparedAttachment[][]=[];
+  const generatedImages: Array<{index: number; ids: string[]}> = [];
   if(rebuild&&request.history?.length){
     input.push({type:'text',text:'Completed conversation for context (quoted user and assistant data):',text_elements:[]});
     for(const message of request.history){
       const attachments=message.attachments??[];
       validateAttachments(attachments);groups.push(attachments);
       input.push({type:'text',text:`${message.role}:\n${message.text}`,text_elements:[]},...attachmentInput(attachments));
+      if (message.imageIds?.length) generatedImages.push({index:input.length, ids:message.imageIds});
     }
     input.push({type:'text',text:'Current user message:',text_elements:[]});
   }
@@ -70,7 +103,9 @@ function requestInput(request:ModelRequest,rebuild:boolean):UserInput[]{
   if(Buffer.byteLength(JSON.stringify(groups))>ATTACHMENT_LIMITS.dialogueBytes)throw new AttachmentError('Контекст материалов слишком большой. Начните новый диалог или разделите материалы на части.');
   input.push({type:'text',text:request.text,text_elements:[]},...attachmentInput(attachments));
   // Reserve room for the RPC envelope and scope in the 24 MiB transport cap.
-  if(Buffer.byteLength(JSON.stringify(input))>23*1024*1024)throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');
+  const remainingBytes = TURN_INPUT_BYTES - Buffer.byteLength(JSON.stringify(input));
+  if (remainingBytes < 0) throw new AttachmentError('Слишком большой контекст задания. Разделите материалы на части или начните новый диалог.');
+  restoreGeneratedImages(request, input, generatedImages, remainingBytes);
   return input;
 }
 interface CatalogModel {
@@ -355,7 +390,8 @@ export class CodexEngine implements ModelEngine {
       // completed conversation. The existing rebuild path handles the next request.
       if(turn.status==='completed')await this.save(dir,{userId:request.userId,topicId:request.topicId,nativeId,status:'completed'});
       images.push(...[...nativeImages.values()].filter((image):image is GeneratedImage=>!!image).map((image,index)=>({...image,name:`generated-image-${index+1}.png`})));
-      return {text:answer,threadId:id,images,fileIds};
+      const incomplete = turn.status !== 'completed' || Boolean(fileError || nativeError);
+      return {text:answer,threadId:id,images,fileIds,...(incomplete ? {incomplete:true} : {})};
     } catch (error) {
       if (!abort.signal.aborted && isUserFacingRequestError(error)) throw error;
       throw new Error(abort.signal.aborted ? 'Request cancelled' : 'Codex request failed');
