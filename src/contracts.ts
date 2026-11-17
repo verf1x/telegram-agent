@@ -23,7 +23,7 @@ export interface TelegramMessage {
   caption?: string;
   media_group_id?: string;
   message_thread_id?: number | undefined;
-  forum_topic_created?: { name: string };
+  forum_topic_created?: { name: string; is_name_implicit?: true };
   forum_topic_edited?: { name?: string };
   photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>;
   document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
@@ -157,6 +157,7 @@ export interface TelegramTransport {
   sendPart(chatId: ChatId, part: OutgoingPart, options?: SendOptions): Promise<number>;
   typing(chatId: ChatId, signal?: AbortSignal, topicId?: number | undefined): Promise<void>;
   createTopic(chatId: ChatId, name: string, signal?: AbortSignal): Promise<number>;
+  renameTopic(chatId: ChatId, topicId: number, name: string, signal?: AbortSignal): Promise<void>;
   deleteTopic(chatId: ChatId, topicId: number, signal?: AbortSignal): Promise<void>;
   answerCallback(id: string, text?: string, signal?: AbortSignal): Promise<void>;
   downloadFile?(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array>;
@@ -257,6 +258,7 @@ export interface ModelEngine {
   run(request: ModelRequest): Promise<ModelResponse>;
   restoreStoppedThread?(threadId: string, requestId: string, address: DialogueAddress): Promise<boolean>;
   summarize(request: SummaryRequest): Promise<string>;
+  generateTopicTitle(text: string, signal: AbortSignal): Promise<string | undefined>;
   listModels(signal?: AbortSignal): Promise<ModelInfo[]>;
   deleteThread(threadId: string): Promise<void>;
   bindLegacyThread(threadId: string, address: DialogueAddress): Promise<void>;

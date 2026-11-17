@@ -162,6 +162,9 @@ export class TelegramApi implements TelegramTransport {
     const topic = await this.#call<{message_thread_id:number}>('createForumTopic',{chat_id:chatId,name},signal);
     return topic.message_thread_id;
   }
+  async renameTopic(chatId: ChatId, topicId: number, name: string, signal?: AbortSignal): Promise<void> {
+    await this.#call('editForumTopic',{chat_id:chatId,message_thread_id:topicId,name},signal);
+  }
   async deleteTopic(chatId: ChatId, topicId: number, signal?: AbortSignal): Promise<void> {
     try { await this.#call('deleteForumTopic',{chat_id:chatId,message_thread_id:topicId},signal); }
     catch (error) { if (!(error instanceof TelegramError && error.topicMissing)) throw error; }
