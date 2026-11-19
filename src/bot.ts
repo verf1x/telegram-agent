@@ -23,7 +23,10 @@ import type {
 import {
   dialogueKey,
   ATTACHMENT_LIMITS,
+  AttachmentBatchError,
   AttachmentError,
+  AttachmentFileError,
+  AttachmentReaderUnavailableError,
   ModelContextError,
   ModelSelectionError,
   ResponseFileError,
@@ -34,8 +37,8 @@ import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./br
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
 import { TelegramError } from "./telegram/transport.ts";
-import { dialogueOperations, SqliteStore, StoredDialogueError, StoredFileUnavailableError } from "./store.ts";
-import type { DialogueState, TaskSource } from "./store.ts";
+import { dialogueOperations, DialogueFileQuotaError, SqliteStore, StoredDialogueError, StoredFileUnavailableError } from "./store.ts";
+import type { AttachmentTask, DialogueState, TaskSource } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 import { DEFAULT_TOPIC_TITLE, GENERIC_TOPIC_TITLE, safeTopicTitle, topicTitleInput } from "./topic-title.ts";
 interface Dependencies {
@@ -61,6 +64,15 @@ function clearPendingPrompt(pending: NonNullable<DialogueState["pending"]>): voi
   delete pending.sources;
   delete pending.captions;
   delete pending.readyAt;
+}
+function attachmentName(name: string): string {
+  return name.replace(/[\x00-\x1f\x7f]/g, "_").slice(0, 180);
+}
+function attachmentWarnings(task: AttachmentTask): string[] {
+  return (task.attachments ?? []).flatMap((ref, index) => {
+    const reason = task.excludedAttachments?.[index];
+    return reason ? [`«${attachmentName(ref.name)}»: ${reason}`] : [];
+  });
 }
 export function createBot(deps: Dependencies): BotController {
   return new BotController(deps);
@@ -259,7 +271,7 @@ export class BotController implements Bot {
         : undefined;
     if (!message.text && !ref) {
       this.deps.store.accept(update.update_id);
-      this.control(() => this.safeText(address, "Отправьте текст, фото или файл: JPEG, PNG, WebP, PDF, DOCX, XLSX, PPTX либо текстовый UTF-8 документ."));
+      this.control(() => this.safeText(address, "Отправьте текст, фото или файл: JPEG, PNG, WebP, PDF, DOCX, XLSX, XLSM, PPTX либо текстовый UTF-8 документ."));
       return;
     }
     const state = this.deps.store.get(address);
@@ -268,6 +280,10 @@ export class BotController implements Bot {
       .exec(message.text ?? "")?.[1]
       ?.toLowerCase();
     if (command) {
+      if (command === "retry") {
+        this.retryAttachments(state, config, update.update_id);
+        return;
+      }
       if (command === "delete") {
         if (state.deleting) {
           this.deps.store.accept(update.update_id);
@@ -304,30 +320,36 @@ export class BotController implements Bot {
     }
     if (ref) {
       const refs = [...(state.pending?.refs ?? []), ref];
-      if (
-        refs.length > ATTACHMENT_LIMITS.files ||
-        refs.some((r) => r.size !== undefined && (
-          !Number.isFinite(r.size) || r.size < 0 || r.size > ATTACHMENT_LIMITS.fileBytes
-        )) ||
-        refs.reduce((n, r) => n + (r.size ?? 0), 0) > ATTACHMENT_LIMITS.batchBytes
-      ) {
+      const fileTooLarge = ref.size !== undefined && (
+        !Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > ATTACHMENT_LIMITS.fileBytes
+      );
+      const batchTooLarge = refs.length > ATTACHMENT_LIMITS.files ||
+        refs.reduce((n, r) => n + (r.size ?? 0), 0) > ATTACHMENT_LIMITS.batchBytes;
+      if (fileTooLarge || batchTooLarge) {
         this.cancelAlbum(address);
-        state.pending ??= { refs: [] };
-        clearPendingPrompt(state.pending);
-        state.pending.awaitingTask = true;
+        if (message.media_group_id) {
+          state.pending ??= {refs: []};
+          state.pending.blockedAlbumId = message.media_group_id;
+        }
+        if (state.pending) {
+          clearPendingPrompt(state.pending);
+          state.pending.awaitingTask = true;
+        }
         this.deps.store.accept(update.update_id, state);
-        this.control(() => this.safeText(address, "Не более 10 вложений, 20 МБ на файл и 50 МБ на задание. Вложение отклонено; остальные материалы сохранены. Разделите материалы и повторите текст задания или очистите их через /new."));
+        const reason = fileTooLarge ? "Лимит на файл составляет 20 МБ. Пришлите файл меньшего размера."
+          : "Лимит на задание составляет 10 вложений и 50 МБ. Отправьте этот файл в отдельном задании.";
+        const remaining = state.pending?.refs.length ? " Отправьте текст задания, чтобы продолжить с принятыми файлами." : "";
+        this.control(() => this.safeText(address, `Файл «${attachmentName(ref.name)}» отклонён. ${reason}${remaining}`));
         return;
       }
       state.pending ??= { refs: [] };
       state.pending.refs.push(ref);
     }
-    const text = message.text ?? (
-      state.pending?.awaitingTask ? undefined : message.caption
-    );
+    const blockedAlbum = message.media_group_id && message.media_group_id === state.pending?.blockedAlbumId;
+    const text = message.text ?? (blockedAlbum ? undefined : message.caption);
     if (state.pending) {
-      if (message.text?.trim()) delete state.pending.awaitingTask;
-      const collectingAlbum = ref && !state.pending.awaitingTask && (message.media_group_id || state.pending.readyAt);
+      const collectingAlbum = ref && !blockedAlbum && (message.media_group_id || state.pending.readyAt);
+      if (text?.trim() || collectingAlbum) delete state.pending.awaitingTask;
       if (text?.trim() || collectingAlbum)
         (state.pending.sources ??= pendingSources(state.pending)).push({ messageId: message.message_id, text: text ?? "" });
       if (collectingAlbum) state.pending.readyAt = Date.now() + ATTACHMENT_LIMITS.albumQuietMs;
@@ -366,12 +388,34 @@ export class BotController implements Bot {
       id: randomUUID(),
       text: taskText(sources),
       started: Date.now(),
-      ...(state.pending?.refs.length ? { attachments: state.pending.refs } : {}),
+      ...(state.pending?.refs.length ? {attachments: state.pending.refs, savedAttachments: state.pending.savedFiles ?? {}} : {}),
     };
-    if (state.pending) {
-      clearPendingPrompt(state.pending);
-    }
+    delete state.pending;
     this.startRequest(state, config, updateId);
+  }
+  private retryAttachments(state: DialogueState, config: BotConfig, updateId: number): void {
+    const blocked = this.busy(state) || state.pending?.readyAt ? BUSY : this.atCapacity(config) ? CAPACITY : undefined;
+    const retry = state.attachmentRetry;
+    if (blocked || !retry) {
+      this.deps.store.accept(updateId);
+      this.control(() => this.safeText(state, blocked ?? "В этом топике нет задания с вложениями для повтора."));
+      return;
+    }
+    const {sources, ...task} = retry;
+    delete state.attachmentRetry;
+    state.latestTask = {sources, historyIndex: state.history.length};
+    state.request = {...task, id: randomUUID(), started: Date.now()};
+    this.startRequest(state, config, updateId);
+  }
+  private rememberAttachmentRetry(state: DialogueState): boolean {
+    const request = state.request;
+    if (!request?.attachments?.some((_, index) => !request.excludedAttachments?.[index]))
+      return false;
+    const {text, attachments, savedAttachments, excludedAttachments} = request;
+    this.hideFiles(state, Object.values(state.attachmentRetry?.savedAttachments ?? {}));
+    state.attachmentRetry = {text, attachments, savedAttachments: savedAttachments ?? {},
+      ...(excludedAttachments ? {excludedAttachments} : {}), sources: state.latestTask?.sources ?? [{text}]};
+    return true;
   }
   private atCapacity(config: BotConfig): boolean {
     return this.busyCount() >= config.maxConcurrentRequests;
@@ -522,6 +566,7 @@ export class BotController implements Bot {
         this.armRepeat(current);
       }
     }
+    this.rememberAttachmentRetry(current);
     delete current.request;
     if (threadId && !restored) {
       if (current.threadId === threadId) delete current.threadId;
@@ -615,47 +660,44 @@ export class BotController implements Bot {
       if (request.repeat && original?.role !== "user") throw new Error("Repeat task unavailable");
       let attachments = original?.attachments;
       const materials: MaterialReference[] = [];
+      const preparationNotes: string[] = [];
       if (request.attachments?.length) {
         this.preparing.add(dialogueKey(address));
-        if (!this.deps.telegram.downloadFile)
-          throw new AttachmentError("Обработка вложений сейчас недоступна. Повторите задание позже.");
-        const files = [];
+        const files: Array<{name: string; mime: string; bytes: Uint8Array; originalFileId: string; index: number}> = [];
         let total = 0;
         for (const [index, ref] of request.attachments.entries()) {
+          if (request.excludedAttachments?.[index]) continue;
           this.ensureActive(address, request.id, controller.signal);
-          const savedId = state.pending?.savedFiles?.[ref.fileId];
-          let bytes: Uint8Array;
+          const saved = this.deps.store.get(address).request?.savedAttachments;
+          const savedId = saved && Object.hasOwn(saved, ref.fileId) ? saved[ref.fileId] : undefined;
           try {
-            bytes = savedId ? this.deps.store.readFile(address,savedId)
-              : await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+            let bytes: Uint8Array;
+            if (savedId) {
+              bytes = this.deps.store.readFile(address, savedId);
+            } else {
+              if (!this.deps.telegram.downloadFile)
+                throw new AttachmentError("Загрузка вложений сейчас недоступна.");
+              bytes = await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+            }
+            this.ensureActive(address, request.id, controller.signal);
+            if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes)
+              throw new AttachmentFileError("Лимит на файл составляет 20 МБ. Пришлите файл меньшего размера.");
+            if (total + bytes.byteLength > ATTACHMENT_LIMITS.batchBytes) {
+              this.excludeAttachment(address, index, "Файл не поместился в лимит 50 МБ на задание. Отправьте его отдельно.");
+              continue;
+            }
+            const materialId = savedId ?? this.deps.store.saveAttachment(
+              address, request.id, ref.fileId, {name: ref.name, mime: ref.mime, bytes}, config.dialogueFileBytes,
+            ).id;
+            total += bytes.byteLength;
+            files.push({name: ref.name, mime: ref.mime, bytes, originalFileId: materialId, index});
           } catch (error) {
-            if (!(error instanceof StoredFileUnavailableError)) throw error;
-            const current = this.deps.store.get(address);
-            if (current.pending) {
-              current.pending.refs = current.pending.refs.filter(item => item.fileId !== ref.fileId);
-              if (current.pending.savedFiles) delete current.pending.savedFiles[ref.fileId];
-              if (!current.pending.refs.length) delete current.pending;
-              this.deps.store.put(current);
-            }
-            throw new AttachmentError(`Вложение «${ref.name}» недоступно. Пришлите его заново и повторите задание.`);
+            const reason = error instanceof StoredFileUnavailableError ? "Сохранённая копия недоступна. Пришлите файл заново."
+              : error instanceof DialogueFileQuotaError ? "Хранилище топика заполнено. Пришлите файл меньшего размера или используйте другой топик."
+              : error instanceof AttachmentFileError ? error.message : undefined;
+            if (!reason) throw error;
+            this.excludeAttachment(address, index, reason);
           }
-          this.ensureActive(address, request.id, controller.signal);
-          total += bytes.byteLength;
-          const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
-          if (bytes.byteLength > ATTACHMENT_LIMITS.fileBytes || total + remaining > ATTACHMENT_LIMITS.batchBytes)
-            throw new AttachmentError("Превышен размер материалов: 20 МБ на файл, 50 МБ на задание. Разделите материалы на несколько заданий.");
-          const current = this.deps.store.get(address);
-          let materialId = current.pending?.savedFiles?.[ref.fileId];
-          if (!materialId) {
-            const saved = this.deps.store.saveFile(address,{name:ref.name,mime:ref.mime,bytes},config.dialogueFileBytes);
-            materialId = saved.id;
-            if (current.pending) {
-              (current.pending.savedFiles ??= {})[ref.fileId] = materialId;
-              this.deps.store.put(current);
-            }
-          }
-          files.push({name: ref.name, mime: ref.mime, bytes, originalFileId: materialId});
-          materials.push({id: materialId, name: ref.name});
         }
         this.ensureActive(address, request.id, controller.signal);
         preview?.stage(files.every(file => file.mime === "application/pdf" || /\.pdf$/i.test(file.name)) ? "Читаю PDF" : "Читаю вложения");
@@ -664,15 +706,24 @@ export class BotController implements Bot {
         let imageBytes = 0;
         for (const file of files) {
           let prepared: PreparedAttachment | undefined;
+          let exceedsPreparationLimit = false;
+          const macroWorkbook = /\.xlsm$/i.test(file.name);
           if (this.deps.attachments) {
             try {
               const result = await this.abortable(this.deps.attachments.prepare([file], controller.signal), controller.signal);
               if (result.length === 1) prepared = result[0];
             } catch (error) {
-              if (!(error instanceof AttachmentError)) throw error;
+              if (error instanceof AttachmentFileError) {
+                const advice = macroWorkbook ? " Если книга открывается, пересохраните её в .xlsx без макросов." : "";
+                this.excludeAttachment(address, file.index, error.message + advice, file.originalFileId);
+                continue;
+              }
+              if (!(error instanceof AttachmentError) || error instanceof AttachmentReaderUnavailableError) throw error;
+              exceedsPreparationLimit = error instanceof AttachmentBatchError;
             }
             this.ensureActive(address, request.id, controller.signal);
           }
+          materials.push({id: file.originalFileId, name: file.name});
           if (prepared) {
             const nextText = textBytes + Buffer.byteLength(prepared.text);
             const nextImages = prepared.images.reduce((sum, image) => sum + Buffer.byteLength(image.base64, "base64"), imageBytes);
@@ -682,12 +733,22 @@ export class BotController implements Bot {
               imageBytes = nextImages;
               continue;
             }
+            exceedsPreparationLimit = true;
+          }
+          const display = attachmentName(file.name);
+          if (exceedsPreparationLimit) {
+            preparationNotes.push(`Передал «${display}» в исходном виде из-за лимита подготовки. Для отдельного разбора отправьте файл в новом задании.`);
+          } else if (macroWorkbook && this.deps.attachments) {
+            preparationNotes.push(`Передал «${display}» в исходном виде. Если книгу не удалось прочитать, пересохраните её в .xlsx без макросов.`);
           }
           attachments.push({name: file.name, text: "", images: [], originalFileId: file.originalFileId});
         }
+        if (!attachments.length)
+          throw new AttachmentError("В задании нет вложений, которые удалось подготовить.");
       }
       this.preparing.delete(dialogueKey(address));
       this.ensureActive(address, request.id, controller.signal);
+      state = this.deps.store.get(address);
       const inputMaterials = original?.materials ?? materials;
       const incoming = {
         role: "user" as const, text: request.text,
@@ -705,7 +766,10 @@ export class BotController implements Bot {
       engineStarted = true;
       const live = preview;
       const visible = previousResult && new Set(previousResult.inputFileIds);
-      const inactive = new Set(state.inactiveFileIds);
+      const inactive = new Set([
+        ...(state.inactiveFileIds ?? []),
+        ...Object.values(state.attachmentRetry?.savedAttachments ?? {}),
+      ]);
       let inputFileIds: string[] = [];
       const run = () => {
         const files = this.deps.store.listFiles(address).filter(file =>
@@ -795,7 +859,7 @@ export class BotController implements Bot {
           current.history.length = previousTask.historyIndex;
           this.hideFiles(current, previousResult.outputFileIds);
           delete current.contextPressure;
-        } else if (attachments) delete current.pending;
+        }
         current.threadId = response.threadId;
         if (response.contextPressure) current.contextPressure = true;
         current.history.push(incoming, {
@@ -811,9 +875,15 @@ export class BotController implements Bot {
       const revoked = current.request.revoked;
       const autoName = current.autoNameTopic && !revoked && !response.incomplete && !imageWarning;
       if (autoName) delete current.autoNameTopic;
+      const deliveryWarnings = attachmentWarnings(current.request);
       delete current.request;
       if (!revoked) {
-        current.delivery = { parts: [...formatAnswer(answer), ...fileIds.map(id => ({kind: "file" as const, id}))], next: 0 };
+        current.delivery = { parts: [
+          ...formatAnswer(answer),
+          ...deliveryWarnings.map(text => ({kind: "text" as const, text: "Вложение исключено. " + text})),
+          ...preparationNotes.map(text => ({kind: "text" as const, text})),
+          ...fileIds.map(id => ({kind: "file" as const, id})),
+        ], next: 0 };
         this.armRepeat(current);
       }
       this.deps.store.put(current);
@@ -901,11 +971,19 @@ export class BotController implements Bot {
   private retireThread(state: DialogueState, id: string): void {
     state.retiredThreadIds = [...new Set([...(state.retiredThreadIds ?? []), id])];
   }
+  private excludeAttachment(address: DialogueAddress, index: number, reason: string, savedId?: string): void {
+    const current = this.deps.store.get(address);
+    if (!current.request) return;
+    (current.request.excludedAttachments ??= {})[index] = reason;
+    if (savedId) this.hideFiles(current, [savedId]);
+    this.deps.store.put(current);
+  }
   private failRequest(state: DialogueState, threadId: string | undefined, message: string): void {
     const request = state.request;
     if (!request) return;
     const fileIds = request.fileIds ?? [];
     const imageIds = request.imageIds ?? [];
+    const retry = this.rememberAttachmentRetry(state);
     if (request.repeat) this.hideFiles(state, [...fileIds, ...imageIds]);
     else delete state.latestTask;
     if (threadId) {
@@ -931,7 +1009,9 @@ export class BotController implements Bot {
       const missing = imageIds.length > images.length + deferredImages.length ? " Часть сохранённых изображений недоступна." : "";
       state.delivery = {
         parts: [
-          { kind: "text", text: prefix + message + missing },
+          { kind: "text", text: prefix + message + missing +
+            (retry ? " Чтобы повторить это задание с вложениями, отправьте /retry." : "") },
+          ...attachmentWarnings(request).map(text => ({kind: "text" as const, text: "Вложение исключено. " + text})),
           ...formatAnswer({text: "", images}),
           ...recoveredFiles.map(id => ({kind: "file" as const, id})),
         ],
@@ -1116,7 +1196,7 @@ export class BotController implements Bot {
       case "help":
         await this.safeText(
           address,
-          OPEN_TOPIC + " Создание и переименование доступны в интерфейсе Telegram. /delete — удалить текущую тему и данные после подтверждения; штатное удаление темы не гарантирует немедленную очистку данных бота. Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. Для получения документа попросите PDF, Word, Excel, презентацию или другой файл; до 10 файлов по 50 МБ. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
+          OPEN_TOPIC + " Создание и переименование доступны в интерфейсе Telegram. /delete — удалить текущую тему и данные после подтверждения; штатное удаление темы не гарантирует немедленную очистку данных бота. Отправьте текст для Codex или до 10 фото и файлов. Текст задания можно добавить в подписи или отправить отдельным сообщением после материалов. /retry повторяет последнее прерванное задание с вложениями в этой теме. Для получения документа попросите PDF, Word, Excel, презентацию или другой файл; до 10 файлов по 50 МБ. Для создания изображения напишите, например, «Нарисуй кота-космонавта»; образцы присылайте в этот диалог. Действуют возможности модели и лимиты подписки. /new — сброс диалога и материалов; /text — последний ответ текстом; /status — состояние." +
             (id === config.ownerId
               ? " /users — список доступа; /model — выбор модели; /broadcast <текст> — объявление одобренным пользователям."
               : ""),
@@ -1409,7 +1489,7 @@ export class BotController implements Bot {
       for (const controller of this.topicTitles.values()) controller.abort();
       for (const [id, controller] of this.controllers) {
         const [userId, topicId] = id.split(":").map(Number);
-        if (this.preparing.has(id)) controller.abort(new AttachmentError("Обработка приостановлена. После исправления настроек повторите текст задания; материалы сохранены."));
+        if (this.preparing.has(id)) controller.abort(new AttachmentError("Обработка приостановлена. Материалы сохранены."));
         else if (!this.readSaved({userId: userId!, topicId: topicId!})?.request) controller.abort();
       }
       return;
@@ -1633,6 +1713,12 @@ export class BotController implements Bot {
         try {
           const state = this.deps.store.findDialogue(address);
           if (!state) continue;
+          if (state.request?.attachments?.length && !state.request.savedAttachments && state.pending) {
+            // Older versions kept the active batch and its saved file IDs in pending.
+            state.request.savedAttachments = state.pending.savedFiles ?? {};
+            delete state.pending;
+            this.deps.store.put(state);
+          }
           if (state.pending) {
             clearPendingPrompt(state.pending);
             if (!state.request && !state.delivery)

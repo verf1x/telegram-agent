@@ -12,6 +12,7 @@ import warnings
 import posixpath
 import stat
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from PIL import Image, ImageOps
@@ -19,12 +20,18 @@ from PIL import Image, ImageOps
 MAX_TEXT = 500_000
 MAX_IMAGE_BYTES = 6_000_000
 MAX_SCREENSHOT_STRIPS = 32
-SPLIT = 'Материалы превышают лимит. Разделите их на несколько заданий.'
-INVALID = 'Не удалось прочитать файл. Проверьте формат или разделите материалы.'
-PDF_EXPORT = 'Документ содержит диаграммы, SmartArt или неподдерживаемые рисунки. Экспортируйте его в PDF и отправьте снова.'
+MAX_OFFICE_IMAGES = 100
 class Rejected(Exception): pass
 class Limit(Rejected): pass
+class ArchiveLimit(Rejected): pass
 class UnsupportedOffice(Rejected): pass
+class Corrupt(Rejected): pass
+class Encrypted(Rejected): pass
+
+VBA_PARTS = {
+    'xl/vbaProject.bin', 'xl/vbaProjectSignature.bin',
+    'xl/vbaProjectSignatureAgile.bin', 'xl/vbaProjectSignatureV3.bin',
+}
 
 images = []
 image_bytes = 0
@@ -68,21 +75,28 @@ def encode_image(image, source_format):
     if image_bytes > MAX_IMAGE_BYTES: raise Limit()
     images.append({'mime': mime, 'base64': base64.b64encode(result).decode('ascii')})
 
-def add_image(data, *, allow_strips=False):
+def add_image(data, *, allow_strips=False, max_images=None):
     warnings.simplefilter('error', Image.DecompressionBombWarning)
     Image.MAX_IMAGE_PIXELS = 32_000_000
-    with Image.open(io.BytesIO(data)) as source:
-        if source.format not in ('PNG', 'JPEG', 'WEBP') or getattr(source, 'n_frames', 1) != 1:
-            raise Rejected()
-        source.load()
-        image = ImageOps.exif_transpose(source)
-        if allow_strips:
-            for strip in screenshot_strips(image):
-                encode_image(strip, source.format)
-        else:
-            if max(image.size) > 5 * min(image.size): raise Limit()
-            encode_image(image, source.format)
-    return '[Image '+str(len(images))+']'
+    first = len(images) + 1
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            if source.format not in ('PNG', 'JPEG', 'WEBP') or getattr(source, 'n_frames', 1) != 1:
+                raise Rejected()
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            if allow_strips:
+                for strip in screenshot_strips(image):
+                    if max_images is not None and len(images) >= max_images: raise Limit()
+                    encode_image(strip, source.format)
+            else:
+                if max(image.size) > 5 * min(image.size): raise Limit()
+                encode_image(image, source.format)
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise Limit() from error
+    except OSError as error:
+        raise Corrupt() from error
+    return ' '.join(f'[Image {index}]' for index in range(first, len(images) + 1))
 
 def local(tag):
     return tag.rsplit('}', 1)[-1]
@@ -138,23 +152,29 @@ class NoDTD(ET.TreeBuilder):
         raise Rejected()
 
 class Office:
-    def __init__(self, data):
+    def __init__(self, data, *, allow_vba=False):
         self.archive = zipfile.ZipFile(io.BytesIO(data))
         members = self.archive.infolist()
-        if len(members) > 2000: raise Limit()
+        if len(members) > 2000: raise ArchiveLimit()
         self.members = {}
         self.trees = {}
+        self.ignored_vba = set()
+        allow_vba = allow_vba and any(item.filename == 'xl/workbook.xml' for item in members)
         total = 0
         for item in members:
             path = item.filename
             mode = item.external_attr >> 16
-            if (item.flag_bits & 1 or stat.S_ISLNK(mode) or '\\' in path or '\x00' in path
+            if item.flag_bits & 1: raise Encrypted()
+            if (stat.S_ISLNK(mode) or '\\' in path or '\x00' in path
                 or path.startswith('/') or '..' in path.split('/') or ':' in path
                 or path in self.members): raise Rejected()
             if item.is_dir(): continue
             total += item.file_size
-            if item.file_size > 20_000_000 or total > 50_000_000 or item.file_size > max(1, item.compress_size)*200: raise Limit()
-            if 'vbaproject' in path.lower() or '/embeddings/' in path.lower(): raise Rejected()
+            if item.file_size > 20_000_000 or total > 50_000_000 or item.file_size > max(1, item.compress_size)*200: raise ArchiveLimit()
+            if '/embeddings/' in path.lower(): raise Rejected()
+            if 'vbaproject' in path.lower():
+                if not allow_vba or path not in VBA_PARTS: raise Rejected()
+                self.ignored_vba.add(path)
             self.members[path] = item
         # Validate every XML member, not merely the parts displayed below.
         # DTDs are rejected by the XML parser for any source encoding.
@@ -164,7 +184,7 @@ class Office:
 
     def bytes(self, path):
         item = self.members.get(path)
-        if item is None: raise Rejected()
+        if item is None or path in self.ignored_vba: raise Rejected()
         with self.archive.open(item) as stream:
             data = stream.read(min(item.file_size, 20_000_000)+1)
             if len(data) != item.file_size: raise Rejected()
@@ -192,7 +212,7 @@ class Office:
             if '\\' in target or ':' in target or '\x00' in target: raise Rejected()
             path = posixpath.normpath(posixpath.join(directory, target)) if not target.startswith('/') else target[1:]
             if path == '..' or path.startswith('../') or path not in self.members: raise Rejected()
-            result[key] = (path, item.get('Type', ''))
+            result[key] = (None if path in self.ignored_vba else path, item.get('Type', ''))
         return result
 
     def related(self, source, key):
@@ -211,10 +231,10 @@ class Office:
             elif kind in ('br', 'cr'): parts.append('\n')
             elif kind == 'blip':
                 target = self.related(source, attr(node, 'embed') or attr(node, 'link'))
-                parts.append(add_image(self.bytes(target)))
+                parts.append(add_image(self.bytes(target), allow_strips=True, max_images=MAX_OFFICE_IMAGES))
             elif kind == 'imagedata':
                 target = self.related(source, attr(node, 'id'))
-                parts.append(add_image(self.bytes(target)))
+                parts.append(add_image(self.bytes(target), allow_strips=True, max_images=MAX_OFFICE_IMAGES))
             elif kind in ('altChunk', 'OLEObject', 'object'):
                 raise Rejected()
             else:
@@ -252,7 +272,7 @@ class Office:
         for node in self.tree(source).iter():
             if local(node.tag) == 'blip':
                 target = self.related(source, attr(node, 'embed') or attr(node, 'link'))
-                parts.append(add_image(self.bytes(target)))
+                parts.append(add_image(self.bytes(target), allow_strips=True, max_images=MAX_OFFICE_IMAGES))
         return '\n'.join(parts)
 
     def sheet(self):
@@ -273,8 +293,11 @@ class Office:
                     value = next((node.text or '' for node in cell if local(node.tag) == 'v'), '')
                     formula = next((node.text or '' for node in cell if local(node.tag) == 'f'), None)
                     if cell.get('t') == 's':
-                        index = int(value)
-                        if index < 0 or index >= len(strings): raise Rejected()
+                        try:
+                            index = int(value)
+                        except ValueError as error:
+                            raise Corrupt() from error
+                        if index < 0 or index >= len(strings): raise Corrupt()
                         value = strings[index]
                     elif cell.get('t') == 'inlineStr':
                         value = ''.join(node.text or '' for node in cell.iter() if local(node.tag) == 't')
@@ -283,10 +306,15 @@ class Office:
                     cells.append(cell.get('r', '?')+': '+value)
                 rows.append('\t'.join(cells))
             # Worksheet drawings are inert relationships, never filesystem paths.
-            for drawing in self.tree(path).iter():
-                if local(drawing.tag) in ('drawing', 'legacyDrawing'):
-                    drawing_path = self.related(path, attr(drawing, 'id'))
+            for item in self.tree(path).iter():
+                kind = local(item.tag)
+                if kind in ('drawing', 'legacyDrawing'):
+                    drawing_path = self.related(path, attr(item, 'id'))
                     rows.append(self.pictures(drawing_path))
+                elif kind == 'tablePart':
+                    table = self.tree(self.related(path, attr(item, 'id')))
+                    if local(table.tag) != 'table' or not table.get('ref'): raise Rejected()
+                    rows.append(f"Table {table.get('displayName') or table.get('name', '')}: {table.get('ref')}")
             sheets.append('\n'.join(rows))
         if not sheets: raise Rejected()
         return '\n\n'.join(sheets)
@@ -380,16 +408,25 @@ class Office:
                 if related is not None: pending.append(related)
 
 def read(data, name, mime):
+    extension = posixpath.splitext(name.lower())[1]
+    office_extensions = {'.docx', '.xlsx', '.xlsm', '.pptx'}
     if data.startswith((b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff')) or (data[:4] == b'RIFF' and data[8:12] == b'WEBP'):
         add_image(data, allow_strips=True)
         if len(images) > 1:
             return 'Изображение передано последовательными фрагментами с перекрытием.'
         return ''
-    if data.startswith(b'%PDF-'):
+    if data.startswith(b'%PDF-') or (extension == '.pdf' and b'%PDF-' in data[:1024]):
         import pypdfium2 as pdfium
+        from pypdfium2 import raw
+        try:
+            document = pdfium.PdfDocument(data)
+        except pdfium.PdfiumError as error:
+            if error.err_code == raw.FPDF_ERR_PASSWORD: raise Encrypted() from error
+            if error.err_code == raw.FPDF_ERR_FORMAT: raise Corrupt() from error
+            raise
         parts = []
-        with closing(pdfium.PdfDocument(data)) as document:
-            if not len(document): raise Rejected()
+        with closing(document):
+            if not len(document): raise Corrupt()
             for index in range(len(document)):
                 with closing(document[index]) as page:
                     with closing(page.get_textpage()) as textpage:
@@ -406,15 +443,26 @@ def read(data, name, mime):
                         add_image(output.getvalue())
         return '\n\n'.join(parts)
     if data.startswith(b'PK'):
-        return Office(data).read()
-    extension = posixpath.splitext(name.lower())[1]
+        try:
+            return Office(data, allow_vba=extension == '.xlsm' or mime.lower() == 'application/vnd.ms-excel.sheet.macroenabled.12').read()
+        except (zipfile.BadZipFile, ET.ParseError, zlib.error) as error:
+            raise Corrupt() from error
+        except NotImplementedError as error:
+            raise Rejected() from error
+    if extension in office_extensions and data.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+        raise Encrypted()
+    if extension in office_extensions | {'.pdf', '.jpg', '.jpeg', '.png', '.webp'}:
+        raise Corrupt()
     text_extensions = {'.txt', '.csv', '.tsv', '.md', '.markdown', '.json', '.jsonl', '.ndjson', '.log', '.xml', '.html', '.htm', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.sql', '.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.cs', '.fs', '.java', '.kt', '.go', '.rs', '.c', '.h', '.cpp', '.hpp', '.rb', '.php', '.sh', '.bash', '.zsh', '.css', '.scss', '.tex', '.r', '.swift'}
     text_mimes = {'application/json', 'application/xml', 'application/javascript', 'application/typescript', 'application/x-yaml', 'application/toml', 'application/sql'}
-    if mime.startswith('image/') or extension in {'.pdf', '.docx', '.xlsx', '.pptx', '.jpg', '.jpeg', '.png', '.webp'}:
+    if mime.startswith('image/'):
         raise Rejected()
     if extension not in text_extensions and not mime.startswith('text/') and mime not in text_mimes:
         raise Rejected()
-    text = data.decode('utf-8-sig')
+    try:
+        text = data.decode('utf-8-sig')
+    except UnicodeError as error:
+        raise Rejected() from error
     if any(ord(c) < 32 and c not in '\r\n\t\f' for c in text): raise Rejected()
     return text
 
@@ -425,9 +473,6 @@ try:
     text = read(data, request['name'], request['mime'])
     if len(text.encode('utf-8')) > MAX_TEXT: raise Limit()
     print(json.dumps({'text': text, 'images': images}, ensure_ascii=False))
-except Limit:
-    print(json.dumps({'text': '', 'images': [], 'error': SPLIT}, ensure_ascii=False))
-except UnsupportedOffice:
-    print(json.dumps({'text': '', 'images': [], 'error': PDF_EXPORT}, ensure_ascii=False))
-except BaseException:
-    print(json.dumps({'text': '', 'images': [], 'error': INVALID}, ensure_ascii=False))
+except Rejected as error:
+    code = {Limit: 'limit', ArchiveLimit: 'archive_limit', UnsupportedOffice: 'unsupported_office', Corrupt: 'corrupt', Encrypted: 'encrypted'}
+    print(json.dumps({'text': '', 'images': [], 'error': code.get(type(error), 'unsupported')}, ensure_ascii=False))

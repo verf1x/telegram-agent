@@ -19,6 +19,13 @@ export interface TaskSource {
   text: string;
 }
 
+export interface AttachmentTask {
+  text: string;
+  attachments?: AttachmentRef[];
+  savedAttachments?: Record<string, string>;
+  excludedAttachments?: Record<number, string>;
+}
+
 export interface DialogueState extends DialogueAddress {
   autoNameTopic?: true;
   migration?: { phase: "creating" | "retry" };
@@ -47,18 +54,18 @@ export interface DialogueState extends DialogueAddress {
     captions?: string[]; // Legacy pending snapshots.
     readyAt?: number;
     awaitingTask?: boolean;
+    blockedAlbumId?: string;
     savedFiles?: Record<string,string>;
   };
   selection?: ModelSelection;
   lastResponse?: string;
   previewCleanup?: Array<{id: number; retryAt?: number}>;
-  request?: {
+  attachmentRetry?: AttachmentTask & { sources: TaskSource[] };
+  request?: AttachmentTask & {
     id: string;
-    text: string;
     threadId?: string;
     repeat?: boolean;
     started: number;
-    attachments?: AttachmentRef[];
     revoked?: boolean;
     stopped?: boolean;
     fileIds?: string[];
@@ -87,6 +94,10 @@ export interface BroadcastState {
   reportRetries?: number;
 }
 
+export class DialogueFileQuotaError extends ResponseFileError {
+  constructor() { super("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new."); }
+}
+
 /** Never retain JSON.parse's cause: Node may print the entire private input. */
 export class StoredDialogueError extends Error {
   constructor() { super("Не удалось прочитать сохранённое состояние диалога. Данные сохранены."); this.name = "StoredDialogueError"; }
@@ -96,6 +107,19 @@ function validDeadline(value: unknown): boolean {
 }
 function stringList(value: unknown): boolean {
   return Array.isArray(value) && value.every(id => typeof id === "string");
+}
+function validSources(sources: unknown): boolean {
+  return Array.isArray(sources) && sources.every(source => typeof source?.text === "string");
+}
+function validStringMap(value: unknown): boolean {
+  return value == null || (typeof value === "object" && !Array.isArray(value) &&
+    Object.values(value).every(item => typeof item === "string"));
+}
+function validAttachmentTask(task: AttachmentTask): boolean {
+  return typeof task.text === "string" && (task.attachments == null ||
+    (Array.isArray(task.attachments) && task.attachments.every(ref =>
+      typeof ref?.fileId === "string" && typeof ref.name === "string" && typeof ref.mime === "string"))) &&
+    validStringMap(task.savedAttachments) && validStringMap(task.excludedAttachments);
 }
 function parseState(value: string): DialogueState {
   let state: DialogueState;
@@ -107,7 +131,9 @@ function parseState(value: string): DialogueState {
   if (!state || !Array.isArray(state.history) || !validDeadline(state.bindingRetryAt) ||
       (state.threadId != null && typeof state.threadId !== "string") ||
       (state.pending != null && (!Array.isArray(state.pending.refs) || !validDeadline(state.pending.readyAt))) ||
-      (state.request != null && (typeof state.request.id !== "string" ||
+      (state.attachmentRetry != null && (!validAttachmentTask(state.attachmentRetry) || !state.attachmentRetry.attachments?.length ||
+        !validSources(state.attachmentRetry.sources))) ||
+      (state.request != null && (typeof state.request.id !== "string" || !validAttachmentTask(state.request) ||
         (state.request.threadId != null && typeof state.request.threadId !== "string") ||
         (state.request.fileIds != null && !stringList(state.request.fileIds)) ||
         (state.request.imageIds != null && !stringList(state.request.imageIds)))) ||
@@ -117,8 +143,7 @@ function parseState(value: string): DialogueState {
         !Number.isSafeInteger(state.delivery.next) || state.delivery.next < 0)) ||
       (state.previewCleanup != null && (!Array.isArray(state.previewCleanup) ||
         state.previewCleanup.some(entry => !Number.isSafeInteger(entry?.id) || !validDeadline(entry.retryAt)))) ||
-      (state.latestTask?.sources !== undefined && (!Array.isArray(state.latestTask.sources) ||
-        state.latestTask.sources.some(source => typeof source?.text !== "string"))) ||
+      (state.latestTask?.sources !== undefined && !validSources(state.latestTask.sources)) ||
       (state.retiredThreadIds != null && !stringList(state.retiredThreadIds)) ||
       (state.inactiveFileIds != null && !stringList(state.inactiveFileIds)) ||
       (state.username != null && typeof state.username !== "string")) throw new StoredDialogueError();
@@ -574,13 +599,16 @@ export class SqliteStore {
   saveFile(user: number | DialogueAddress, file: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
     return this.persistFile(user,file,quota);
   }
+  saveAttachment(user: DialogueAddress, requestId: string, fileId: string, file: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
+    return this.persistFile(user, file, quota, {id: requestId, kind: "attachment", fileId});
+  }
   saveResponseFile(user: number | DialogueAddress, requestId: string, file: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
     return this.persistFile(user, file, quota, {id: requestId, kind: "file"});
   }
   saveResponseImage(user: DialogueAddress, requestId: string, image: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
     return this.persistFile(user, image, quota, {id: requestId, kind: "image"});
   }
-  private persistFile(user: number | DialogueAddress, file: GeneratedFile, quota: number, output?: {id: string; kind: "file" | "image"}): DialogueFile {
+  private persistFile(user: number | DialogueAddress, file: GeneratedFile, quota: number, owner?: {id: string} & ({kind: "file" | "image"} | {kind: "attachment"; fileId: string})): DialogueFile {
     const address = typeof user === "number" ? {userId:user} : user;
     if (!(file.bytes instanceof Uint8Array) || file.bytes.byteLength > RESPONSE_FILE_LIMITS.fileBytes)
       throw new ResponseFileError("Файл превышает 50 МБ. Попросите уменьшить его размер.");
@@ -589,18 +617,22 @@ export class SqliteStore {
     const mime = /^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/.test(file.mime) ? file.mime : "application/octet-stream";
     const result = {id: randomUUID(),name,mime,size:file.bytes.byteLength};
     return this.fileTransaction(address, write => {
-      const state = output ? this.get(address) : undefined;
+      const state = owner ? this.get(address) : undefined;
       const request = state?.request;
-      if (output && (request?.id !== output.id || request.stopped || (request.revoked && output.kind === "file")))
+      if (owner && (request?.id !== owner.id || request.stopped || (request.revoked && owner.kind !== "image")))
         throw new ResponseFileError("Задание больше недоступно.");
-      if (output?.kind === "file" && (request?.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files)
+      if (owner?.kind === "file" && (request?.fileIds?.length ?? 0) >= RESPONSE_FILE_LIMITS.files)
         throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
       const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=?").get(address.userId,address.topicId??0) as {size:number}).size;
-      if (used + result.size > quota) throw new ResponseFileError("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new.");
+      if (used + result.size > quota) throw new DialogueFileQuotaError();
       this.insertFile(address, result.id, { name, mime, bytes: file.bytes }, write);
-      if (state && request) {
-        const ids = output?.kind === "image" ? (request.imageIds ??= []) : (request.fileIds ??= []);
-        ids.push(result.id);
+      if (state && request && owner) {
+        if (owner.kind === "attachment") {
+          request.savedAttachments = {...request.savedAttachments, [owner.fileId]: result.id};
+        } else {
+          const ids = owner.kind === "image" ? (request.imageIds ??= []) : (request.fileIds ??= []);
+          ids.push(result.id);
+        }
         this.put(state);
       }
       return result;

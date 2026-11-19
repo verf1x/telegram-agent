@@ -76,6 +76,10 @@ export class AttachmentError extends Error {
   constructor(message: string) { super(message); this.name = "AttachmentError"; }
 }
 
+export class AttachmentFileError extends AttachmentError {}
+export class AttachmentBatchError extends AttachmentError {}
+export class AttachmentReaderUnavailableError extends AttachmentError {}
+
 export class ModelContextError extends AttachmentError {
   constructor() {
     super("Задание превышает окно контекста модели. Сократите текст или разделите вложения.");

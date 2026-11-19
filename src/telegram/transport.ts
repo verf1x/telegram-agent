@@ -1,5 +1,5 @@
 import type { ChatId, DraftOptions, GeneratedFile, OutgoingPart, SendOptions, TelegramTransport, TelegramUpdate } from '../contracts.ts';
-import { AttachmentError, ATTACHMENT_LIMITS, RESPONSE_FILE_LIMITS } from '../contracts.ts';
+import { AttachmentFileError, ATTACHMENT_LIMITS, RESPONSE_FILE_LIMITS } from '../contracts.ts';
 import { formatText } from './format.ts';
 
 export class TelegramError extends Error {
@@ -75,22 +75,22 @@ export class TelegramApi implements TelegramTransport {
   }
   async downloadFile(fileId: string, maxBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
     const limit = Math.min(maxBytes,ATTACHMENT_LIMITS.fileBytes);
-    if (!Number.isSafeInteger(limit) || limit <= 0) throw new AttachmentError('Недопустимый размер вложения.');
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new AttachmentFileError('Недопустимый размер вложения.');
     // One deadline covers metadata, headers and the complete response stream.
     const deadline = AbortSignal.timeout(60_000);
     const combined = signal ? AbortSignal.any([signal,deadline]) : deadline;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
       const file = await this.#call<{file_path?:string;file_size?:number}>('getFile',{file_id:fileId},combined);
-      if (file.file_size !== undefined && (!Number.isSafeInteger(file.file_size) || file.file_size < 0 || file.file_size > limit)) throw new AttachmentError('Файл слишком большой. Разделите материалы на части.');
+      if (file.file_size !== undefined && (!Number.isSafeInteger(file.file_size) || file.file_size < 0 || file.file_size > limit)) throw new AttachmentFileError('Файл слишком большой. Разделите материалы на части.');
       const path = file.file_path;
       // Telegram paths are relative identifiers, never user-selected URLs or
       // filesystem paths. A narrow alphabet also excludes encoded traversal.
-      if (typeof path !== 'string' || path.length > 1024 || !/^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(path) || path.split('/').some(part=>part === '.' || part === '..')) throw new AttachmentError('Не удалось получить файл Telegram. Отправьте его повторно.');
+      if (typeof path !== 'string' || path.length > 1024 || !/^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(path) || path.split('/').some(part=>part === '.' || part === '..')) throw new AttachmentFileError('Не удалось получить файл Telegram. Отправьте его повторно.');
       const response = await this.#fetch(`${this.#baseUrl}/file/bot${this.#token}/${path}`,{signal:combined,redirect:'error'});
       if (!response.ok || !response.body) { await response.body?.cancel(); throw new TelegramError(response.status,'download failed'); }
       const declared = response.headers.get('content-length');
-      if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > limit || !Number.isSafeInteger(Number(declared)))) { await response.body.cancel(); throw new AttachmentError('Файл слишком большой. Разделите материалы на части.'); }
+      if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > limit || !Number.isSafeInteger(Number(declared)))) { await response.body.cancel(); throw new AttachmentFileError('Файл слишком большой. Разделите материалы на части.'); }
       reader = response.body.getReader();
       const chunks: Uint8Array[] = [];
       let size = 0;
@@ -98,13 +98,19 @@ export class TelegramApi implements TelegramTransport {
         const chunk = await reader.read();
         if (chunk.done) break;
         size += chunk.value.byteLength;
-        if (size > limit) throw new AttachmentError('Файл слишком большой. Разделите материалы на части.');
+        if (size > limit) throw new AttachmentFileError('Файл слишком большой. Разделите материалы на части.');
         chunks.push(chunk.value);
       }
       return Buffer.concat(chunks,size);
     } catch (error) {
       if (signal?.aborted) throw new DOMException('Telegram request aborted','AbortError');
-      if (error instanceof AttachmentError || error instanceof TelegramError) throw error;
+      if (error instanceof AttachmentFileError) throw error;
+      if (error instanceof TelegramError) {
+        if ([400, 404, 410, 413].includes(error.code)) {
+          throw new AttachmentFileError('Telegram отклонил загрузку. Пришлите файл заново или уменьшите его размер.');
+        }
+        throw error;
+      }
       throw new TelegramError(0,'download failed');
     } finally { await reader?.cancel().catch(()=>{}); reader?.releaseLock(); }
   }
