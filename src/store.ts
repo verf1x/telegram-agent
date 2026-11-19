@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { RESPONSE_FILE_LIMITS, ResponseFileError } from "./contracts.ts";
+import { dialogueKey, RESPONSE_FILE_LIMITS, ResponseFileError } from "./contracts.ts";
 import type { DialogueFile, GeneratedFile } from "./contracts.ts";
 import { DatabaseSync } from "node:sqlite";
+import type { StatementSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ArchivedMaterial } from "./dialogue-context.ts";
@@ -163,16 +164,32 @@ function dialogueMetadata(state: DialogueState) {
     previewDue] as const;
 }
 
+interface StoreDatabase {
+  exec: DatabaseSync["exec"];
+  prepare(sql: string): Pick<StatementSync, "all" | "get" | "iterate" | "run">;
+  close: DatabaseSync["close"];
+}
+
+interface FilePayloads {
+  put(id: string, bytes: Uint8Array): void;
+  read(id: string): Uint8Array;
+  remove(ids: string[]): void;
+  recover(referenced: ReadonlySet<string>): void;
+}
+
 export class SqliteStore {
-  private readonly db: DatabaseSync;
+  private readonly db: StoreDatabase;
+  private readonly payloads: FilePayloads | undefined;
+  private pendingPayloadDeletes?: Map<string, string[]>;
   private acceptedOffset = 0;
   private transacting = false;
   private changed = false;
   private readonly listeners = new Set<() => void>();
-  constructor(path: string) {
+  constructor(path: string, options?: { database?: StoreDatabase; payloads?: FilePayloads }) {
     if (path !== ":memory:")
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
+    this.db = options?.database ?? new DatabaseSync(path);
+    this.payloads = options?.payloads;
     this.db.exec("CREATE TABLE IF NOT EXISTS dialogue_files (id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, topic_id INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL, bytes BLOB NOT NULL); CREATE INDEX IF NOT EXISTS files_user ON dialogue_files(user_id)");
     this.db.exec(
       "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; CREATE TABLE IF NOT EXISTS dialogues (user_id INTEGER NOT NULL, topic_id INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, PRIMARY KEY(user_id,topic_id)); CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -194,6 +211,10 @@ export class SqliteStore {
     this.migrateScheduling();
     const offset = this.db.prepare("SELECT value FROM metadata WHERE key='offset'").get() as {value: string} | undefined;
     this.acceptedOffset = Number(offset?.value ?? 0);
+    if (this.payloads) {
+      const files = this.db.prepare("SELECT id FROM dialogue_files").all() as Array<{id: string}>;
+      this.payloads.recover(new Set(files.map(file => file.id)));
+    }
   }
   private migrateScheduling(): void {
     const columns = this.db.prepare("PRAGMA table_info(dialogues)").all() as Array<{name: string}>;
@@ -222,7 +243,7 @@ export class SqliteStore {
         CREATE INDEX broadcasts_owner ON broadcasts (owner_id) WHERE unreadable=0;
         CREATE INDEX broadcasts_unreadable ON broadcasts (id) WHERE unreadable=1;
       `);
-      const addresses = this.addresses(upgrade ? "1" : "unreadable=1");
+      const addresses = this.addresses(upgrade ? "TRUE" : "unreadable=1");
       const update = this.db.prepare(`UPDATE dialogues SET
         username=?,busy=?,recover=?,album_at=?,access_work=?,incomplete_delete=?,due_at=?,preview_at=?,unreadable=0
         WHERE user_id=? AND topic_id=?`);
@@ -232,7 +253,7 @@ export class SqliteStore {
           if (state) update.run(...dialogueMetadata(state), address.userId, address.topicId ?? 0);
         } catch (error) { if (!(error instanceof StoredDialogueError)) throw error; }
       }
-      const reports = this.db.prepare(`SELECT id,owner_id,state FROM broadcasts WHERE ${upgrade ? "1" : "unreadable=1"}`)
+      const reports = this.db.prepare(`SELECT id,owner_id,state FROM broadcasts WHERE ${upgrade ? "TRUE" : "unreadable=1"}`)
         .all() as BroadcastRow[];
       const saveDue = this.db.prepare("UPDATE broadcasts SET due_at=?,unreadable=0 WHERE id=?");
       for (const row of reports) {
@@ -345,11 +366,13 @@ export class SqliteStore {
     });
   }
   remove(address: DialogueAddress): void {
-    this.transaction(() => {
-      this.removeFiles(address);
+    const ids = this.transaction(() => {
+      const removed = this.removeFiles(address);
       this.db.prepare("DELETE FROM dialogues WHERE user_id=? AND topic_id=?").run(address.userId,address.topicId ?? 0);
       this.notifyWork();
+      return removed;
     });
+    this.removePayloads(address, ids);
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   }
   all(): DialogueState[] {
@@ -375,7 +398,7 @@ export class SqliteStore {
       const insert = this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes,prepared) VALUES(?,?,?,?,?,?,?,1)");
       for (const {id, name, attachment} of archived) {
         const bytes = Buffer.from(JSON.stringify(attachment));
-        insert.run(id,state.userId,state.topicId??0,name,"application/json",bytes.length,bytes);
+        insert.run(id,state.userId,state.topicId??0,name,"application/json",bytes.length,this.storePayload(id,bytes));
       }
       this.put(state);
     });
@@ -446,7 +469,7 @@ export class SqliteStore {
     const address = typeof user === "number" ? {userId:user} : user;
     const row = this.db.prepare("SELECT bytes FROM dialogue_files WHERE user_id=? AND topic_id=? AND id=?").get(address.userId,address.topicId??0,id) as {bytes: Uint8Array} | undefined;
     if (!row) throw new ResponseFileError("Файл недоступен в текущем диалоге.");
-    return row.bytes;
+    return this.payloads?.read(id) ?? row.bytes;
   }
   saveFile(user: number | DialogueAddress, file: GeneratedFile, quota = RESPONSE_FILE_LIMITS.dialogueBytes as number): DialogueFile {
     return this.persistFile(user,file,quota);
@@ -474,7 +497,7 @@ export class SqliteStore {
         throw new ResponseFileError("Не более 10 файлов ответа на задание. Готовые файлы сохранены.");
       const used = (this.db.prepare("SELECT coalesce(sum(size),0) AS size FROM dialogue_files WHERE user_id=? AND topic_id=?").get(address.userId,address.topicId??0) as {size:number}).size;
       if (used + result.size > quota) throw new ResponseFileError("Хранилище файлов диалога заполнено. Старые файлы сохранены; начните новый диалог через /new.");
-      this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes) VALUES(?,?,?,?,?,?,?)").run(result.id,address.userId,address.topicId??0,name,mime,result.size,file.bytes);
+      this.db.prepare("INSERT INTO dialogue_files(id,user_id,topic_id,name,mime,size,bytes) VALUES(?,?,?,?,?,?,?)").run(result.id,address.userId,address.topicId??0,name,mime,result.size,this.storePayload(result.id,file.bytes));
       if (state && request) {
         const ids = output?.kind === "image" ? (request.imageIds ??= []) : (request.fileIds ??= []);
         ids.push(result.id);
@@ -485,11 +508,40 @@ export class SqliteStore {
   }
   deleteFiles(user: number | DialogueAddress): void {
     const address = typeof user === "number" ? {userId:user} : user;
-    this.removeFiles(address);
+    if (this.payloads) {
+      const ids = this.transaction(() => this.removeFiles(address));
+      this.removePayloads(address, ids);
+    } else this.removeFiles(address);
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   }
-  private removeFiles(address: DialogueAddress): void {
-    this.db.prepare("DELETE FROM dialogue_files WHERE user_id=? AND topic_id=?").run(address.userId,address.topicId??0);
+  private removeFiles(address: DialogueAddress): string[] {
+    const sql = "DELETE FROM dialogue_files WHERE user_id=? AND topic_id=?";
+    if (this.payloads) {
+      const files = this.db.prepare(sql + " RETURNING id").all(address.userId,address.topicId??0) as Array<{id: string}>;
+      return files.map(file => file.id);
+    }
+    this.db.prepare(sql).run(address.userId,address.topicId??0);
+    return [];
+  }
+  private removePayloads(address: DialogueAddress, ids: string[]): void {
+    if (!this.payloads) return;
+    const key = dialogueKey(address);
+    const pending = this.pendingPayloadDeletes?.get(key);
+    const files = pending ? [...pending, ...ids] : ids;
+    if (!files.length) return;
+    try {
+      this.payloads.remove(files);
+      this.pendingPayloadDeletes?.delete(key);
+    } catch (error) {
+      // The database deletion has committed. Retain the IDs for retries in this process.
+      (this.pendingPayloadDeletes ??= new Map()).set(key, files);
+      throw error;
+    }
+  }
+  private storePayload(id: string, bytes: Uint8Array): Uint8Array {
+    if (!this.payloads) return bytes;
+    this.payloads.put(id, bytes);
+    return Buffer.alloc(0);
   }
   close(): void {
     this.db.close();
