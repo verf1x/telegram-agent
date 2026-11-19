@@ -68,6 +68,30 @@ test('XLSX keeps sheet, row and cell order, shared strings and inert cached form
  const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('sheet.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')],new AbortController().signal);
  assert.match(file!.text,/Sales\nA1: Apples\tB1: 42\nB2: =B1\*2 \[cached: 84\]\n\nForecast\nA1: Next year\tB1: 100/);
 });
+test('wide XLSX and XLSM images keep both strips, tables and cached formulas', {skip: !pythonPath}, async () => {
+ const reader = new SandboxedAttachmentReader({pythonPath});
+ for (const [name, mime] of [
+  ['wide.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ['wide.xlsm', 'application/vnd.ms-excel.sheet.macroEnabled.12'],
+ ]) {
+  const [file] = await reader.prepare([await fixture(name, mime)], new AbortController().signal);
+  assert.match(file!.text, /Sales\nA1: Apples\tB1: 42\nB2: =B1\*2 \[cached: 84\]/);
+  assert.match(file!.text, /\[Image 1\] \[Image 2\]\nTable SalesTotals: A1:B2/);
+  assert.match(file!.text, /Forecast/);
+  assert.doesNotMatch(file!.text, /opaque VBA marker|example\.invalid/);
+  assert.equal(file!.images.length, 2);
+  const strips = file!.images.map(image => Buffer.from(image.base64, 'base64'));
+  assert.ok(strips.every(bytes => bytes.readUInt32BE(20) === 73));
+  assert.ok(strips.reduce((width, bytes) => width + bytes.readUInt32BE(16), 0) > 443);
+ }
+});
+
+test('Office still bounds the number of normalized images after splitting wide images', {skip: !pythonPath}, async () => {
+ const reader = new SandboxedAttachmentReader({pythonPath});
+ const input = await fixture('too-many-images.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+ await assert.rejects(reader.prepare([input], new AbortController().signal), /лимит/);
+});
+
 test('PPTX uses presentation slide order and includes embedded pictures',{skip:!pythonPath},async()=>{
  const [file]=await new SandboxedAttachmentReader({pythonPath}).prepare([await fixture('slides.pptx','application/vnd.openxmlformats-officedocument.presentationml.presentation')],new AbortController().signal);
  assert.match(file!.text,/Slide 1\nOpening slide\.\n\[Image 1\]\n\nSlide 2\nFinal slide\./);

@@ -159,3 +159,38 @@ archive('empty-placeholders.pptx',{
  'ppt/slides/_rels/slide1.xml.rels':rels([('layout','../slideLayouts/slideLayout1.xml','slideLayout')]),
  'ppt/slideLayouts/slideLayout1.xml':f'<p:sldLayout xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph/></p:nvPr></p:nvSpPr><p:spPr><a:prstGeom prst="rect"/></p:spPr><p:txBody><a:p/></p:txBody></p:sp></p:spTree></p:cSld></p:sldLayout>',
 })
+
+# Match the wide image from issue #33 without including the user's workbook.
+wide = BytesIO()
+Image.new('RGB', (443, 73), 'white').save(wide, 'PNG')
+with zipfile.ZipFile(ROOT/'sheet.xlsx') as workbook:
+ wide_sheet = {name: workbook.read(name) for name in workbook.namelist()}
+wide_sheet['xl/worksheets/sheet1.xml'] = wide_sheet['xl/worksheets/sheet1.xml'].decode().replace(
+ '</worksheet>', f'<drawing xmlns:r="{D}" r:id="drawing"/><tableParts xmlns:r="{D}"><tablePart r:id="table"/></tableParts></worksheet>')
+wide_sheet['xl/worksheets/_rels/sheet1.xml.rels'] = rels([
+ ('drawing', '../drawings/drawing1.xml', 'drawing'), ('table', '../tables/table1.xml', 'table')])
+wide_sheet['xl/tables/table1.xml'] = f'<table xmlns="{S}" id="1" name="SalesTotals" displayName="SalesTotals" ref="A1:B2"/>'
+blip = f'<a:blip r:embed="picture"/>'
+drawing = f'<wsDr xmlns="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="{A}" xmlns:r="{D}">'
+wide_sheet['xl/drawings/drawing1.xml'] = drawing + blip + '</wsDr>'
+wide_sheet['xl/drawings/_rels/drawing1.xml.rels'] = rels([('picture', '../media/image1.png', 'image')])
+wide_sheet['xl/media/image1.png'] = wide.getvalue()
+archive('wide.xlsx', wide_sheet)
+
+# The VBA binary is deliberately opaque. The reader must never open this part.
+macro_sheet = dict(wide_sheet)
+macro_sheet['xl/vbaProject.bin'] = b'opaque VBA marker'
+macro_sheet['xl/_rels/workbook.xml.rels'] = rels([
+ ('s1', 'worksheets/sheet1.xml', 'worksheet'), ('s2', 'worksheets/sheet2.xml', 'worksheet'),
+ ('vba', 'vbaProject.bin', 'vbaProject'), ('external', 'externalLinks/externalLink1.xml', 'externalLink')])
+macro_sheet['xl/externalLinks/externalLink1.xml'] = f'<externalLink xmlns="{S}" xmlns:r="{D}"><externalBook r:id="remote"/></externalLink>'
+macro_sheet['xl/externalLinks/_rels/externalLink1.xml.rels'] = (
+ f'<Relationships xmlns="{R}"><Relationship Id="remote" Type="{D}/externalLinkPath" '
+ 'Target="https://example.invalid/never-fetch.xlsx" TargetMode="External"/></Relationships>')
+archive('wide.xlsm', macro_sheet)
+
+# Each wide picture becomes two strips, so 51 pictures exceed the Office image count.
+archive('too-many-images.xlsx', {**wide_sheet, 'xl/drawings/drawing1.xml': drawing + blip*51 + '</wsDr>'})
+archive('invalid-shared-string.xlsx', {
+ **wide_sheet, 'xl/worksheets/sheet1.xml': wide_sheet['xl/worksheets/sheet1.xml'].replace('<v>0</v>', '<v>oops</v>', 1),
+})

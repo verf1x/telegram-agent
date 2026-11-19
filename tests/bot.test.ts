@@ -229,7 +229,7 @@ test("a long live draft keeps showing new text within Telegram's limit", {timeou
   assert.equal(f.sent.map(message => message.text).join(""), long);
 });
 
-test("Stop during PDF preparation preserves the source for the next task", {timeout: 5000}, async (t) => {
+test("Stop during PDF preparation preserves the source for an explicit retry", {timeout: 5000}, async (t) => {
   const reading = Promise.withResolvers<number>();
   let prepares = 0;
   let preparationSignal: AbortSignal | undefined;
@@ -255,11 +255,11 @@ test("Stop during PDF preparation preserves the source for the next task", {time
   assert.equal(preparationSignal?.aborted, true);
   assert.equal(f.requests.length, 0);
   assert.equal(f.sent.length, 0);
-  await f.bot.handleUpdate(f.update(2, "use the saved PDF"));
+  await f.bot.handleUpdate(f.update(2, "/retry"));
   await f.bot.drain();
   assert.equal(downloads, 1);
   assert.equal(f.requests[0].attachments[0].text, "saved source");
-  assert.equal(f.sent.at(-1)!.text, "answer use the saved PDF");
+  assert.equal(f.sent.at(-1)!.text, "answer stop while reading");
 });
 
 test("a stopped turn keeps earlier context and saved files while late results and stops are ignored", {timeout: 7000}, async (t) => {
@@ -1093,17 +1093,35 @@ test("attachment limits reject a batch before downloads and leave accepted files
   assert.equal(f.requests[0].attachments.length, 10);
 });
 
-test("actual oversized downloads never start partial analysis and pending materials can be retried", async (t) => {
-  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
-  f.telegram.downloadFile = async () => new Uint8Array(20_000_001);
+test("a caption starts a new task after an ungrouped file was rejected", async t => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({name: file.name, text: "ok", images: []}))});
+  f.telegram.downloadFile = async id => Buffer.from(id);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
+  const rejected = fileUpdate(f.update(2, ""), "rejected.txt");
+  rejected.message!.document!.file_size = 20_000_001;
+  await f.bot.handleUpdate(rejected);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt", "Compare the accepted files"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].text, "Compare the accepted files");
+  assert.deepEqual(f.requests[0].attachments.map((file: {name: string}) => file.name), ["first.txt", "second.txt"]);
+});
+
+test("an oversized download leaves the next text as a standalone task in the same topic", async (t) => {
+  const f = fixture(t, { prepare: async () => [] });
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async (id) => {
+    downloads.push(id);
+    return new Uint8Array(20_000_001);
+  };
   await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "large.txt", "Explain"));
   await f.bot.drain();
   assert.equal(f.requests.length, 0);
   assert.match(f.sent.at(-1)!.text, /раздел|20|размер/i);
-  f.telegram.downloadFile = async () => new Uint8Array(4);
-  await f.bot.handleUpdate(f.update(2, "Try again"));
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Привет"));
   await f.bot.drain();
-  assert.equal(f.requests[0].attachments[0].name, "large.txt");
+  assert.deepEqual(f.requests.map(request => [request.text, request.attachments]), [["Привет", undefined]]);
+  assert.deepEqual(downloads, ["large.txt"]);
 });
 
 test("prepared text over the batch budget falls back to the original and keeps earlier prepared text", async (t) => {
@@ -1117,6 +1135,7 @@ test("prepared text over the batch budget falls back to the original and keeps e
   const original = request.files.find((file: any) => file.name === "long.txt");
   assert.equal(request.attachments[0].text.length, 250_001);
   assert.deepEqual(request.attachments[1], {name: "long.txt", text: "", images: [], originalFileId: original.id});
+  assert.match(f.sent.at(-1)!.text, /long\.txt.*лимита.*новом задании/);
 });
 
 test("oversized prepared images fall back to the original while many small pages still reach the model", async (t) => {
@@ -1325,7 +1344,7 @@ test("revocation during download cancels the batch before the next file and pend
   await f.bot.handleUpdate(f.update(1, "Owner continues independently"));
   await f.bot.drain();
   assert.equal(f.requests[0].attachments, undefined);
-  await f.bot.handleUpdate(f.update(2, "Repeat the task"));
+  await f.bot.handleUpdate(f.update(2, "/retry"));
   await f.bot.drain();
   assert.deepEqual(f.requests[1].attachments.map((a: any) => a.name), ["first.txt", "second.txt"]);
 });
@@ -1509,6 +1528,53 @@ test("the request deadline also bounds an unresponsive attachment download", asy
   assert.match(f.sent.at(-1)!.text, /Время обработки/i);
 });
 
+test("a corrupt PDF is rejected and the next text is a standalone task", {skip: !process.env.VERFIX_TEST_PYTHON}, async (t) => {
+  const f = fixture(t, new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON}));
+  const downloads: string[] = [];
+  f.telegram.downloadFile = async id => {
+    downloads.push(id);
+    return Buffer.from("%PDF-1.7\ntruncated");
+  };
+  const upload = fileUpdate(f.update(2, ""), "broken.pdf", "Read");
+  upload.message!.document!.mime_type = "application/pdf";
+  await f.bot.handleUpdate(upload);
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /broken\.pdf.*поврежд[её]н/i);
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].text, "Привет");
+  assert.equal(f.requests[0].attachments, undefined);
+  assert.deepEqual(f.requests[0].files, []);
+  assert.deepEqual(downloads, ["broken.pdf"]);
+});
+
+test("a damaged workbook does not prevent analysis of an intact file", {skip: !process.env.VERFIX_TEST_PYTHON}, async t => {
+  const f = fixture(t, new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON}));
+  const broken = readFileSync(new URL("./fixtures/attachments/invalid-shared-string.xlsx", import.meta.url));
+  f.telegram.downloadFile = async id => id.endsWith(".xlsx") ? broken : Buffer.from("Intact");
+  const upload = fileUpdate(f.update(2, ""), "broken.xlsx");
+  upload.message!.document!.file_size = broken.length;
+  await f.bot.handleUpdate(upload);
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt", "Compare the files"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[0].attachments, [{name: "notes.txt", text: "Intact", images: []}]);
+  assert.deepEqual(f.requests[0].files.map((file: {name: string}) => file.name), ["notes.txt"]);
+  assert.match(f.sent.at(-1)!.text, /broken\.xlsx.*повреждён/);
+});
+
+test("the actual batch limit excludes overflow and analyzes the files that fit", async t => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({name: file.name, text: "ok", images: []}))});
+  f.telegram.downloadFile = async () => new Uint8Array(17_000_000);
+  for (const name of ["first.txt", "second.txt", "overflow.txt"])
+    await f.bot.handleUpdate(fileUpdate(f.update(2, ""), name));
+  await f.bot.handleUpdate(f.update(2, "Compare"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[0].attachments.map((file: {name: string}) => file.name), ["first.txt", "second.txt"]);
+  assert.match(f.sent.at(-1)!.text, /overflow\.txt.*50 МБ.*отдельно/);
+});
+
 test("an unreadable HTML file reaches the engine as an original alongside successfully prepared text", {skip: !process.env.VERFIX_TEST_PYTHON}, async (t) => {
   const f = fixture(t, new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON!}));
   const html = Buffer.from("<html>\xcf\xf0\xe8\xe2\xe5\xf2</html>", "latin1");
@@ -1539,8 +1605,119 @@ test("an unreadable HTML file reaches the engine as an original alongside succes
   assert.deepEqual(downloads, ["page.html", "notes.txt"]);
 });
 
-test("a model attachment error retains pending originals for an explicit retry", async (t) => {
-  const f = fixture(t, { prepare: async (files) => files.map((file) => ({ name: file.name, text: "ok", images: [] })) });
+test("an explicit retry after a Telegram outage uses the original text and saved files only in its topic", async (t) => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({name: file.name, text: "ok", images: []}))});
+  const downloads: string[] = [];
+  let available = false;
+  f.telegram.downloadFile = async (id) => {
+    downloads.push(id);
+    if (id === "second.txt" && !available) throw new TelegramError(503, "offline");
+    return Buffer.from(id);
+  };
+  await f.bot.handleUpdate(f.update(2, "Earlier question"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "first.txt"));
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "second.txt", "Compare the files"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /\/retry/);
+  await f.reopen();
+
+  available = true;
+  const other = f.update(2, "/retry");
+  other.message!.message_thread_id = 11;
+  await f.bot.handleUpdate(other);
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.deepEqual(downloads, ["first.txt", "second.txt"]);
+  assert.equal(f.requests[1].text, "Привет");
+  assert.equal(f.requests[1].attachments, undefined);
+  assert.deepEqual(f.requests[1].files, []);
+  assert.equal(f.requests[1].history[0].text, "Earlier question");
+
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "fresh.txt"));
+  await f.bot.drain();
+  await f.bot.handleUpdate(f.update(2, "/retry"));
+  await f.bot.drain();
+  assert.equal(f.requests[2].text, "Compare the files");
+  assert.deepEqual(f.requests[2].attachments.map((file: {name: string}) => file.name), ["first.txt", "second.txt"]);
+  assert.deepEqual(downloads, ["first.txt", "second.txt", "second.txt"]);
+
+  await f.bot.handleUpdate(f.update(2, "Read the new file"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[3].attachments.map((file: {name: string}) => file.name), ["fresh.txt"]);
+  assert.equal(f.requests[3].files.filter((file: {name: string}) => file.name === "first.txt").length, 1);
+});
+
+test("a pre-upgrade interrupted attachment task retries with its saved original", async t => {
+  const f = fixture(t, {prepare: async files => files.map(file => ({
+    name: file.name, text: Buffer.from(file.bytes).toString(), images: [],
+  }))});
+  const address = {userId: 2, topicId: 10};
+  const alreadySaved = f.store.saveFile(address, {name: "notes.txt", mime: "text/plain", bytes: Buffer.from("Saved before upgrade")});
+  const refs = [{fileId: "old-upload", name: alreadySaved.name, mime: alreadySaved.mime, source: "document" as const}];
+  f.store.put({...address, history: [], pending: {refs, savedFiles: {"old-upload": alreadySaved.id}},
+    request: {id: "old-job", text: "Read", started: Date.now(), attachments: refs}});
+  await f.reopen();
+  assert.match(f.sent.at(-1)!.text, /\/retry/);
+
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.deepEqual(f.requests[0].files, []);
+  await f.bot.handleUpdate(f.update(2, "/retry"));
+  await f.bot.drain();
+  assert.equal(f.requests[1].text, "Read");
+  assert.deepEqual(f.requests[1].attachments, [{name: "notes.txt", text: "Saved before upgrade", images: []}]);
+});
+
+test("a malformed saved attachment request leaves neighboring topics available after restart", async t => {
+  const f = fixture(t);
+  f.store.put({userId: 2, topicId: 10, history: [], request: {
+    id: "broken", text: "Read", started: Date.now(), attachments: {length: 1} as never,
+  }});
+  await f.reopen();
+  const update = f.update(2, "Hello from a different topic");
+  update.message!.message_thread_id = 11;
+  await f.bot.handleUpdate(update);
+  await f.bot.drain();
+  assert.equal(f.requests[0].topicId, 11);
+  assert.equal(f.requests[0].text, "Hello from a different topic");
+});
+
+test("a newer failed attachment task does not expose older failed originals to a plain message", async t => {
+  const f = fixture(t, {prepare: async () => []});
+  f.telegram.downloadFile = async id => {
+    if (id.startsWith("offline")) throw new TelegramError(503, "offline");
+    return Buffer.from(id);
+  };
+  for (const task of ["first", "second"]) {
+    await f.bot.handleUpdate(fileUpdate(f.update(2, ""), task + ".txt"));
+    await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "offline-" + task + ".txt", task));
+    await f.bot.drain();
+  }
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].attachments, undefined);
+  assert.deepEqual(f.requests[0].files, []);
+});
+
+test("an unavailable attachment reader keeps the file for /retry", {skip: !process.env.VERFIX_TEST_PYTHON}, async t => {
+  let reader = new SandboxedAttachmentReader({pythonPath: "/nonexistent/verfix-test-python"});
+  const f = fixture(t, {prepare: (files, signal) => reader.prepare(files, signal)});
+  f.telegram.downloadFile = async () => Buffer.from("Ready for analysis");
+  await f.bot.handleUpdate(fileUpdate(f.update(2, ""), "notes.txt", "Read"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.sent.at(-1)!.text, /временно недоступен.*\/retry/);
+
+  reader = new SandboxedAttachmentReader({pythonPath: process.env.VERFIX_TEST_PYTHON});
+  await f.bot.handleUpdate(f.update(2, "/retry"));
+  await f.bot.drain();
+  assert.equal(f.requests[0].text, "Read");
+  assert.equal(f.requests[0].attachments[0].text, "Ready for analysis");
+});
+
+test("a model attachment error can be retried explicitly after switching models", async (t) => {
+  const f = fixture(t, {prepare: async (files) => files.map((file) => ({name: file.name, text: "ok", images: []}))});
   f.telegram.downloadFile = async () => new Uint8Array(4);
   const original = f.engine.run;
   f.engine.run = async () => { throw new AttachmentError("Выбранная модель не принимает изображения. Выберите другую модель."); };
@@ -1548,9 +1725,10 @@ test("a model attachment error retains pending originals for an explicit retry",
   await f.bot.drain();
   assert.match(f.sent.at(-1)!.text, /не принимает изображения/);
   f.engine.run = original;
-  await f.bot.handleUpdate(f.update(2, "Retry once more"));
+  await f.bot.handleUpdate(f.update(2, "/retry"));
   await f.bot.drain();
   assert.deepEqual(f.requests[0].history, []);
+  assert.equal(f.requests[0].text, "Read");
   assert.equal(f.requests[0].attachments[0].name, "notes.txt");
 });
 
@@ -2608,7 +2786,7 @@ test("a partial variant can deliver its files without becoming the active answer
   assert.deepEqual(f.requests[1].files, []);
 });
 
-test("the next task can use the intact attachments after reporting a lost pending attachment", async t => {
+test("a mixed batch uses the intact attachment and reports the lost file", async t => {
   const f = fixture(t, undefined, openLocalStore);
   const address = { userId: 2, topicId: 10 };
   const lost = f.store.saveFile(address, { name: "missing.txt", mime: "text/plain", bytes: Buffer.from("lost") });
@@ -2622,12 +2800,13 @@ test("the next task can use the intact attachments after reporting a lost pendin
   await f.reopen();
   await f.bot.handleUpdate(f.update(2, "Read both files"));
   await f.bot.drain();
-  assert.match(f.sent.at(-1)!.text, /Вложение .* недоступно.*заново/);
-  assert.equal(f.requests.length, 0);
-
-  await f.bot.handleUpdate(f.update(2, "Read the intact file"));
-  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /missing\.txt.*недоступна.*заново/);
   assert.equal(f.requests.length, 1);
   assert.deepEqual(f.requests[0].attachments.map((file: {name: string}) => file.name), [retained.name]);
-  assert.equal(f.sent.at(-1)!.text, "answer Read the intact file");
+
+  await f.bot.handleUpdate(f.update(2, "Привет"));
+  await f.bot.drain();
+  assert.equal(f.requests[1].attachments, undefined);
+  assert.deepEqual(f.requests[1].files.map((file: {name: string}) => file.name), [retained.name]);
+  assert.equal(f.sent.at(-1)!.text, "answer Привет");
 });
