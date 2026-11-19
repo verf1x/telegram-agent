@@ -1,11 +1,10 @@
 import { createCipheriv, createHash } from "node:crypto";
-import { readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { createBot } from "../../src/bot.ts";
 import { SqliteStore } from "../../src/store.ts";
 import { DEFAULT_MODEL_SELECTION } from "../../src/contracts.ts";
-import { DirectoryPayloads } from "./payloads.mjs";
+import { DirectoryPayloads } from "../../src/files/payloads.ts";
 import { instrument, now, timedDatabase } from "./metrics.mjs";
 import { PostgresDatabase } from "./postgres.mjs";
 
@@ -140,6 +139,7 @@ async function configure(config) {
   store = new SqliteStore(config.path, {
     database,
     payloads: payloads && {
+      bind: (id, hasFiles) => payloads.bind(id, hasFiles),
       put: (id, data) => measure("file.write", () => {
         if (fault === "partial-payload") {
           payloads.put(id, data.subarray(0, Math.floor(data.length / 2)));
@@ -149,7 +149,7 @@ async function configure(config) {
       }),
       read: id => measure("file.read", () => payloads.read(id)),
       remove: ids => measure("file.remove", () => payloads.remove(ids)),
-      recover: ids => measure("file.recover", () => payloads.recover(ids)),
+      recover: (ids, pending) => measure("file.recover", () => payloads.recover(ids, pending)),
     },
   });
   const save = store.saveResponseFile.bind(store);
@@ -199,7 +199,7 @@ async function command(kind, data) {
       return { ...results(data), cpuUs: process.cpuUsage(resourceStart), peakRssKiB: process.resourceUsage().maxRSS };
     }
     case "inspect": return { state: store.findDialogue(data), files: store.listFiles(data),
-      directory: payloads && readdirSync(options.directory), offset: store.offset };
+      directory: payloads?.fileKeys(), offset: store.offset };
     case "cleanup":
       for (const address of data) store.remove(address);
       return;

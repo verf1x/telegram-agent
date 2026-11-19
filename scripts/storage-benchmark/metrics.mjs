@@ -63,7 +63,7 @@ export function timedDatabase(db, measure, afterStatement) {
       if (/INSERT INTO dialogues/.test(sql)) category = "db.contextWrite";
       if (/ORDER BY (due_at|preview_at),user_id,topic_id/.test(sql)) category = "db.ready";
       if (/INSERT INTO dialogue_files/.test(sql)) category = "db.fileWrite";
-      if (/SELECT bytes FROM dialogue_files/.test(sql)) category = "db.fileRead";
+      if (/SELECT bytes,file_key,size FROM dialogue_files/.test(sql)) category = "db.fileRead";
       function call(method, args) {
         const result = measure(category, () => statement[method](...args));
         afterStatement(sql, category);
