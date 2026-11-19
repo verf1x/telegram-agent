@@ -34,7 +34,7 @@ import { BROADCAST_CALLBACK, BROADCAST_COMMAND, BroadcastController } from "./br
 import { formatAnswer, formatText } from "./telegram/format.ts";
 import { DraftRateLimit, RequestPreview, STOP_CALLBACK } from "./telegram/preview.ts";
 import { TelegramError } from "./telegram/transport.ts";
-import { dialogueOperations, SqliteStore, StoredDialogueError } from "./store.ts";
+import { dialogueOperations, SqliteStore, StoredDialogueError, StoredFileUnavailableError } from "./store.ts";
 import type { DialogueState, TaskSource } from "./store.ts";
 import { compactionInput, recentHistoryStart, SUMMARY_BYTES } from "./dialogue-context.ts";
 import { DEFAULT_TOPIC_TITLE, GENERIC_TOPIC_TITLE, safeTopicTitle, topicTitleInput } from "./topic-title.ts";
@@ -624,8 +624,21 @@ export class BotController implements Bot {
         for (const [index, ref] of request.attachments.entries()) {
           this.ensureActive(address, request.id, controller.signal);
           const savedId = state.pending?.savedFiles?.[ref.fileId];
-          const bytes = savedId ? this.deps.store.readFile(address,savedId)
-            : await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+          let bytes: Uint8Array;
+          try {
+            bytes = savedId ? this.deps.store.readFile(address,savedId)
+              : await this.abortable(this.deps.telegram.downloadFile(ref.fileId, ATTACHMENT_LIMITS.fileBytes, controller.signal), controller.signal);
+          } catch (error) {
+            if (!(error instanceof StoredFileUnavailableError)) throw error;
+            const current = this.deps.store.get(address);
+            if (current.pending) {
+              current.pending.refs = current.pending.refs.filter(item => item.fileId !== ref.fileId);
+              if (current.pending.savedFiles) delete current.pending.savedFiles[ref.fileId];
+              if (!current.pending.refs.length) delete current.pending;
+              this.deps.store.put(current);
+            }
+            throw new AttachmentError(`Вложение «${ref.name}» недоступно. Пришлите его заново и повторите задание.`);
+          }
           this.ensureActive(address, request.id, controller.signal);
           total += bytes.byteLength;
           const remaining = request.attachments.slice(index + 1).reduce((n, r) => n + (r.size ?? 0), 0);
@@ -902,16 +915,25 @@ export class BotController implements Bot {
     delete state.request;
     if (!request.revoked) {
       const saved = imageIds.length ? this.deps.store.listFiles(state) : [];
+      const deferredImages: string[] = [];
       const images = imageIds.flatMap(id => {
         const file = saved.find(item => item.id === id);
-        return file ? [{...file, bytes: this.deps.store.readFile(state, id)}] : [];
+        if (!file) return [];
+        try { return [{...file, bytes: this.deps.store.readFile(state, id)}]; }
+        catch (error) {
+          if (!(error instanceof ResponseFileError)) throw error;
+          if (!(error instanceof StoredFileUnavailableError)) deferredImages.push(id);
+          return [];
+        }
       });
-      const prefix = fileIds.length || images.length ? "Готова только часть задания; созданные файлы приложены. " : "";
+      const recoveredFiles = [...deferredImages, ...fileIds];
+      const prefix = recoveredFiles.length || images.length ? "Готова только часть задания; созданные файлы приложены. " : "";
+      const missing = imageIds.length > images.length + deferredImages.length ? " Часть сохранённых изображений недоступна." : "";
       state.delivery = {
         parts: [
-          { kind: "text", text: prefix + message },
+          { kind: "text", text: prefix + message + missing },
           ...formatAnswer({text: "", images}),
-          ...fileIds.map(id => ({kind: "file" as const, id})),
+          ...recoveredFiles.map(id => ({kind: "file" as const, id})),
         ],
         next: 0,
       };
@@ -997,22 +1019,25 @@ export class BotController implements Bot {
       try {
         if (part.kind === "file") {
           const file = this.deps.store.listFiles(address).find(file=>file.id===part.id);
-          if (!file || !this.deps.telegram.sendFile) throw new Error("File delivery unavailable");
+          if (!file) throw new StoredFileUnavailableError();
+          if (!this.deps.telegram.sendFile) throw new Error("File delivery unavailable");
           await this.abortable(this.deps.telegram.sendFile(userId,{...file,bytes:this.deps.store.readFile(address,file.id)}, options), controller.signal);
         } else await this.abortable(this.deps.telegram.sendPart(userId, part, options), controller.signal);
       } catch (error) {
-        if (
-          error &&
-          typeof error === "object" &&
-          "permanent" in error &&
-          error.permanent
-        ) {
+        const missing = error instanceof StoredFileUnavailableError;
+        const permanent = error && typeof error === "object" && "permanent" in error && error.permanent;
+        if (part.kind === "file" && (missing || (permanent && "code" in error && error.code === 400))) {
           const current = this.deps.store.get(address);
-          if (part.kind === "file" && current.delivery && "code" in error && error.code === 400) {
-            current.delivery.parts[current.delivery.next] = {kind:"text",text:"Не удалось доставить один из файлов. Он сохранён в диалоге; попросите отправить его повторно."};
+          if (current.delivery) {
+            const text = missing ? "Сохранённый файл ответа недоступен. Попросите создать его заново."
+              : "Не удалось доставить один из файлов. Он сохранён в диалоге; попросите отправить его повторно.";
+            current.delivery.parts[current.delivery.next] = {kind: "text", text};
             this.deps.store.put(current);
-            continue;
           }
+          continue;
+        }
+        if (permanent) {
+          const current = this.deps.store.get(address);
           delete current.delivery;
           this.deps.store.put(current);
         } else {

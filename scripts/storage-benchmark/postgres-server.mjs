@@ -22,6 +22,8 @@ export async function startPostgres(root, image) {
     "--env", "POSTGRES_DB=postgres", "--env", "POSTGRES_PASSWORD",
     image, "-c", "fsync=on", "-c", "synchronous_commit=on",
     "-c", "full_page_writes=on", "-c", "shared_buffers=128MB", "-c", "lc_messages=C",
+    "-c", "logging_collector=on", "-c", "log_destination=jsonlog", "-c", "log_filename=benchmark.log",
+    "-c", "log_rotation_age=0", "-c", "log_rotation_size=0", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=10ms",
   ], { env: { ...process.env, POSTGRES_PASSWORD: password } });
   const stop = () => docker(["stop", "--time", "5", container]);
   let admin;
@@ -47,7 +49,8 @@ export async function startPostgres(root, image) {
       current_setting('synchronous_commit') AS synchronous_commit,
       current_setting('full_page_writes') AS full_page_writes,
       current_setting('shared_buffers') AS shared_buffers, current_setting('wal_sync_method') AS wal_sync_method,
-      current_setting('wal_compression') AS wal_compression, current_setting('max_wal_size') AS max_wal_size`)).rows[0];
+      current_setting('wal_compression') AS wal_compression, current_setting('max_wal_size') AS max_wal_size,
+      current_setting('deadlock_timeout') AS lock_wait_log_threshold`)).rows[0];
     info.image = docker(["inspect", "--format", "{{.Image}}", container]);
     let sequence = 0;
     return {
@@ -64,6 +67,39 @@ export async function startPostgres(root, image) {
               (SELECT count(*) FROM pg_locks WHERE NOT granted AND database=d.datid) AS waiting
               FROM pg_stat_database d WHERE datname=$1`, [name]);
             return Object.fromEntries(Object.entries(result.rows[0]).map(([key, value]) => [key, Number(value)]));
+          },
+          async lockWaits() {
+            const barrier = "verfix lock logs ready " + randomBytes(8).toString("hex");
+            await admin.query(`DO $$ BEGIN RAISE LOG '${barrier}'; END $$`);
+            const path = join(data, "benchmark", "log", "benchmark.json");
+            for (let attempt = 0; attempt < 100; attempt++) {
+              // Wait for the collector to persist the barrier and any preceding messages.
+              const log = readFileSync(path, "utf8");
+              const entries = log.split("\n").slice(0, -1).map(line => JSON.parse(line));
+              const boundary = entries.findIndex(entry => entry.message === barrier);
+              if (boundary !== -1) {
+                let completed = 0, cancelled = 0, maxCompletedMs = null;
+                const waiting = new Set();
+                for (const entry of entries.slice(0, boundary)) {
+                  if (entry.dbname !== name) continue;
+                  if (["55P03", "57014", "40P01"].includes(entry.state_code) && waiting.delete(String(entry.pid))) {
+                    cancelled++;
+                  }
+                  const match = /^process (\d+) (still waiting for|acquired) .* after ([\d.]+) ms$/.exec(entry.message);
+                  if (!match) continue;
+                  const [, pid, event, duration] = match;
+                  if (event === "still waiting for") waiting.add(pid);
+                  else {
+                    waiting.delete(pid);
+                    completed++;
+                    maxCompletedMs = Math.max(maxCompletedMs ?? 0, Number(duration));
+                  }
+                }
+                return { waits: completed + cancelled + waiting.size, cancelled, maxCompletedMs };
+              }
+              await delay(20);
+            }
+            throw new Error("PostgreSQL did not finish collecting lock logs");
           },
           async drop() { await admin.query(`DROP DATABASE ${name} WITH (FORCE)`); },
         };

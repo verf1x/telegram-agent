@@ -70,6 +70,7 @@ async function comparison(name, variants, cases) {
           const entry = report[label].readings[scenario.name];
           entry.raw.push(rows);
           entry.missedOverlap += missedOverlap;
+          if (db) (entry.lockWaitsByRun ??= []).push(await db.lockWaits());
         } finally {
           await db?.drop();
           rmSync(config.path, { force: true });

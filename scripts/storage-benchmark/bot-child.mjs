@@ -140,13 +140,14 @@ async function configure(config) {
     database,
     payloads: payloads && {
       bind: (id, hasFiles) => payloads.bind(id, hasFiles),
-      put: (id, data) => measure("file.write", () => {
+      put: (id, data, onCreated) => measure("file.write", () => {
         if (fault === "partial-payload") {
-          payloads.put(id, data.subarray(0, Math.floor(data.length / 2)));
+          payloads.put(id, data.subarray(0, Math.floor(data.length / 2)), onCreated);
           crash();
         }
-        payloads.put(id, data);
+        payloads.put(id, data, onCreated);
       }),
+      available: (id, size) => measure("file.stat", () => payloads.available(id, size)),
       read: id => measure("file.read", () => payloads.read(id)),
       remove: ids => measure("file.remove", () => payloads.remove(ids)),
       recover: (ids, pending) => measure("file.recover", () => payloads.recover(ids, pending)),

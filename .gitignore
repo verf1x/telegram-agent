@@ -8,7 +8,7 @@ runtime/
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite.files/
-*.sqlite.lock
+*.sqlite.db.lock
 coverage/
 .venv
 __pycache__/

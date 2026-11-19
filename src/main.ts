@@ -72,7 +72,7 @@ async function main(): Promise<void> {
       if (existing) throw error;
       return join(await realpath(dirname(initial.databasePath)), basename(initial.databasePath));
     });
-    unlockDatabase = await instanceLock(database + '.lock',onSignal,'DATABASE_PATH');
+    unlockDatabase = await instanceLock(database + '.db.lock',onSignal,'DATABASE_PATH');
     store = openLocalStore(database);
     await chmod(database,0o600);
     engine = new CodexEngine({runtimeDir:initial.runtimeDir});

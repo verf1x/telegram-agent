@@ -14,6 +14,10 @@ function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
+export function isUnavailablePayload(error: unknown): boolean {
+  return error instanceof MaterialStorageError || ["ENOENT", "ENOTDIR", "ELOOP"].some(code => hasCode(error, code));
+}
+
 function syncDirectory(path: string): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try { fsyncSync(fd); }
@@ -47,9 +51,10 @@ export class DirectoryPayloads {
     return join(this.directory, key);
   }
 
-  put(key: string, bytes: Uint8Array): void {
+  put(key: string, bytes: Uint8Array, onCreated: () => void): void {
     const fd = openSync(this.path(key), "wx", 0o600);
     try {
+      onCreated();
       writeFileSync(fd, bytes);
       fsyncSync(fd);
     } finally {
@@ -57,6 +62,16 @@ export class DirectoryPayloads {
     }
     // Make the directory entry durable before committing the database reference.
     syncDirectory(this.directory);
+  }
+
+  available(key: string, size: number): boolean {
+    try {
+      const file = lstatSync(this.path(key));
+      return file.isFile() && file.size === size;
+    } catch (error) {
+      // Keep transient filesystem errors eligible for retry when the bytes are requested.
+      return !isUnavailablePayload(error);
+    }
   }
 
   read(key: string): Uint8Array {
@@ -79,8 +94,8 @@ export class DirectoryPayloads {
   recover(referenced: ReadonlySet<string>, pendingDeletion: ReadonlySet<string>): void {
     const entries = this.fileKeys();
     const present = new Set(entries);
-    if ([...referenced].some(key => !present.has(key) || !lstatSync(this.path(key)).isFile()))
-      throw new MaterialStorageError();
+    if ([...referenced].some(key => !present.has(key)))
+      console.error("Часть сохранённых файлов недоступна. Бот продолжит работу с доступными материалами.");
 
     // Keep pending deletions with their dialogue. An interrupted write leaves no reference.
     const orphans = entries.filter(key => !referenced.has(key) && !pendingDeletion.has(key));
