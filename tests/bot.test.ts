@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileConfigSource } from "../src/config.ts";
-import { SqliteStore } from "../src/store.ts";
+import { openLocalStore, SqliteStore } from "../src/store.ts";
 import { AttachmentError, ImageGenerationError, ModelContextError, ModelSelectionError } from "../src/contracts.ts";
 import { createBot } from "../src/bot.ts";
 import { SandboxedAttachmentReader } from "../src/attachments/reader.ts";
@@ -34,7 +34,7 @@ test("file configuration applies access changes only when a process starts", asy
   assert.deepEqual(restarted.snapshot().config.allowedUserIds, [3]);
 });
 
-function fixture(t: any, attachments?: AttachmentReader) {
+function fixture(t: any, attachments?: AttachmentReader, openStore = (path: string) => new SqliteStore(path)) {
   const dir = mkdtempSync(join(tmpdir(), "verfix-bot-"));
   const env = join(dir, ".env");
   const configText = (allowed = "2", extra = "") =>
@@ -56,7 +56,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
     catch (error) { snapshot = {valid: false, error: (error as Error).message, lastValid}; }
     for (const listener of listeners) listener(snapshot);
   };
-  let store = new SqliteStore(join(dir, "db.sqlite"));
+  let store = openStore(join(dir, "db.sqlite"));
   const sent: Array<{
     chatId: number;
     text: string;
@@ -141,7 +141,7 @@ function fixture(t: any, attachments?: AttachmentReader) {
     reopen: async () => {
       await bot.shutdown();
       store.close();
-      store = new SqliteStore(join(dir, "db.sqlite"));
+      store = openStore(join(dir, "db.sqlite"));
       bot = createBot({ config, store, engine, telegram, attachments });
       await bot.recover();
     },
@@ -2606,4 +2606,28 @@ test("a partial variant can deliver its files without becoming the active answer
   await f.bot.drain();
   assert.equal(f.requests[1].threadId, "thread-2");
   assert.deepEqual(f.requests[1].files, []);
+});
+
+test("the next task can use the intact attachments after reporting a lost pending attachment", async t => {
+  const f = fixture(t, undefined, openLocalStore);
+  const address = { userId: 2, topicId: 10 };
+  const lost = f.store.saveFile(address, { name: "missing.txt", mime: "text/plain", bytes: Buffer.from("lost") });
+  const retained = f.store.saveFile(address, { name: "retained.txt", mime: "text/plain", bytes: Buffer.from("intact") });
+  f.store.put({ ...address, history: [], pending: {
+    refs: [lost, retained].map(file => ({ fileId: file.name, name: file.name, mime: file.mime, source: "document" })),
+    savedFiles: { [lost.name]: lost.id, [retained.name]: retained.id },
+  } });
+  f.telegram.downloadFile = async () => { throw new Error("No original should be downloaded in this test"); };
+  unlinkSync(join(f.dir, "db.sqlite.files", lost.id));
+  await f.reopen();
+  await f.bot.handleUpdate(f.update(2, "Read both files"));
+  await f.bot.drain();
+  assert.match(f.sent.at(-1)!.text, /Вложение .* недоступно.*заново/);
+  assert.equal(f.requests.length, 0);
+
+  await f.bot.handleUpdate(f.update(2, "Read the intact file"));
+  await f.bot.drain();
+  assert.equal(f.requests.length, 1);
+  assert.deepEqual(f.requests[0].attachments.map((file: {name: string}) => file.name), [retained.name]);
+  assert.equal(f.sent.at(-1)!.text, "answer Read the intact file");
 });

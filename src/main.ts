@@ -1,16 +1,18 @@
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, open } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { chmod, lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createBot } from './bot.ts';
 import { FileConfigSource } from './config.ts';
-import { SqliteStore } from './store.ts';
+import { openLocalStore } from './store.ts';
+import type { SqliteStore } from './store.ts';
+import { MaterialStorageError } from './files/payloads.ts';
 import { CodexEngine } from './codex/engine.ts';
 import { SandboxedAttachmentReader } from './attachments/reader.ts';
 import { TelegramApi, TelegramError } from './telegram/transport.ts';
 
 /** Linux flock releases even after SIGKILL; no stale PID-file takeover race. */
-async function instanceLock(path: string, onLost: () => void): Promise<() => Promise<void>> {
+async function instanceLock(path: string, onLost: () => void, resource: 'RUNTIME_DIR' | 'DATABASE_PATH'): Promise<() => Promise<void>> {
   const file = await open(path,'a',0o600);
   await file.chmod(0o600);
   await file.close();
@@ -19,7 +21,7 @@ async function instanceLock(path: string, onLost: () => void): Promise<() => Pro
   const exit = new Promise<void>(resolveExit => lock.once('exit',() => { exited = true; resolveExit(); }));
   await new Promise<void>((resolveReady,reject) => {
     lock.once('error',() => reject(new Error('Не удалось запустить flock. Установите util-linux.')));
-    lock.once('exit',code => reject(new Error(code === 73 ? 'Бот уже запущен с этим RUNTIME_DIR.' : 'Не удалось получить блокировку процесса.')));
+    lock.once('exit',code => reject(new Error(code === 73 ? `Бот уже запущен с этим ${resource}.` : 'Не удалось получить блокировку процесса.')));
     lock.stdout!.once('data',chunk => {
       if (chunk.toString().startsWith('locked')) resolveReady();
       else reject(new Error('Не удалось получить блокировку процесса.'));
@@ -52,16 +54,27 @@ async function main(): Promise<void> {
   };
   process.once('SIGINT',onSignal);
   process.once('SIGTERM',onSignal);
-  let unlock: (() => Promise<void>) | undefined;
+  let unlockRuntime: (() => Promise<void>) | undefined;
+  let unlockDatabase: (() => Promise<void>) | undefined;
   let store: SqliteStore | undefined;
   let engine: CodexEngine | undefined;
   try {
     await mkdir(initial.runtimeDir,{recursive:true,mode:0o700});
     await chmod(initial.runtimeDir,0o700);
     await mkdir(dirname(initial.databasePath),{recursive:true,mode:0o700});
-    unlock = await instanceLock(resolve(initial.runtimeDir,'bot.lock'),onSignal);
-    store = new SqliteStore(initial.databasePath);
-    await chmod(initial.databasePath,0o600);
+    unlockRuntime = await instanceLock(resolve(initial.runtimeDir,'bot.lock'),onSignal,'RUNTIME_DIR');
+    const database = await realpath(initial.databasePath).catch(async error => {
+      if (error.code !== 'ENOENT') throw error;
+      // An existing dangling symlink must never bind the database to a different directory.
+      const existing = await lstat(initial.databasePath).catch(failure => {
+        if (failure.code !== 'ENOENT') throw failure;
+      });
+      if (existing) throw error;
+      return join(await realpath(dirname(initial.databasePath)), basename(initial.databasePath));
+    });
+    unlockDatabase = await instanceLock(database + '.db.lock',onSignal,'DATABASE_PATH');
+    store = openLocalStore(database);
+    await chmod(database,0o600);
     engine = new CodexEngine({runtimeDir:initial.runtimeDir});
     const telegram = new TelegramApi(initial.botToken);
     await telegram.requireTopics(stop.signal);
@@ -96,7 +109,9 @@ async function main(): Promise<void> {
   } finally {
     await Promise.allSettled([bot?.shutdown()]);
     await Promise.allSettled([engine?.close()]);
-    try { store?.close(); } finally { await unlock?.(); }
+    try { store?.close(); } finally {
+      try { await unlockDatabase?.(); } finally { await unlockRuntime?.(); }
+    }
     process.removeListener('SIGINT',onSignal);
     process.removeListener('SIGTERM',onSignal);
   }
@@ -104,6 +119,8 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   // Startup failures contain only our own safe diagnostics or validated config errors.
-  console.error(error instanceof Error && /^(Включите Threaded Mode|Ошибка конфигурации:|Бот уже запущен|Не удалось (запустить flock|получить блокировку))/.test(error.message) ? error.message : 'Не удалось запустить бота. Проверьте конфигурацию, права и зависимости.');
+  const safe = error instanceof MaterialStorageError || error instanceof Error &&
+    /^(Включите Threaded Mode|Ошибка конфигурации:|Бот уже запущен|Не удалось (запустить flock|получить блокировку))/.test(error.message);
+  console.error(safe ? error.message : 'Не удалось запустить бота. Проверьте конфигурацию, права и зависимости.');
   process.exitCode = 1;
 });
